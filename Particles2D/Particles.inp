@@ -22,3 +22,5 @@
 100
 # bit of time for particle dynamics
 0.001
+# output frequency
+10

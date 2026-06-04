@@ -8,7 +8,7 @@ from typing import Iterator, Tuple
 
 import numpy as np
 import h5py
-from numba import njit, prange
+from numba import cuda, float64
 
 
 # ============================================================
@@ -18,14 +18,7 @@ from numba import njit, prange
 K_FORCE = 1e-3
 EPS = 1e-2
 EPS2 = EPS * EPS
-
-
-# ============================================================
-# UTIL
-# ============================================================
-
-def idx2d(i: int, j: int, nx: int) -> int:
-    return i + j * nx
+BLOCK_SIZE = 256
 
 
 # ============================================================
@@ -174,154 +167,184 @@ def read_input(file_name: str) -> Tuple[Config, Grid, Grid]:
 
 
 # ============================================================
-# NUMBA KERNELS
+# GPU KERNELS
 # ============================================================
 
-@njit(cache=True, parallel=True, fastmath=False)
-def compute_generating_field_numba(values, nx, ny, xs, xe, ys, ye, max_iter):
-    dx = (xe - xs) / (nx - 1)
-    dy = (ye - ys) / (ny - 1)
+@cuda.jit
+def mandelbrot_kernel(values, nx, ny, xs, xe, ys, ye, max_iter):
+    i, j = cuda.grid(2)
 
-    for j in prange(ny):
+    if i < nx and j < ny:
+        dx = (xe - xs) / (nx - 1)
+        dy = (ye - ys) / (ny - 1)
+
+        ca = xs + i * dx
         cb = ys + j * dy
-        base = j * nx
-        for i in range(nx):
-            ca = xs + i * dx
 
-            za = 0.0
-            zb = 0.0
-            it = 0
-            it = 0
-            while it < max_iter:
-                a = za * za - zb * zb + ca
-                b = 2.0 * za * zb + cb
-                za = a
-                zb = b
-                it += 1
-                if za * za + zb * zb > 4.0:
-                    break
+        za = 0.0
+        zb = 0.0
+        it = 0
 
-            values[base + i] = np.uint64(it)
+        while it < max_iter:
+            a = za * za - zb * zb + ca
+            b = 2.0 * za * zb + cb
+            za = a
+            zb = b
+            if za * za + zb * zb > 4.0:
+                break
+            it += 1
+
+        values[i + j * nx] = np.uint64(it)
 
 
-@njit(cache=True, parallel=True, fastmath=False)
-def compute_forces_numba(x, y, w, fx, fy):
-    N = x.shape[0]
+@cuda.jit
+def compute_forces_tiled_kernel(x, y, w, fx, fy, N):
+    sh_x = cuda.shared.array(shape=BLOCK_SIZE, dtype=float64)
+    sh_y = cuda.shared.array(shape=BLOCK_SIZE, dtype=float64)
+    sh_w = cuda.shared.array(shape=BLOCK_SIZE, dtype=float64)
 
-    for i in prange(N):
+    i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
+    tid = cuda.threadIdx.x
+
+    active = i < N
+
+    if active:
         xi = x[i]
         yi = y[i]
         wi = w[i]
+    else:
+        xi = 0.0
+        yi = 0.0
+        wi = 0.0
 
-        fxi = 0.0
-        fyi = 0.0
+    fxi = 0.0
+    fyi = 0.0
 
-        for j in range(N):
-            if i == j:
-                continue
+    tiles = (N + BLOCK_SIZE - 1) // BLOCK_SIZE
 
-            dx = x[j] - xi
-            dy = y[j] - yi
-            r2 = dx * dx + dy * dy + EPS2
+    for tile in range(tiles):
+        j = tile * BLOCK_SIZE + tid
 
-            invr = 1.0 / np.sqrt(r2)
-            invr2 = invr * invr
-            invr3 = invr2 * invr
-            coeff = K_FORCE * wi * w[j] * invr3
+        if j < N:
+            sh_x[tid] = x[j]
+            sh_y[tid] = y[j]
+            sh_w[tid] = w[j]
+        else:
+            sh_x[tid] = 0.0
+            sh_y[tid] = 0.0
+            sh_w[tid] = 0.0
 
-            fxi += coeff * dx
-            fyi += coeff * dy
+        cuda.syncthreads()
 
+        if active:
+            for k in range(BLOCK_SIZE):
+                global_j = tile * BLOCK_SIZE + k
+
+                if global_j >= N or global_j == i:
+                    continue
+
+                dx = sh_x[k] - xi
+                dy = sh_y[k] - yi
+                r2 = dx * dx + dy * dy + EPS2
+
+                invr = 1.0 / math.sqrt(r2)
+                invr2 = invr * invr
+                invr3 = invr2 * invr
+                coeff = K_FORCE * wi * sh_w[k] * invr3
+
+                fxi += coeff * dx
+                fyi += coeff * dy
+
+        cuda.syncthreads()
+
+    if active:
         fx[i] = fxi
         fy[i] = fyi
 
 
-@njit(cache=True, parallel=True, fastmath=False)
-def half_kick_drift_numba(x, y, vx, vy, w, fx, fy, dt):
-    N = x.shape[0]
-    half_dt = 0.5 * dt
+@cuda.jit
+def half_kick_drift_kernel(x, y, vx, vy, w, fx, fy, dt, N):
+    i = cuda.grid(1)
+    if i >= N:
+        return
 
-    for i in prange(N):
-        invm = 1.0 / w[i]
+    invm = 1.0 / w[i]
 
-        # Match CUDA:
-        # v += 0.5 * a_old * dt
-        vx[i] += half_dt * fx[i] * invm
-        vy[i] += half_dt * fy[i] * invm
+    # Match CPU/CUDA reference:
+    # 1) v += 0.5 * a_old * dt
+    vx[i] += 0.5 * fx[i] * invm * dt
+    vy[i] += 0.5 * fy[i] * invm * dt
 
-        # x += v * dt
-        x[i] += vx[i] * dt
-        y[i] += vy[i] * dt
-
-
-@njit(cache=True, parallel=True, fastmath=False)
-def half_kick_numba(vx, vy, w, fx_new, fy_new, dt):
-    N = vx.shape[0]
-    half_dt = 0.5 * dt
-
-    for i in prange(N):
-        invm = 1.0 / w[i]
-
-        # Match CUDA:
-        # v += 0.5 * a_new * dt
-        vx[i] += half_dt * fx_new[i] * invm
-        vy[i] += half_dt * fy_new[i] * invm
+    # 2) x += v * dt
+    x[i] += vx[i] * dt
+    y[i] += vy[i] * dt
 
 
-@njit(cache=True, fastmath=False)
-def build_screen_numba(values, nx, ny, xs, xe, ys, ye, x, y, w, wmin, wr):
-    values[:] = 0
+@cuda.jit
+def half_kick_kernel(vx, vy, w, fx_new, fy_new, dt, N):
+    i = cuda.grid(1)
+    if i >= N:
+        return
 
-    N = x.shape[0]
-    if N == 0:
+    invm = 1.0 / w[i]
+
+    # 3) v += 0.5 * a_new * dt
+    vx[i] += 0.5 * fx_new[i] * invm * dt
+    vy[i] += 0.5 * fy_new[i] * invm * dt
+
+
+@cuda.jit
+def zero_int64_kernel(arr, n):
+    i = cuda.grid(1)
+    if i < n:
+        arr[i] = 0
+
+
+@cuda.jit
+def build_screen_kernel(screen, x, y, w, nx, ny, xs, xe, ys, ye, wmin, wr, N):
+    n = cuda.grid(1)
+    if n >= N:
         return
 
     invdx = (nx - 1) / (xe - xs) if xe != xs else 0.0
     invdy = (ny - 1) / (ye - ys) if ye != ys else 0.0
 
-    for n in range(N):
-        ix = int((x[n] - xs) * invdx)
-        iy = int((y[n] - ys) * invdy)
+    ix = int((x[n] - xs) * invdx)
+    iy = int((y[n] - ys) * invdy)
 
-        if ix < 0:
-            ix = 0
-        elif ix > nx - 1:
-            ix = nx - 1
+    if ix < 0:
+        ix = 0
+    elif ix > nx - 1:
+        ix = nx - 1
 
-        if iy < 0:
-            iy = 0
-        elif iy > ny - 1:
-            iy = ny - 1
+    if iy < 0:
+        iy = 0
+    elif iy > ny - 1:
+        iy = ny - 1
 
-        wp = int(10.0 * (w[n] - wmin) / wr)
-        if wp < 0:
-            wp = 0
-        elif wp > 1000:
-            wp = 1000
+    wp = int(10.0 * (w[n] - wmin) / wr)
+    if wp < 0:
+        wp = 0
+    elif wp > 1000:
+        wp = 1000
 
-        wp_u64 = np.uint64(wp)
+    for dj in range(-1, 2):
+        jy = iy + dj
+        if jy < 0 or jy >= ny:
+            continue
 
-        for dj in (-1, 0, 1):
-            jy = iy + dj
-            if jy < 0 or jy >= ny:
+        row = jy * nx
+        for di in range(-1, 2):
+            jx = ix + di
+            if jx < 0 or jx >= nx:
                 continue
 
-            row = jy * nx
-            for di in (-1, 0, 1):
-                jx = ix + di
-                if jx < 0 or jx >= nx:
-                    continue
-
-                values[row + jx] += wp_u64
+            cuda.atomic.add(screen, row + jx, wp)
 
 
 # ============================================================
-# HIGH-LEVEL PHYSICS WRAPPERS
+# HIGH-LEVEL HELPERS
 # ============================================================
-
-def compute_generating_field(g: Grid, max_iter: int) -> None:
-    compute_generating_field_numba(g.values, g.nx, g.ny, g.xs, g.xe, g.ys, g.ye, max_iter)
-
 
 def generate_particles(g: Grid, pg: Grid) -> Particles:
     P = Particles()
@@ -351,28 +374,6 @@ def generate_particles(g: Grid, pg: Grid) -> Particles:
     P.vy.fill(0.0)
 
     return P
-
-
-def compute_forces(P: Particles, fx: np.ndarray, fy: np.ndarray) -> None:
-    compute_forces_numba(P.x, P.y, P.w, fx, fy)
-
-
-def integrate_vv(P: Particles,
-                 fx: np.ndarray,
-                 fy: np.ndarray,
-                 fx_new: np.ndarray,
-                 fy_new: np.ndarray,
-                 dt: float):
-    half_kick_drift_numba(P.x, P.y, P.vx, P.vy, P.w, fx, fy, dt)
-    compute_forces_numba(P.x, P.y, P.w, fx_new, fy_new)
-    half_kick_numba(P.vx, P.vy, P.w, fx_new, fy_new, dt)
-    # Swap force buffers, same spirit as CUDA std::swap
-    return fx_new, fy_new, fx, fy
-
-
-def build_screen(g: Grid, P: Particles, wmin: float, wr: float) -> None:
-    build_screen_numba(g.values, g.nx, g.ny, g.xs, g.xe, g.ys, g.ye,
-                       P.x, P.y, P.w, wmin, wr)
 
 
 # ============================================================
@@ -473,17 +474,15 @@ class H5StreamWriter:
 
 
 # ============================================================
-# JIT WARM-UP
+# CUDA WARM-UP
 # ============================================================
 
-def warmup_numba() -> None:
-    """
-    Compile hot kernels before timing, so reported runtime excludes JIT cost.
-    """
-    # Tiny dummy arrays
-    values = np.zeros(4, dtype=np.uint64)
-    compute_generating_field_numba(values, 2, 2, -2.0, 1.0, -1.0, 1.0, 4)
+def warmup_cuda() -> None:
+    # tiny Mandelbrot
+    d_vals = cuda.device_array(4, dtype=np.uint64)
+    mandelbrot_kernel[(1, 1), (2, 2)](d_vals, 2, 2, -2.0, 1.0, -1.0, 1.0, 4)
 
+    # tiny particle arrays
     x = np.array([0.0, 1.0], dtype=np.float64)
     y = np.array([0.0, 0.5], dtype=np.float64)
     w = np.array([1.0, 2.0], dtype=np.float64)
@@ -494,13 +493,26 @@ def warmup_numba() -> None:
     fx_new = np.zeros(2, dtype=np.float64)
     fy_new = np.zeros(2, dtype=np.float64)
 
-    compute_forces_numba(x, y, w, fx, fy)
-    half_kick_drift_numba(x, y, vx, vy, w, fx, fy, 1e-3)
-    compute_forces_numba(x, y, w, fx_new, fy_new)
-    half_kick_numba(vx, vy, w, fx_new, fy_new, 1e-3)
+    x_d = cuda.to_device(x)
+    y_d = cuda.to_device(y)
+    w_d = cuda.to_device(w)
+    vx_d = cuda.to_device(vx)
+    vy_d = cuda.to_device(vy)
+    fx_d = cuda.to_device(fx)
+    fy_d = cuda.to_device(fy)
+    fx_new_d = cuda.to_device(fx_new)
+    fy_new_d = cuda.to_device(fy_new)
 
-    screen = np.zeros(4, dtype=np.uint64)
-    build_screen_numba(screen, 2, 2, -1.0, 1.0, -1.0, 1.0, x, y, w, 1.0, 1.0)
+    compute_forces_tiled_kernel[1, BLOCK_SIZE](x_d, y_d, w_d, fx_d, fy_d, 2)
+    half_kick_drift_kernel[1, BLOCK_SIZE](x_d, y_d, vx_d, vy_d, w_d, fx_d, fy_d, 1e-3, 2)
+    compute_forces_tiled_kernel[1, BLOCK_SIZE](x_d, y_d, w_d, fx_new_d, fy_new_d, 2)
+    half_kick_kernel[1, BLOCK_SIZE](vx_d, vy_d, w_d, fx_new_d, fy_new_d, 1e-3, 2)
+
+    screen_d = cuda.device_array(4, dtype=np.int64)
+    zero_int64_kernel[1, BLOCK_SIZE](screen_d, 4)
+    build_screen_kernel[1, BLOCK_SIZE](screen_d, x_d, y_d, w_d, 2, 2, -1.0, 1.0, -1.0, 1.0, 1.0, 1.0, 2)
+
+    cuda.synchronize()
 
 
 # ============================================================
@@ -509,23 +521,68 @@ def warmup_numba() -> None:
 
 def main() -> int:
     try:
+        if not cuda.is_available():
+            raise RuntimeError("CUDA is not available")
+
         input_file = sys.argv[1] if len(sys.argv) > 1 else "Particles.inp"
 
         cfg, gen, screen = read_input(input_file)
 
-        # JIT compile before timing / real work where possible
-        warmup_numba()
+        # Warm-up so timing excludes most JIT overhead
+        warmup_cuda()
 
-        # Pre-loop work (same spirit as CUDA: initial setup before timing)
-        compute_generating_field(gen, cfg.maxIters)
+        # ----------------------------------------------------
+        # 1) Generating field on GPU
+        # ----------------------------------------------------
+        d_vals = cuda.device_array(gen.nx * gen.ny, dtype=np.uint64)
+
+        block2d = (16, 16)
+        grid2d = (
+            (gen.nx + block2d[0] - 1) // block2d[0],
+            (gen.ny + block2d[1] - 1) // block2d[1],
+        )
+
+        mandelbrot_kernel[grid2d, block2d](
+            d_vals,
+            gen.nx, gen.ny,
+            gen.xs, gen.xe,
+            gen.ys, gen.ye,
+            cfg.maxIters
+        )
+        cuda.synchronize()
+
+        gen.values = d_vals.copy_to_host()
+
+        # ----------------------------------------------------
+        # 2) Particle generation on host (same logic as CPU)
+        # ----------------------------------------------------
         P = generate_particles(gen, screen)
 
-        fx = np.empty(P.n, dtype=np.float64)
-        fy = np.empty(P.n, dtype=np.float64)
-        fx_new = np.empty(P.n, dtype=np.float64)
-        fy_new = np.empty(P.n, dtype=np.float64)
+        # ----------------------------------------------------
+        # 3) Copy particles to GPU
+        # ----------------------------------------------------
+        x_d = cuda.to_device(P.x)
+        y_d = cuda.to_device(P.y)
+        vx_d = cuda.to_device(P.vx)
+        vy_d = cuda.to_device(P.vy)
+        w_d = cuda.to_device(P.w)
 
-        compute_forces(P, fx, fy)
+        fx_d = cuda.device_array(P.n, dtype=np.float64)
+        fy_d = cuda.device_array(P.n, dtype=np.float64)
+        fx_new_d = cuda.device_array(P.n, dtype=np.float64)
+        fy_new_d = cuda.device_array(P.n, dtype=np.float64)
+
+        # Screen buffer on device:
+        # use int64 for broad atomic-add compatibility, cast to uint64 on host
+        screen_d = cuda.device_array(screen.nx * screen.ny, dtype=np.int64)
+
+        threads = BLOCK_SIZE
+        blocks_particles = (P.n + threads - 1) // threads
+        blocks_screen = (screen.nx * screen.ny + threads - 1) // threads
+
+        # Initial forces before timing (matches CPU logic)
+        compute_forces_tiled_kernel[blocks_particles, threads](x_d, y_d, w_d, fx_d, fy_d, P.n)
+        cuda.synchronize()
 
         wmin = float(np.min(P.w))
         wmax = float(np.max(P.w))
@@ -536,15 +593,67 @@ def main() -> int:
 
             for step in range(cfg.maxSteps):
                 if step % cfg.outputEvery == 0:
-                    build_screen(screen, P, wmin, wr)
+                    zero_int64_kernel[blocks_screen, threads](screen_d, screen.nx * screen.ny)
+                    build_screen_kernel[blocks_particles, threads](
+                        screen_d,
+                        x_d, y_d, w_d,
+                        screen.nx, screen.ny,
+                        screen.xs, screen.xe,
+                        screen.ys, screen.ye,
+                        wmin, wr, P.n
+                    )
+                    cuda.synchronize()
+
+                    # copy output state to host for HDF5 writing
+                    x_d.copy_to_host(P.x)
+                    y_d.copy_to_host(P.y)
+                    vx_d.copy_to_host(P.vx)
+                    vy_d.copy_to_host(P.vy)
+
+                    screen_host_i64 = screen_d.copy_to_host()
+                    screen.values[:] = screen_host_i64.astype(np.uint64, copy=False)
+
                     h5.write_frame(P, screen)
 
-                fx, fy, fx_new, fy_new = integrate_vv(P, fx, fy, fx_new, fy_new, cfg.dt)
+                # Velocity-Verlet on GPU
+                half_kick_drift_kernel[blocks_particles, threads](
+                    x_d, y_d, vx_d, vy_d, w_d, fx_d, fy_d, cfg.dt, P.n
+                )
+                compute_forces_tiled_kernel[blocks_particles, threads](
+                    x_d, y_d, w_d, fx_new_d, fy_new_d, P.n
+                )
+                half_kick_kernel[blocks_particles, threads](
+                    vx_d, vy_d, w_d, fx_new_d, fy_new_d, cfg.dt, P.n
+                )
 
+                # swap force buffers
+                fx_d, fx_new_d = fx_new_d, fx_d
+                fy_d, fy_new_d = fy_new_d, fy_d
+
+            cuda.synchronize()
             t1 = time.perf_counter()
 
+            # Final catch-up frame (same as CPU code)
             if (cfg.maxSteps - 1) % cfg.outputEvery != 0:
-                build_screen(screen, P, wmin, wr)
+                zero_int64_kernel[blocks_screen, threads](screen_d, screen.nx * screen.ny)
+                build_screen_kernel[blocks_particles, threads](
+                    screen_d,
+                    x_d, y_d, w_d,
+                    screen.nx, screen.ny,
+                    screen.xs, screen.xe,
+                    screen.ys, screen.ye,
+                    wmin, wr, P.n
+                )
+                cuda.synchronize()
+
+                x_d.copy_to_host(P.x)
+                y_d.copy_to_host(P.y)
+                vx_d.copy_to_host(P.vx)
+                vy_d.copy_to_host(P.vy)
+
+                screen_host_i64 = screen_d.copy_to_host()
+                screen.values[:] = screen_host_i64.astype(np.uint64, copy=False)
+
                 h5.write_frame(P, screen)
 
         elapsed_s = t1 - t0
@@ -566,4 +675,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

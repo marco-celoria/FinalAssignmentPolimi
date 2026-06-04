@@ -21,8 +21,8 @@ find_package(HDF5 REQUIRED COMPONENTS C CXX)
 # ------------------------------------------------------------
 # EXECUTABLE & SOURCES
 # ------------------------------------------------------------
-# Assuming your code is saved as particles_hdf5.cpp
-add_executable(particle_sim particles_hdf5.cpp)
+# Assuming your code is saved as particles.cpp
+add_executable(particle_sim particles.cpp)
 
 # ------------------------------------------------------------
 # TARGET PROPERTIES & DEPENDENCIES
