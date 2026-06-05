@@ -57,11 +57,11 @@ class Particles:
 
     def resize(self, N: int) -> None:
         self.n = N
-        self.w = np.empty(N, dtype=np.float64)
-        self.x = np.empty(N, dtype=np.float64)
-        self.y = np.empty(N, dtype=np.float64)
-        self.vx = np.empty(N, dtype=np.float64)
-        self.vy = np.empty(N, dtype=np.float64)
+        self.w = np.zeros(N, dtype=np.float64)
+        self.x = np.zeros(N, dtype=np.float64)
+        self.y = np.zeros(N, dtype=np.float64)
+        self.vx = np.zeros(N, dtype=np.float64)
+        self.vy = np.zeros(N, dtype=np.float64)
 
 
 @dataclass
@@ -346,9 +346,6 @@ def generate_particles(g: Grid, pg: Grid) -> Particles:
 
     P.x[:] = pg.xs + (pg.xe - pg.xs) * (is_.astype(np.float64) / float(g.nx - 1))
     P.y[:] = pg.ys + (pg.ye - pg.ys) * (js.astype(np.float64) / float(g.ny - 1))
-
-    P.vx.fill(0.0)
-    P.vy.fill(0.0)
 
     return P
 
