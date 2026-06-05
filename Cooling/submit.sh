@@ -5,7 +5,7 @@
 #SBATCH --partition=boost_usr_prod
 #SBATCH --time=0:30:00
 #SBATCH --mem=200GB
-#SBATCH --job-name=run_test_comm
+#SBATCH --job-name=run_validate
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
 #SBATCH --gres=gpu:1
@@ -21,9 +21,9 @@ module load hdf5/1.14.3--gcc--12.2.0-spack0.22
 module load python/3.11.7 
 source cooling_venv/bin/activate
 echo "Cpp vs Cuda"
-#srun python validate_cooling_h5.py Cpp/build/cooling.h5 Cuda/build/cooling.h5  
+srun python validate_cooling_h5.py Cpp/build/cooling.h5 Cuda/build/cooling.h5  
 echo "Cpp vs Numba"
 srun python validate_cooling_h5.py Cpp/build/cooling.h5 Numba/cooling.h5
 echo "Cpp vs NumbaCuda"
-#srun python validate_cooling_h5.py Cpp/build/cooling.h5 NumbaCuda/cooling.h5
+srun python validate_cooling_h5.py Cpp/build/cooling.h5 NumbaCuda/cooling.h5
 

@@ -109,7 +109,6 @@ def read_input(fname: str) -> Config:
     dimag = next_float()
     max_iters = next_int()
     steps = next_int()
-    _legacy_ppm_flag = next_int()  # parsed and ignored
 
     if max_iters <= 0:
         raise RuntimeError("maxIters must be > 0")
@@ -196,7 +195,7 @@ def build_cooling_coeffs(nx: int, ny: int, dd: float = 100.0) -> Tuple[float, fl
 # - interior and boundaries separated
 # ============================================================
 
-@njit(parallel=False, fastmath=False)
+@njit(parallel=True, fastmath=False)
 def compute_weight_kernel(weight: np.ndarray,
                           nx: int, ny: int,
                           x0: float, y0: float,
@@ -231,7 +230,7 @@ def compute_weight_kernel(weight: np.ndarray,
             weight[p] = it
 
 
-@njit(parallel=False, fastmath=False)
+@njit(parallel=True, fastmath=False)
 def initialize_field_kernel(u: np.ndarray,
                             weight: np.ndarray,
                             nx: int, ny: int,
@@ -458,13 +457,25 @@ def run_simulation(cfg: Config, h5_file: str, csv_file: str) -> None:
         t0 = time.perf_counter()
         compute_weight_kernel(weight, cfg.nx, cfg.ny, x0, y0, dx, dy, cfg.maxIters)
         t1 = time.perf_counter()
-
+        def flat_idx(i: int, j: int, nx: int) -> int:
+            return j * nx + i
+        # after compute_weight_kernel(...)
         wmin = int(weight.min())
         wmax = int(weight.max())
+
+        print(f"DEBUG discrepancy = {discrepancy:.17g}")
+        print(f"DEBUG wmin = {wmin}, wmax = {wmax}")
+
+        for (j, i) in [(10, 1291), (0, 0), (cfg.ny // 2, cfg.nx // 2), (cfg.ny - 1, cfg.nx - 1)]:
+            p = flat_idx(i, j, cfg.nx)
+            print(f"DEBUG weight[{j},{i}] = {int(weight[p])}")
 
         initialize_field_kernel(u_curr, weight, cfg.nx, cfg.ny, x0, y0, dx, dy,
                                 discrepancy, wmin, wmax)
         t2 = time.perf_counter()
+        for (j, i) in [(10, 1291), (0, 0), (cfg.ny // 2, cfg.nx // 2), (cfg.ny - 1, cfg.nx - 1)]:
+            p = flat_idx(i, j, cfg.nx)
+            print(f"DEBUG u0[{j},{i}] = {u_curr[p]:.17g}")
 
         with H5Writer(h5_file, cfg.nx, cfg.ny, 32) as writer:
             # Step 0

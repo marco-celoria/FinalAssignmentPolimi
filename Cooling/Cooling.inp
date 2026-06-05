@@ -1,29 +1,80 @@
-# Xdots:
-2000
-# Ydots:
-2000
-# Field measured values - 26-06-2012
-  9
-#        x, y, v
--0.374959   -0.661204   4.056965
--0.374959   -0.659061   4.056880
--0.374959   -0.656918   4.056796
--0.373754   -0.661204   4.056498
--0.373754   -0.659061   4.056414
--0.373754   -0.656918   4.056330
--0.372548   -0.661204   4.056034
--0.372548   -0.659061   4.055950
--0.372548   -0.656918   4.055866
+# ============================================================
+# Cooling Solver Input File
+# ============================================================
 #
-# Sreal, Simag, Rreal, Rimag
-#-1.2033787500
+# Format (numeric tokens are read in this exact order):
+#
+#   1) nx
+#   2) ny
+#   3) nMeasured
+#   4) measured points: (x y v) repeated nMeasured times
+#   5) Sreal
+#   6) Simag
+#   7) Dreal
+#   8) Dimag
+#   9) maxIters
+#  10) steps
+#  11) legacyPPMFlag   (parsed but ignored by current code)
+#
+# Notes:
+# - Comments are ignored.
+# - Keep all numeric values in the same order.
+# - Grid is node-centered and includes both boundaries.
+#
+# ============================================================
+# Grid dimensions
+# ============================================================
+
+# Number of grid points in x direction
+2000
+
+# Number of grid points in y direction
+2000
+
+# ============================================================
+# Measured field samples
+# ============================================================
+
+# Number of measured points
+9
+
+# Measured points: x  y  v
+-0.374959  -0.661204  4.056965
+-0.374959  -0.659061  4.056880
+-0.374959  -0.656918  4.056796
+-0.373754  -0.661204  4.056498
+-0.373754  -0.659061  4.056414
+-0.373754  -0.656918  4.056330
+-0.372548  -0.661204  4.056034
+-0.372548  -0.659061  4.055950
+-0.372548  -0.656918  4.055866
+
+# ============================================================
+# Computational domain
+# ============================================================
+#
+# Sreal = x origin
+# Simag = y origin
+# Dreal = domain size in x
+# Dimag = domain size in y
+#
+# Domain:
+#   x(i) = Sreal + i * Dreal / (nx - 1)
+#   y(j) = Simag + j * Dimag / (ny - 1)
+#
+
 -0.376165
 -0.663348
 0.004822
 0.008573
-# MaxIters
+
+# ============================================================
+# Fractal / initialization settings
+# ============================================================
+
+# Maximum Mandelbrot iterations
 4000
-# Computed steps
+
+# Number of time steps
 240
-# 1 := generates .PPM files
-0
+

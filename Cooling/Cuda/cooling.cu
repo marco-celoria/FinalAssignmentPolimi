@@ -284,10 +284,6 @@ Config readInput(const std::string& fname)
     cfg.maxIters = nextInt();
     cfg.steps    = nextInt();
 
-    // Legacy input contains a final PPM flag. We parse and ignore it.
-    const int legacyPPMFlag = nextInt();
-    (void)legacyPPMFlag;
-
     if (cfg.maxIters <= 0) {
         throw std::runtime_error("maxIters must be > 0");
     }

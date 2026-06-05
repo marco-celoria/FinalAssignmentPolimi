@@ -5,7 +5,7 @@
 #SBATCH --partition=boost_usr_prod
 #SBATCH --time=0:30:00
 #SBATCH --mem=50GB
-#SBATCH --job-name=run_test_comm
+#SBATCH --job-name=run_cpp_cooling
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
 #SBATCH --gres=gpu:1

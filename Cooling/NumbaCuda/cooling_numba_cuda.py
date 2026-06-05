@@ -109,7 +109,6 @@ def read_input(fname: str) -> Config:
     dimag = next_float()
     max_iters = next_int()
     steps = next_int()
-    _legacy_ppm_flag = next_int()  # parsed and ignored for compatibility
 
     if max_iters <= 0:
         raise RuntimeError("maxIters must be > 0")

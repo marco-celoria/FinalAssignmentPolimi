@@ -107,7 +107,6 @@ std::size_t safeGridSize(std::size_t nx, std::size_t ny)
 //   Dimag
 //   maxIters
 //   steps
-//   ppmFlag   <-- ignored here (legacy compatibility)
 // ============================================================
 
 Config readInput(const std::string& fname)
@@ -191,10 +190,6 @@ Config readInput(const std::string& fname)
     cfg.Dimag    = nextDouble();
     cfg.maxIters = nextInt();
     cfg.steps    = nextInt();
-
-    // Legacy input contains a final PPM flag. We parse and ignore it.
-    const int legacyPPMFlag = nextInt();
-    (void)legacyPPMFlag;
 
     if (cfg.maxIters <= 0) {
         throw std::runtime_error("maxIters must be > 0");
@@ -753,7 +748,28 @@ int main(int argc, char** argv)
 
         initializeField(uCurr, weight, cfg, map, discrepancy);
         auto t2 = std::chrono::steady_clock::now();
+        //////////////////////////
+	auto flatIdx = [&](std::size_t i, std::size_t j) { return idx2D(i, j, cfg.nx);};
+        const auto [wminIt, wmaxIt] = std::minmax_element(weight.begin(), weight.end());
+        std::cout << std::setprecision(17);
+        std::cout << "DEBUG discrepancy = " << discrepancy << "\n";
+        std::cout << "DEBUG wmin = " << *wminIt << ", wmax = " << *wmaxIt << "\n";
+        for (const auto& ij : std::vector<std::pair<std::size_t,std::size_t>>{
+           {1291, 10}, {0, 0}, {cfg.nx / 2, cfg.ny / 2}, {cfg.nx - 1, cfg.ny - 1}}) {
+           const std::size_t i = ij.first;
+           const std::size_t j = ij.second;
+           const std::size_t p = flatIdx(i, j);
+           std::cout << "DEBUG weight[" << j << "," << i << "] = " << weight[p] << "\n";
+        }
 
+        for (const auto& ij : std::vector<std::pair<std::size_t,std::size_t>>{
+            {1291, 10}, {0, 0}, {cfg.nx / 2, cfg.ny / 2}, {cfg.nx - 1, cfg.ny - 1}}) {
+            const std::size_t i = ij.first;
+            const std::size_t j = ij.second;
+            const std::size_t p = flatIdx(i, j);
+            std::cout << "DEBUG u0[" << j << "," << i << "] = " << uCurr[p] << "\n";
+        }
+        ////////////////////////////
         H5Writer writer(h5File, cfg.nx, cfg.ny, 32);
         
         // step 0
