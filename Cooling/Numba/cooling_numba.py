@@ -196,7 +196,7 @@ def build_cooling_coeffs(nx: int, ny: int, dd: float = 100.0) -> Tuple[float, fl
 # - interior and boundaries separated
 # ============================================================
 
-@njit(parallel=True, fastmath=False)
+@njit(parallel=False, fastmath=False)
 def compute_weight_kernel(weight: np.ndarray,
                           nx: int, ny: int,
                           x0: float, y0: float,
@@ -231,7 +231,7 @@ def compute_weight_kernel(weight: np.ndarray,
             weight[p] = it
 
 
-@njit(parallel=True, fastmath=False)
+@njit(parallel=False, fastmath=False)
 def initialize_field_kernel(u: np.ndarray,
                             weight: np.ndarray,
                             nx: int, ny: int,
