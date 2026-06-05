@@ -373,51 +373,8 @@ CoolingCoeffs buildCoolingCoeffs(double dx, double dy, double dd = 100.0)
 
     return c;
 }
-/*
-CoolingCoeffs buildCoolingCoeffs(std::size_t nx, std::size_t ny, double dd = 100.0)
-{
-    if (nx < 3 || ny < 3) {
-        throw std::invalid_argument("buildCoolingCoeffs: nx and ny must be at least 3");
-    }
-    if (dd <= 0.0) {
-        throw std::invalid_argument("buildCoolingCoeffs: dd must be > 0");
-    }
 
-    CoolingCoeffs c{};
-    c.dd = dd;
-    c.hx = 1.0 / static_cast<double>(nx - 1);
-    c.hy = 1.0 / static_cast<double>(ny - 1);
 
-    const double hx2 = c.hx * c.hx;
-    const double hy2 = c.hy * c.hy;
-
-    c.dgx = -2.0 * (1.0 + c.dd * c.hx / (hx2 + c.dd));
-    c.dgy = -2.0 * (1.0 + c.dd * c.hy / (hy2 + c.dd));
-
-    c.CX = (c.hx + c.dd * std::exp(c.hx)) / (15.0 * c.dd + c.hx);
-    c.CY = (c.hy + c.dd * std::exp(c.hy)) / (15.0 * c.dd + c.hy);
-
-    return c;
-}
-*/
-/*
-CoolingCoeffs buildCoolingCoeffs(std::size_t nx, std::size_t ny, double dd = 100.0)
-{
-    if (nx < 3 || ny < 3) {
-        throw std::invalid_argument("buildCoolingCoeffs: nx and ny must be at least 3");
-    }
-
-    CoolingCoeffs c{};
-    c.dd  = dd;
-    c.hx  = 1.0 / static_cast<double>(nx - 1);
-    c.hy  = 1.0 / static_cast<double>(ny - 1);
-    c.dgx = -2.0 * (1.0 + c.dd * c.hx / (c.hx * c.hx + c.dd));
-    c.dgy = -2.0 * (1.0 + c.dd * c.hy / (c.hy * c.hy + c.dd));
-    c.CX  = (c.hx + c.dd * std::exp(c.hx)) / (15.0 * c.dd + c.hx);
-    c.CY  = (c.hy + c.dd * std::exp(c.hy)) / (15.0 * c.dd + c.hy);
-    return c;
-}
-*/
 // ============================================================
 // HDF5 WRITER
 //   Writes:
@@ -938,7 +895,6 @@ int main(int argc, char** argv)
 
         const DomainMap map = buildDomainMap(cfg);
         const CoolingCoeffs cooling = buildCoolingCoeffs(map.dx, map.dy, 100.0);
-	//const CoolingCoeffs cooling = buildCoolingCoeffs(cfg.nx, cfg.ny, 100.0);
         const double discrepancy = computeDiscrepancy(cfg);
 
         std::vector<int> weightHost(N);
@@ -994,15 +950,6 @@ int main(int argc, char** argv)
         CUDA_CHECK(cudaEventRecord(weightStop.get()));
         CUDA_CHECK(cudaEventSynchronize(weightStop.get()));
         CUDA_CHECK(cudaEventElapsedTime(&tWeightMs, weightStart.get(), weightStop.get()));
-
-        /*CUDA_CHECK(cudaMemcpy(weightHost.data(),
-                              d_weight.get(),
-                              N * sizeof(int),
-                              cudaMemcpyDeviceToHost));
-        const auto [wminIt, wmaxIt] = std::minmax_element(weightHost.begin(), weightHost.end());
-        const int wmin = *wminIt;
-        const int wmax = *wmaxIt;
-        */
 	thrust::device_ptr<int> w_ptr(d_weight.get());
         auto minmax_pair = thrust::minmax_element(w_ptr, w_ptr + N);
         const int wmin = *minmax_pair.first;
@@ -1041,7 +988,6 @@ int main(int argc, char** argv)
                               N * sizeof(double),
                               cudaMemcpyDeviceToHost));
         writer.write(0, uHost);
-        //writeStatsLine(csv, 0, computeStats(uHost));
         Stats s = computeStatsGPU(d_uCurr.get(), N);
         writeStatsLine(csv, 0, s);
 
@@ -1082,7 +1028,6 @@ int main(int argc, char** argv)
                                       cudaMemcpyDeviceToHost));
 
                 writer.write(step, uHost);
-                //writeStatsLine(csv, step, computeStats(uHost));
                 // Calculate statistics entirely on the GPU
                 Stats s = computeStatsGPU(d_uCurr.get(), N);
                 writeStatsLine(csv, step, s);

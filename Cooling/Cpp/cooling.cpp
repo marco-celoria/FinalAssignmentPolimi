@@ -293,25 +293,6 @@ CoolingCoeffs buildCoolingCoeffs(double dx, double dy, double dd = 100.0)
     return c;
 }
 
-/*
-CoolingCoeffs buildCoolingCoeffs(std::size_t nx, std::size_t ny, double dd = 100.0)
-{
-    if (nx < 3 || ny < 3) {
-        throw std::invalid_argument("buildCoolingCoeffs: nx and ny must be at least 3");
-    }
-
-    CoolingCoeffs c{};
-    c.dd  = dd;
-    c.hx  = 1.0 / static_cast<double>(nx - 1);
-    c.hy  = 1.0 / static_cast<double>(ny - 1);
-    c.dgx = -2.0 * (1.0 + c.dd * c.hx / (c.hx * c.hx + c.dd));
-    c.dgy = -2.0 * (1.0 + c.dd * c.hy / (c.hy * c.hy + c.dd));
-    c.CX  = (c.hx + c.dd * std::exp(c.hx)) / (15.0 * c.dd + c.hx);
-    c.CY  = (c.hy + c.dd * std::exp(c.hy)) / (15.0 * c.dd + c.hy);
-    return c;
-}
-*/
-
 // ============================================================
 // HDF5 WRITER
 //   Writes:
@@ -675,25 +656,6 @@ void applyBoundary(double* u, std::size_t nx, std::size_t ny)
     }
 }
 
-/*
-void applyBoundary(double* u, std::size_t nx, std::size_t ny)
-{
-#pragma omp parallel
-    {
-#pragma omp for schedule(static)
-        for (std::size_t j = 1; j < ny - 1; ++j) {
-            u[idx2D(0,     j, nx)] = u[idx2D(1,     j, nx)];
-            u[idx2D(nx - 1, j, nx)] = u[idx2D(nx - 2, j, nx)];
-        }
-
-#pragma omp for schedule(static)
-        for (std::size_t i = 0; i < nx; ++i) {
-            u[idx2D(i, 0,      nx)] = u[idx2D(i, 1,      nx)];
-            u[idx2D(i, ny - 1, nx)] = u[idx2D(i, ny - 2, nx)];
-        }
-    }
-}
-*/
 void updateField(const double* RESTRICT u1,
                  double* RESTRICT u2,
                  std::size_t nx,
@@ -781,8 +743,6 @@ int main(int argc, char** argv)
         const std::size_t N = safeGridSize(cfg.nx, cfg.ny);
         const DomainMap map = buildDomainMap(cfg);
         const CoolingCoeffs cooling = buildCoolingCoeffs(map.dx, map.dy, 100.0);
-        //const DomainMap map = buildDomainMap(cfg);
-        //const CoolingCoeffs cooling = buildCoolingCoeffs(cfg.nx, cfg.ny, 100.0);
         const double discrepancy = computeDiscrepancy(cfg);
 
         std::vector<int> weight(N);

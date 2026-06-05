@@ -9,7 +9,6 @@ import h5py
 import numpy as np
 from numba import njit, prange
 
-
 # ============================================================
 # DATA STRUCTURES
 # ============================================================
@@ -185,28 +184,6 @@ def build_cooling_coeffs(dx: float, dy: float, dd: float = 100.0) -> Tuple[float
     CY = (hy + dd * math.exp(hy)) / (15.0 * dd + hy)
 
     return dd, hx, hy, dgx, dgy, CX, CY
-
-#def build_cooling_coeffs(nx: int, ny: int, dd: float = 100.0) -> Tuple[float, float, float, float, float, float, float]:
-#    """
-#    Matches the cleaned C++ baseline:
-#      hx = 1 / (nx - 1)
-#      hy = 1 / (ny - 1)
-#    """
-#    if nx < 3 or ny < 3:
-#        raise ValueError("build_cooling_coeffs: nx and ny must be at least 3")
-#    if dd <= 0.0:
-#        raise ValueError("build_cooling_coeffs: dd must be > 0")
-#
-#    hx = 1.0 / float(nx - 1)
-#    hy = 1.0 / float(ny - 1)
-#
-#    dgx = -2.0 * (1.0 + dd * hx / (hx * hx + dd))
-#    dgy = -2.0 * (1.0 + dd * hy / (hy * hy + dd))
-#
-#    CX = (hx + dd * math.exp(hx)) / (15.0 * dd + hx)
-#    CY = (hy + dd * math.exp(hy)) / (15.0 * dd + hy)
-#
-#    return dd, hx, hy, dgx, dgy, CX, CY
 
 
 # ============================================================
@@ -466,8 +443,6 @@ def write_stats_line(f, step: int, stats: Tuple[float, float, float, float]) -> 
 def run_simulation(cfg: Config, h5_file: str, csv_file: str) -> None:
     n = validated_grid_size(cfg.nx, cfg.ny)
 
-    #x0, y0, dx, dy = build_domain_params(cfg)
-    #_dd, _hx, _hy, dgx, dgy, CX, CY = build_cooling_coeffs(cfg.nx, cfg.ny, 100.0)
     x0, y0, dx, dy = build_domain_params(cfg)
     _, _, _, dgx, dgy, CX, CY = build_cooling_coeffs(dx, dy, 100.0)
     discrepancy = compute_discrepancy(cfg)
@@ -561,6 +536,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"CRITICAL ERROR: {e}", file=sys.stderr)
         raise SystemExit(1)
-
-
 
