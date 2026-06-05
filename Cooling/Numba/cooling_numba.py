@@ -4,7 +4,7 @@ import math
 import time
 from dataclasses import dataclass
 from typing import List, Tuple
-
+import sys
 import h5py
 import numpy as np
 from numba import njit, prange
@@ -36,15 +36,13 @@ class Config:
 
 
 # ============================================================
-# SAFE GRID SIZE
+# VALIDATE GRID SIZE
 # ============================================================
 
-def safe_grid_size(nx: int, ny: int) -> int:
+def validated_grid_size(nx: int, ny: int) -> int:
     if nx <= 0 or ny <= 0:
         raise ValueError("Grid dimensions must be > 0")
     n = nx * ny
-    if n <= 0:
-        raise OverflowError("Grid size overflow")
     return n
 
 
@@ -114,6 +112,10 @@ def read_input(fname: str) -> Config:
         raise RuntimeError("maxIters must be > 0")
     if steps < 0:
         raise RuntimeError("steps must be >= 0")
+    if dreal <= 0.0 or dimag <= 0.0:
+        raise RuntimeError("Domain extents Dreal and Dimag must be > 0")
+    if pos != len(tokens):
+        raise RuntimeError("Malformed input: unexpected extra tokens at end of file")
 
     return Config(
         nx=nx,
@@ -164,18 +166,18 @@ def compute_discrepancy(cfg: Config) -> float:
     return float(acc / np.longdouble(len(cfg.measured)))
 
 
-def build_cooling_coeffs(nx: int, ny: int, dd: float = 100.0) -> Tuple[float, float, float, float, float, float, float]:
-    """
-    Matches the cleaned C++ baseline:
-      hx = 1 / (nx - 1)
-      hy = 1 / (ny - 1)
-    """
-    if nx < 3 or ny < 3:
-        raise ValueError("build_cooling_coeffs: nx and ny must be at least 3")
+def build_cooling_coeffs(dx: float, dy: float, dd: float = 100.0) -> Tuple[float, float, float, float, float, float, float]:
+    # 1. Validation Checks
+    if dx <= 0.0 or dy <= 0.0:
+        raise ValueError("build_cooling_coeffs: dx and dy must be > 0")
+    if dd <= 0.0:
+        raise ValueError("build_cooling_coeffs: dd must be > 0")
 
-    hx = 1.0 / float(nx - 1)
-    hy = 1.0 / float(ny - 1)
+    # 2. Assign Grid Spacing
+    hx = dx
+    hy = dy
 
+    # 3. Calculate Coefficients
     dgx = -2.0 * (1.0 + dd * hx / (hx * hx + dd))
     dgy = -2.0 * (1.0 + dd * hy / (hy * hy + dd))
 
@@ -183,6 +185,28 @@ def build_cooling_coeffs(nx: int, ny: int, dd: float = 100.0) -> Tuple[float, fl
     CY = (hy + dd * math.exp(hy)) / (15.0 * dd + hy)
 
     return dd, hx, hy, dgx, dgy, CX, CY
+
+#def build_cooling_coeffs(nx: int, ny: int, dd: float = 100.0) -> Tuple[float, float, float, float, float, float, float]:
+#    """
+#    Matches the cleaned C++ baseline:
+#      hx = 1 / (nx - 1)
+#      hy = 1 / (ny - 1)
+#    """
+#    if nx < 3 or ny < 3:
+#        raise ValueError("build_cooling_coeffs: nx and ny must be at least 3")
+#    if dd <= 0.0:
+#        raise ValueError("build_cooling_coeffs: dd must be > 0")
+#
+#    hx = 1.0 / float(nx - 1)
+#    hy = 1.0 / float(ny - 1)
+#
+#    dgx = -2.0 * (1.0 + dd * hx / (hx * hx + dd))
+#    dgy = -2.0 * (1.0 + dd * hy / (hy * hy + dd))
+#
+#    CX = (hx + dd * math.exp(hx)) / (15.0 * dd + hx)
+#    CY = (hy + dd * math.exp(hy)) / (15.0 * dd + hy)
+#
+#    return dd, hx, hy, dgx, dgy, CX, CY
 
 
 # ============================================================
@@ -440,10 +464,12 @@ def write_stats_line(f, step: int, stats: Tuple[float, float, float, float]) -> 
 # ============================================================
 
 def run_simulation(cfg: Config, h5_file: str, csv_file: str) -> None:
-    n = safe_grid_size(cfg.nx, cfg.ny)
+    n = validated_grid_size(cfg.nx, cfg.ny)
 
+    #x0, y0, dx, dy = build_domain_params(cfg)
+    #_dd, _hx, _hy, dgx, dgy, CX, CY = build_cooling_coeffs(cfg.nx, cfg.ny, 100.0)
     x0, y0, dx, dy = build_domain_params(cfg)
-    _dd, _hx, _hy, dgx, dgy, CX, CY = build_cooling_coeffs(cfg.nx, cfg.ny, 100.0)
+    _, _, _, dgx, dgy, CX, CY = build_cooling_coeffs(dx, dy, 100.0)
     discrepancy = compute_discrepancy(cfg)
 
     # Flat arrays only: GPU-friendly design
@@ -457,25 +483,12 @@ def run_simulation(cfg: Config, h5_file: str, csv_file: str) -> None:
         t0 = time.perf_counter()
         compute_weight_kernel(weight, cfg.nx, cfg.ny, x0, y0, dx, dy, cfg.maxIters)
         t1 = time.perf_counter()
-        def flat_idx(i: int, j: int, nx: int) -> int:
-            return j * nx + i
-        # after compute_weight_kernel(...)
         wmin = int(weight.min())
         wmax = int(weight.max())
-
-        print(f"DEBUG discrepancy = {discrepancy:.17g}")
-        print(f"DEBUG wmin = {wmin}, wmax = {wmax}")
-
-        for (j, i) in [(10, 1291), (0, 0), (cfg.ny // 2, cfg.nx // 2), (cfg.ny - 1, cfg.nx - 1)]:
-            p = flat_idx(i, j, cfg.nx)
-            print(f"DEBUG weight[{j},{i}] = {int(weight[p])}")
 
         initialize_field_kernel(u_curr, weight, cfg.nx, cfg.ny, x0, y0, dx, dy,
                                 discrepancy, wmin, wmax)
         t2 = time.perf_counter()
-        for (j, i) in [(10, 1291), (0, 0), (cfg.ny // 2, cfg.nx // 2), (cfg.ny - 1, cfg.nx - 1)]:
-            p = flat_idx(i, j, cfg.nx)
-            print(f"DEBUG u0[{j},{i}] = {u_curr[p]:.17g}")
 
         with H5Writer(h5_file, cfg.nx, cfg.ny, 32) as writer:
             # Step 0
@@ -542,6 +555,12 @@ def main() -> int:
     run_simulation(cfg, args.h5, args.csv)
     return 0
 
-
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as e:
+        print(f"CRITICAL ERROR: {e}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+

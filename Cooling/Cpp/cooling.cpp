@@ -47,7 +47,7 @@ struct Config {
     double Sreal{}, Simag{}, Dreal{}, Dimag{};
     int maxIters{};
     int steps{};
-    int outputEvery{1}; // HDF5 snapshot cadence (CLI override)
+    int outputEvery{1}; // snapshot and stats cadence
     std::vector<MeasuredPoint> measured;
 };
 
@@ -137,15 +137,21 @@ Config readInput(const std::string& fname)
     }
 
     std::size_t pos = 0;
-
+    
     auto nextInt = [&]() -> int {
         if (pos >= tokens.size()) {
             throw std::runtime_error("Malformed input: missing integer token");
         }
+        const std::string& s = tokens.at(pos++);
         try {
-            return std::stoi(tokens.at(pos++));
-        } catch (const std::exception&) {
-            throw std::runtime_error("Malformed input: invalid integer token '" + tokens.at(pos - 1) + "'");
+            std::size_t used = 0;
+            int v = std::stoi(s, &used);
+            if (used != s.size()) {
+                throw std::runtime_error("");
+            }
+            return v;
+        } catch (...) {
+            throw std::runtime_error("Malformed input: invalid integer token '" + s + "'");
         }
     };
 
@@ -153,12 +159,19 @@ Config readInput(const std::string& fname)
         if (pos >= tokens.size()) {
             throw std::runtime_error("Malformed input: missing floating-point token");
         }
+        const std::string& s = tokens.at(pos++);
         try {
-            return std::stod(tokens.at(pos++));
-        } catch (const std::exception&) {
-            throw std::runtime_error("Malformed input: invalid floating-point token '" + tokens.at(pos - 1) + "'");
+            std::size_t used = 0;
+            double v = std::stod(s, &used);
+            if (used != s.size()) {
+                throw std::runtime_error("");
+            }
+            return v;
+        } catch (...) {
+            throw std::runtime_error("Malformed input: invalid floating-point token '" + s + "'");
         }
     };
+
 
     Config cfg{};
 
@@ -197,10 +210,16 @@ Config readInput(const std::string& fname)
     if (cfg.steps < 0) {
         throw std::runtime_error("steps must be >= 0");
     }
+    if (cfg.Dreal <= 0.0 || cfg.Dimag <= 0.0) {
+        throw std::runtime_error("Domain extents Dreal and Dimag must be > 0");
+    }
+
+    if (pos != tokens.size()) {
+        throw std::runtime_error("Malformed input: unexpected extra tokens at end of file");
+    }
 
     // default HDF5 write cadence unless overridden on CLI
     cfg.outputEvery = 1;
-
     return cfg;
 }
 
@@ -257,6 +276,24 @@ double computeDiscrepancy(const Config& cfg)
 //   simple and GPU-portable.
 // ============================================================
 
+CoolingCoeffs buildCoolingCoeffs(double dx, double dy, double dd = 100.0)
+{
+    if (dx <= 0.0 || dy <= 0.0) {
+        throw std::invalid_argument("buildCoolingCoeffs: dx and dy must be > 0");
+    }
+
+    CoolingCoeffs c{};
+    c.dd  = dd;
+    c.hx  = dx;
+    c.hy  = dy;
+    c.dgx = -2.0 * (1.0 + c.dd * c.hx / (c.hx * c.hx + c.dd));
+    c.dgy = -2.0 * (1.0 + c.dd * c.hy / (c.hy * c.hy + c.dd));
+    c.CX  = (c.hx + c.dd * std::exp(c.hx)) / (15.0 * c.dd + c.hx);
+    c.CY  = (c.hy + c.dd * std::exp(c.hy)) / (15.0 * c.dd + c.hy);
+    return c;
+}
+
+/*
 CoolingCoeffs buildCoolingCoeffs(std::size_t nx, std::size_t ny, double dd = 100.0)
 {
     if (nx < 3 || ny < 3) {
@@ -273,7 +310,7 @@ CoolingCoeffs buildCoolingCoeffs(std::size_t nx, std::size_t ny, double dd = 100
     c.CY  = (c.hy + c.dd * std::exp(c.hy)) / (15.0 * c.dd + c.hy);
     return c;
 }
-
+*/
 
 // ============================================================
 // HDF5 WRITER
@@ -371,7 +408,7 @@ public:
         if (closed_) {
             throw std::runtime_error("H5Writer: write() called after close()");
         }
-        if (field.size() != nx_ * ny_) {
+	if (field.size() != safeGridSize(nx_, ny_)) {
             throw std::runtime_error("H5Writer: field size mismatch");
         }
 
@@ -604,8 +641,6 @@ void updateInterior(const double* RESTRICT u1,
 // ------------------------------------------------------------
 // 4) Boundary update
 //
-// Enforces zero-normal-gradient style copying:
-//
 // left  = neighbor at i=1
 // right = neighbor at i=nx-2
 // top   = neighbor at j=1
@@ -614,6 +649,33 @@ void updateInterior(const double* RESTRICT u1,
 // Split out separately for clarity and future GPU portability.
 // ------------------------------------------------------------
 
+void applyBoundary(double* u, std::size_t nx, std::size_t ny)
+{
+#pragma omp parallel
+    {
+#pragma omp for schedule(static)
+        for (std::size_t j = 1; j < ny - 1; ++j) {
+            u[idx2D(0,      j, nx)] = u[idx2D(1,      j, nx)];
+            u[idx2D(nx - 1, j, nx)] = u[idx2D(nx - 2, j, nx)];
+        }
+
+#pragma omp for schedule(static)
+        for (std::size_t i = 1; i < nx - 1; ++i) {
+            u[idx2D(i, 0,      nx)] = u[idx2D(i, 1,      nx)];
+            u[idx2D(i, ny - 1, nx)] = u[idx2D(i, ny - 2, nx)];
+        }
+
+#pragma omp single
+        {
+            u[idx2D(0,      0,      nx)] = u[idx2D(1,      0,      nx)];
+            u[idx2D(nx - 1, 0,      nx)] = u[idx2D(nx - 2, 0,      nx)];
+            u[idx2D(0,      ny - 1, nx)] = u[idx2D(1,      ny - 1, nx)];
+            u[idx2D(nx - 1, ny - 1, nx)] = u[idx2D(nx - 2, ny - 1, nx)];
+        }
+    }
+}
+
+/*
 void applyBoundary(double* u, std::size_t nx, std::size_t ny)
 {
 #pragma omp parallel
@@ -631,7 +693,7 @@ void applyBoundary(double* u, std::size_t nx, std::size_t ny)
         }
     }
 }
-
+*/
 void updateField(const double* RESTRICT u1,
                  double* RESTRICT u2,
                  std::size_t nx,
@@ -717,9 +779,10 @@ int main(int argc, char** argv)
         }
 
         const std::size_t N = safeGridSize(cfg.nx, cfg.ny);
-
         const DomainMap map = buildDomainMap(cfg);
-        const CoolingCoeffs cooling = buildCoolingCoeffs(cfg.nx, cfg.ny, 100.0);
+        const CoolingCoeffs cooling = buildCoolingCoeffs(map.dx, map.dy, 100.0);
+        //const DomainMap map = buildDomainMap(cfg);
+        //const CoolingCoeffs cooling = buildCoolingCoeffs(cfg.nx, cfg.ny, 100.0);
         const double discrepancy = computeDiscrepancy(cfg);
 
         std::vector<int> weight(N);
@@ -748,28 +811,6 @@ int main(int argc, char** argv)
 
         initializeField(uCurr, weight, cfg, map, discrepancy);
         auto t2 = std::chrono::steady_clock::now();
-        //////////////////////////
-	auto flatIdx = [&](std::size_t i, std::size_t j) { return idx2D(i, j, cfg.nx);};
-        const auto [wminIt, wmaxIt] = std::minmax_element(weight.begin(), weight.end());
-        std::cout << std::setprecision(17);
-        std::cout << "DEBUG discrepancy = " << discrepancy << "\n";
-        std::cout << "DEBUG wmin = " << *wminIt << ", wmax = " << *wmaxIt << "\n";
-        for (const auto& ij : std::vector<std::pair<std::size_t,std::size_t>>{
-           {1291, 10}, {0, 0}, {cfg.nx / 2, cfg.ny / 2}, {cfg.nx - 1, cfg.ny - 1}}) {
-           const std::size_t i = ij.first;
-           const std::size_t j = ij.second;
-           const std::size_t p = flatIdx(i, j);
-           std::cout << "DEBUG weight[" << j << "," << i << "] = " << weight[p] << "\n";
-        }
-
-        for (const auto& ij : std::vector<std::pair<std::size_t,std::size_t>>{
-            {1291, 10}, {0, 0}, {cfg.nx / 2, cfg.ny / 2}, {cfg.nx - 1, cfg.ny - 1}}) {
-            const std::size_t i = ij.first;
-            const std::size_t j = ij.second;
-            const std::size_t p = flatIdx(i, j);
-            std::cout << "DEBUG u0[" << j << "," << i << "] = " << uCurr[p] << "\n";
-        }
-        ////////////////////////////
         H5Writer writer(h5File, cfg.nx, cfg.ny, 32);
         
         // step 0

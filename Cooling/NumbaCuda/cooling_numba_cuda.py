@@ -4,6 +4,7 @@ import math
 import time
 from dataclasses import dataclass
 from typing import List, Tuple
+import sys
 
 import h5py
 import numpy as np
@@ -36,17 +37,13 @@ class Config:
 
 
 # ============================================================
-# SAFE GRID SIZE
+# VALIDATE GRID SIZE
 # ============================================================
 
-def safe_grid_size(nx: int, ny: int) -> int:
+def validated_grid_size(nx: int, ny: int) -> int:
     if nx <= 0 or ny <= 0:
         raise ValueError("Grid dimensions must be > 0")
-    n = nx * ny
-    if n <= 0:
-        raise OverflowError("Grid size overflow")
-    return n
-
+    return nx * ny
 
 # ============================================================
 # INPUT PARSER
@@ -114,6 +111,10 @@ def read_input(fname: str) -> Config:
         raise RuntimeError("maxIters must be > 0")
     if steps < 0:
         raise RuntimeError("steps must be >= 0")
+    if dreal <= 0.0 or dimag <= 0.0:
+        raise RuntimeError("Domain extents Dreal and Dimag must be > 0")
+    if pos != len(tokens):
+        raise RuntimeError("Malformed input: unexpected extra tokens at end of file")
 
     return Config(
         nx=nx,
@@ -156,13 +157,35 @@ def compute_discrepancy(cfg: Config) -> float:
     return float(acc / np.longdouble(len(cfg.measured)))
 
 
-def build_cooling_coeffs(nx: int, ny: int, dd: float = 100.0) -> Tuple[float, float, float, float, float, float, float]:
-    if nx < 3 or ny < 3:
-        raise ValueError("build_cooling_coeffs: nx and ny must be at least 3")
+#def build_cooling_coeffs(nx: int, ny: int, dd: float = 100.0) -> Tuple[float, float, float, float, float, float, float]:
+#    if nx < 3 or ny < 3:
+#        raise ValueError("build_cooling_coeffs: nx and ny must be at least 3")
+#    if dd <= 0.0:
+#        raise ValueError("build_cooling_coeffs: dd must be > 0")
+#
+#    hx = 1.0 / float(nx - 1)
+#    hy = 1.0 / float(ny - 1)
+#
+#    dgx = -2.0 * (1.0 + dd * hx / (hx * hx + dd))
+#    dgy = -2.0 * (1.0 + dd * hy / (hy * hy + dd))
+#
+#    CX = (hx + dd * math.exp(hx)) / (15.0 * dd + hx)
+#    CY = (hy + dd * math.exp(hy)) / (15.0 * dd + hy)
+#
+#    return dd, hx, hy, dgx, dgy, CX, CY
 
-    hx = 1.0 / float(nx - 1)
-    hy = 1.0 / float(ny - 1)
+def build_cooling_coeffs(dx: float, dy: float, dd: float = 100.0):
+    # 1. Validation Checks
+    if dx <= 0.0 or dy <= 0.0:
+        raise ValueError("build_cooling_coeffs: dx and dy must be > 0")
+    if dd <= 0.0:
+        raise ValueError("build_cooling_coeffs: dd must be > 0")
 
+    # 2. Assign Grid Spacing
+    hx = dx
+    hy = dy
+
+    # 3. Calculate Coefficients
     dgx = -2.0 * (1.0 + dd * hx / (hx * hx + dd))
     dgy = -2.0 * (1.0 + dd * hy / (hy * hy + dd))
 
@@ -170,7 +193,6 @@ def build_cooling_coeffs(nx: int, ny: int, dd: float = 100.0) -> Tuple[float, fl
     CY = (hy + dd * math.exp(hy)) / (15.0 * dd + hy)
 
     return dd, hx, hy, dgx, dgy, CX, CY
-
 
 # ============================================================
 # CUDA KERNELS
@@ -241,6 +263,10 @@ def update_interior_kernel(u1, u2, nx, ny, dgx, dgy, CX, CY):
         )
     )
 
+
+# Left/right edges are updated first.
+# Top/bottom then copies from the already-updated edge-adjacent values,
+# so corners are implicitly determined by the edge-update order.
 
 @cuda.jit
 def apply_boundary_lr_kernel(u, nx, ny):
@@ -415,9 +441,11 @@ def run_simulation(cfg: Config,
             "CUDA is not available. Check NVIDIA driver / CUDA runtime / Numba installation."
         )
 
-    n = safe_grid_size(cfg.nx, cfg.ny)
+    n = validated_grid_size(cfg.nx, cfg.ny)
+#    x0, y0, dx, dy = build_domain_params(cfg)
+#    _dd, _hx, _hy, dgx, dgy, CX, CY = build_cooling_coeffs(cfg.nx, cfg.ny, 100.0)
     x0, y0, dx, dy = build_domain_params(cfg)
-    _dd, _hx, _hy, dgx, dgy, CX, CY = build_cooling_coeffs(cfg.nx, cfg.ny, 100.0)
+    _, _, _, dgx, dgy, CX, CY = build_cooling_coeffs(dx, dy, 100.0)
     discrepancy = compute_discrepancy(cfg)
 
     # Host array used only when needed for reductions / output
@@ -466,10 +494,10 @@ def run_simulation(cfg: Config,
                     dgx, dgy, CX, CY,
                     block2d, block1d
                 )
-                cuda.synchronize()
                 d_u_curr, d_u_next = d_u_next, d_u_curr
 
                 if (step % cfg.outputEvery) == 0 or step == cfg.steps:
+                    cuda.synchronize()
                     u_host = d_u_curr.copy_to_host()
                     writer.write(step, u_host)
                     write_stats_line(csvf, step, compute_stats(u_host))
@@ -544,4 +572,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as e:
+        print(f"CRITICAL ERROR: {e}", file=sys.stderr)
+        raise SystemExit(1)
+
+

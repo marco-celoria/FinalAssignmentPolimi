@@ -14,7 +14,11 @@
 #include <string>
 #include <utility>
 #include <vector>
-
+#include <thrust/device_ptr.h>
+#include <thrust/extrema.h>
+#include <thrust/reduce.h>
+#include <thrust/transform_reduce.h>
+#include <charconv> // Required for std::from_chars
 // ============================================================
 // CUDA ERROR HANDLING
 // ============================================================
@@ -55,7 +59,7 @@ public:
         : ptr_(nullptr), count_(count)
     {
         if (count_ > 0) {
-            CUDA_CHECK(cudaMalloc(&ptr_, count_ * sizeof(T)));
+	    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ptr_), count_ * sizeof(T)));
         }
     }
 
@@ -230,15 +234,21 @@ Config readInput(const std::string& fname)
     }
 
     std::size_t pos = 0;
-
+    
     auto nextInt = [&]() -> int {
         if (pos >= tokens.size()) {
             throw std::runtime_error("Malformed input: missing integer token");
         }
+        const std::string& s = tokens.at(pos++);
         try {
-            return std::stoi(tokens.at(pos++));
-        } catch (const std::exception&) {
-            throw std::runtime_error("Malformed input: invalid integer token '" + tokens.at(pos - 1) + "'");
+            std::size_t used = 0;
+            int v = std::stoi(s, &used);
+            if (used != s.size()) {
+                throw std::runtime_error("");
+            }
+            return v;
+        } catch (...) {
+            throw std::runtime_error("Malformed input: invalid integer token '" + s + "'");
         }
     };
 
@@ -246,12 +256,18 @@ Config readInput(const std::string& fname)
         if (pos >= tokens.size()) {
             throw std::runtime_error("Malformed input: missing floating-point token");
         }
+        const std::string& s = tokens.at(pos++);
         try {
-            return std::stod(tokens.at(pos++));
-        } catch (const std::exception&) {
-            throw std::runtime_error("Malformed input: invalid floating-point token '" + tokens.at(pos - 1) + "'");
+            std::size_t used = 0;
+            double v = std::stod(s, &used);
+            if (used != s.size()) {
+                throw std::runtime_error("");
+            }
+            return v;
+         } catch (...) {
+            throw std::runtime_error("Malformed input: invalid floating-point token '" + s + "'");
         }
-    };
+     };
 
     Config cfg{};
 
@@ -290,7 +306,12 @@ Config readInput(const std::string& fname)
     if (cfg.steps < 0) {
         throw std::runtime_error("steps must be >= 0");
     }
-
+    if (cfg.Dreal <= 0.0 || cfg.Dimag <= 0.0) {
+        throw std::runtime_error("Domain extents Dreal and Dimag must be > 0");
+    }
+    if (pos != tokens.size()) {
+        throw std::runtime_error("Malformed input: unexpected extra tokens at end of file");
+    }
     cfg.outputEvery = 1;
     return cfg;
 }
@@ -327,6 +348,59 @@ double computeDiscrepancy(const Config& cfg)
     return static_cast<double>(sum / static_cast<long double>(cfg.measured.size()));
 }
 
+CoolingCoeffs buildCoolingCoeffs(double dx, double dy, double dd = 100.0)
+{
+    if (dx <= 0.0 || dy <= 0.0) {
+        throw std::invalid_argument("buildCoolingCoeffs: dx and dy must be > 0");
+    }
+    if (dd <= 0.0) {
+        throw std::invalid_argument("buildCoolingCoeffs: dd must be > 0");
+    }
+
+    CoolingCoeffs c{};
+    c.dd = dd;
+    c.hx = dx;
+    c.hy = dy;
+
+    const double hx2 = c.hx * c.hx;
+    const double hy2 = c.hy * c.hy;
+
+    c.dgx = -2.0 * (1.0 + c.dd * c.hx / (hx2 + c.dd));
+    c.dgy = -2.0 * (1.0 + c.dd * c.hy / (hy2 + c.dd));
+
+    c.CX = (c.hx + c.dd * std::exp(c.hx)) / (15.0 * c.dd + c.hx);
+    c.CY = (c.hy + c.dd * std::exp(c.hy)) / (15.0 * c.dd + c.hy);
+
+    return c;
+}
+/*
+CoolingCoeffs buildCoolingCoeffs(std::size_t nx, std::size_t ny, double dd = 100.0)
+{
+    if (nx < 3 || ny < 3) {
+        throw std::invalid_argument("buildCoolingCoeffs: nx and ny must be at least 3");
+    }
+    if (dd <= 0.0) {
+        throw std::invalid_argument("buildCoolingCoeffs: dd must be > 0");
+    }
+
+    CoolingCoeffs c{};
+    c.dd = dd;
+    c.hx = 1.0 / static_cast<double>(nx - 1);
+    c.hy = 1.0 / static_cast<double>(ny - 1);
+
+    const double hx2 = c.hx * c.hx;
+    const double hy2 = c.hy * c.hy;
+
+    c.dgx = -2.0 * (1.0 + c.dd * c.hx / (hx2 + c.dd));
+    c.dgy = -2.0 * (1.0 + c.dd * c.hy / (hy2 + c.dd));
+
+    c.CX = (c.hx + c.dd * std::exp(c.hx)) / (15.0 * c.dd + c.hx);
+    c.CY = (c.hy + c.dd * std::exp(c.hy)) / (15.0 * c.dd + c.hy);
+
+    return c;
+}
+*/
+/*
 CoolingCoeffs buildCoolingCoeffs(std::size_t nx, std::size_t ny, double dd = 100.0)
 {
     if (nx < 3 || ny < 3) {
@@ -343,7 +417,7 @@ CoolingCoeffs buildCoolingCoeffs(std::size_t nx, std::size_t ny, double dd = 100
     c.CY  = (c.hy + c.dd * std::exp(c.hy)) / (15.0 * c.dd + c.hy);
     return c;
 }
-
+*/
 // ============================================================
 // HDF5 WRITER
 //   Writes:
@@ -439,9 +513,10 @@ public:
         if (closed_) {
             throw std::runtime_error("H5Writer: write() called after close()");
         }
-        if (field.size() != nx_ * ny_) {
+	if (field.size() != safeGridSize(nx_, ny_)) {
             throw std::runtime_error("H5Writer: field size mismatch");
         }
+
 
         if (frame_ >= capacity_) {
             capacity_ += batch_;
@@ -627,6 +702,10 @@ void updateInteriorKernel(const double* __restrict__ u1,
         );
 }
 
+// Left/right edges are updated first.
+// Top/bottom then copies from the already-updated edge-adjacent values,
+// so corners are implicitly determined by the edge-update order.
+
 __global__
 void applyBoundaryLRKernel(double* u, int nx, int ny)
 {
@@ -745,6 +824,55 @@ Stats computeStats(const std::vector<double>& u)
     return s;
 }
 
+// Functor to calculate squared difference from the mean for variance
+struct square_deviation_functor {
+    double mean;
+    __host__ __device__
+    square_deviation_functor(double m) : mean(m) {}
+
+    __host__ __device__
+    double operator()(const double& x) const {
+        double delta = x - mean;
+        return delta * delta;
+    }
+};
+
+Stats computeStatsGPU(double* d_ptr, std::size_t N)
+{
+    if (N == 0) {
+        throw std::runtime_error("computeStatsGPU: empty field");
+    }
+
+    // Wrap raw device pointer into a thrust device pointer
+    thrust::device_ptr<double> t_ptr(d_ptr);
+
+    Stats s{};
+
+    // 1. Compute Min and Max simultaneously on the GPU
+    auto minmax_pair = thrust::minmax_element(t_ptr, t_ptr + N);
+    s.minv = *minmax_pair.first;  // Synchronizes implicitly for just a scalar copy
+    s.maxv = *minmax_pair.second;
+
+    // 2. Compute Sum (for Mean) on the GPU
+    double sum = thrust::reduce(t_ptr, t_ptr + N, 0.0, thrust::plus<double>());
+    s.mean = sum / static_cast<double>(N);
+
+    // 3. Compute Sum of Squared Deviations (for Std Dev) on the GPU
+    // This fuses a map operation (x - mean)^2 and a reduction into a single kernel pass
+    double sum_squared_diff = thrust::transform_reduce(
+        t_ptr,
+        t_ptr + N,
+        square_deviation_functor(s.mean),
+        0.0,
+        thrust::plus<double>()
+    );
+
+    s.stddev = std::sqrt(sum_squared_diff / static_cast<double>(N));
+
+    return s;
+}
+
+
 void writeStatsHeader(std::ostream& os)
 {
     os << "Step;Min;Mean;Max;Std_dev\n";
@@ -763,6 +891,19 @@ void writeStatsLine(std::ostream& os, int step, const Stats& s)
 // MAIN
 // ============================================================
 
+int parseStrictInt(const std::string& s, const std::string& what) {
+    int v = 0;
+    auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+    
+    // Check if there was a parsing error, or if the pointer didn't reach the end of the string
+    if (ec != std::errc{} || ptr != s.data() + s.size()) {
+        throw std::runtime_error("Invalid " + what + ": '" + s + "'");
+    }
+    
+    return v;
+}
+
+
 int main(int argc, char** argv)
 {
     H5::Exception::dontPrint();
@@ -773,10 +914,10 @@ int main(int argc, char** argv)
         const std::string csvFile   = (argc > 3) ? argv[3] : "Statistics.csv";
 
         Config cfg = readInput(inputFile);
-
         if (argc > 4) {
-            cfg.outputEvery = std::stoi(argv[4]);
+            cfg.outputEvery = parseStrictInt(argv[4], "outputEvery");
         }
+
         if (cfg.outputEvery <= 0) {
             throw std::invalid_argument("outputEvery must be > 0");
         }
@@ -796,7 +937,8 @@ int main(int argc, char** argv)
         const int ny_i = static_cast<int>(cfg.ny);
 
         const DomainMap map = buildDomainMap(cfg);
-        const CoolingCoeffs cooling = buildCoolingCoeffs(cfg.nx, cfg.ny, 100.0);
+        const CoolingCoeffs cooling = buildCoolingCoeffs(map.dx, map.dy, 100.0);
+	//const CoolingCoeffs cooling = buildCoolingCoeffs(cfg.nx, cfg.ny, 100.0);
         const double discrepancy = computeDiscrepancy(cfg);
 
         std::vector<int> weightHost(N);
@@ -853,14 +995,18 @@ int main(int argc, char** argv)
         CUDA_CHECK(cudaEventSynchronize(weightStop.get()));
         CUDA_CHECK(cudaEventElapsedTime(&tWeightMs, weightStart.get(), weightStop.get()));
 
-        CUDA_CHECK(cudaMemcpy(weightHost.data(),
+        /*CUDA_CHECK(cudaMemcpy(weightHost.data(),
                               d_weight.get(),
                               N * sizeof(int),
                               cudaMemcpyDeviceToHost));
-
         const auto [wminIt, wmaxIt] = std::minmax_element(weightHost.begin(), weightHost.end());
         const int wmin = *wminIt;
         const int wmax = *wmaxIt;
+        */
+	thrust::device_ptr<int> w_ptr(d_weight.get());
+        auto minmax_pair = thrust::minmax_element(w_ptr, w_ptr + N);
+        const int wmin = *minmax_pair.first;
+        const int wmax = *minmax_pair.second;
 
         // ----------------------------------------------------
         // Stage 2: initialization
@@ -895,7 +1041,9 @@ int main(int argc, char** argv)
                               N * sizeof(double),
                               cudaMemcpyDeviceToHost));
         writer.write(0, uHost);
-        writeStatsLine(csv, 0, computeStats(uHost));
+        //writeStatsLine(csv, 0, computeStats(uHost));
+        Stats s = computeStatsGPU(d_uCurr.get(), N);
+        writeStatsLine(csv, 0, s);
 
         if (cfg.steps > 0) {
             CUDA_CHECK(cudaEventRecord(dynBatchStart.get()));
@@ -934,8 +1082,10 @@ int main(int argc, char** argv)
                                       cudaMemcpyDeviceToHost));
 
                 writer.write(step, uHost);
-                writeStatsLine(csv, step, computeStats(uHost));
-
+                //writeStatsLine(csv, step, computeStats(uHost));
+                // Calculate statistics entirely on the GPU
+                Stats s = computeStatsGPU(d_uCurr.get(), N);
+                writeStatsLine(csv, step, s);
                 if (step < cfg.steps) {
                     CUDA_CHECK(cudaEventRecord(dynBatchStart.get()));
                 }
@@ -949,7 +1099,7 @@ int main(int argc, char** argv)
 
         std::cout << "Weight field GPU time: " << (tWeightMs / 1e3) << " s\n";
         std::cout << "Init field GPU time:   " << (tInitMs / 1e3)   << " s\n";
-        std::cout << "Dynamics GPU time:     " << (tDynKernelMsAccum / 1e3) << " s\n";
+        std::cout << "Dynamics update-kernel time:     " << (tDynKernelMsAccum / 1e3) << " s\n";
         std::cout << "Dynamics + I/O wall:   " << tDynWall << " s\n";
 
         if (cfg.steps > 0) {
