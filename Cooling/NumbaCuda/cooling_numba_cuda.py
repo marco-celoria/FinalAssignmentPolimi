@@ -385,6 +385,80 @@ class H5Writer:
 # STATISTICS
 # ============================================================
 
+@cuda.jit
+def stats_kernel(u, n, block_min, block_max, block_sum, block_sum2):
+    s_min  = cuda.shared.array(256, dtype=np.float64)
+    s_max  = cuda.shared.array(256, dtype=np.float64)
+    s_sum  = cuda.shared.array(256, dtype=np.float64)
+    s_sum2 = cuda.shared.array(256, dtype=np.float64)
+
+    tid = cuda.threadIdx.x
+    gid = cuda.grid(1)
+
+    # Initialize
+    if gid < n:
+        val = u[gid]
+        s_min[tid]  = val
+        s_max[tid]  = val
+        s_sum[tid]  = val
+        s_sum2[tid] = val * val
+    else:
+        s_min[tid]  = 1e300
+        s_max[tid]  = -1e300
+        s_sum[tid]  = 0.0
+        s_sum2[tid] = 0.0
+
+    cuda.syncthreads()
+
+    # Tree reduction
+    s = cuda.blockDim.x // 2
+    while s > 0:
+        if tid < s:
+            # min/max
+            if s_min[tid + s] < s_min[tid]:
+                s_min[tid] = s_min[tid + s]
+
+            if s_max[tid + s] > s_max[tid]:
+                s_max[tid] = s_max[tid + s]
+
+            # sum
+            s_sum[tid] += s_sum[tid + s]
+            s_sum2[tid] += s_sum2[tid + s]
+
+        cuda.syncthreads()
+        s //= 2
+
+    # Write block results
+    if tid == 0:
+        b = cuda.blockIdx.x
+        block_min[b]  = s_min[0]
+        block_max[b]  = s_max[0]
+        block_sum[b]  = s_sum[0]
+        block_sum2[b] = s_sum2[0]
+
+def compute_stats_gpu(d_u, n, d_min, d_max, d_sum, d_sum2, grid_size, block_size):
+
+    stats_kernel[grid_size, block_size](d_u, n, d_min, d_max, d_sum, d_sum2)
+    cuda.synchronize()
+    # copy back ONLY reduced arrays (small!)
+    h_min  = d_min.copy_to_host()
+    h_max  = d_max.copy_to_host()
+    h_sum  = d_sum.copy_to_host()
+    h_sum2 = d_sum2.copy_to_host()
+
+    # final reduction on CPU (cheap!)
+    mn = float(np.min(h_min))
+    mx = float(np.max(h_max))
+    total_sum  = float(np.sum(h_sum))
+    total_sum2 = float(np.sum(h_sum2))
+
+    mean = total_sum / n
+    var = max(0.0, total_sum2 / n - mean * mean)
+    std  = math.sqrt(var)
+
+    return mn, mean, mx, std
+
+
 def compute_stats(u: np.ndarray) -> Tuple[float, float, float, float]:
     if u.size == 0:
         raise RuntimeError("compute_stats: empty field")
@@ -417,10 +491,14 @@ def run_simulation(cfg: Config,
                    csv_file: str,
                    block2d=(16, 16),
                    block1d=256) -> None:
+    
     if not cuda.is_available():
         raise RuntimeError(
             "CUDA is not available. Check NVIDIA driver / CUDA runtime / Numba installation."
         )
+
+    if block1d != 256:
+        raise ValueError("stats_kernel requires block1d == 256")
 
     n = validated_grid_size(cfg.nx, cfg.ny)
     x0, y0, dx, dy = build_domain_params(cfg)
@@ -457,15 +535,23 @@ def run_simulation(cfg: Config,
             discrepancy, wmin, wmax,
             block2d
         )
+        # Initialization stats
+        grid_size = (n + block1d - 1) // block1d
+        d_min = cuda.device_array(grid_size, dtype=np.float64)
+        d_max = cuda.device_array(grid_size, dtype=np.float64)
+        d_sum = cuda.device_array(grid_size, dtype=np.float64)
+        d_sum2 = cuda.device_array(grid_size, dtype=np.float64)
+
         cuda.synchronize()
         t2 = time.perf_counter()
-
+        
         with H5Writer(h5_file, cfg.nx, cfg.ny, 32) as writer:
             # Step 0 output
+            stats0 = compute_stats_gpu(d_u_curr, n, d_min, d_max, d_sum, d_sum2, grid_size, block1d)
+            write_stats_line(csvf, 0, stats0)
             u_host = d_u_curr.copy_to_host()
             writer.write(0, u_host)
-            write_stats_line(csvf, 0, compute_stats(u_host))
-
+        
             for step in range(1, cfg.steps + 1):
                 launch_update_field(
                     d_u_curr, d_u_next,
@@ -476,10 +562,11 @@ def run_simulation(cfg: Config,
                 d_u_curr, d_u_next = d_u_next, d_u_curr
 
                 if (step % cfg.outputEvery) == 0 or step == cfg.steps:
-                    cuda.synchronize()
+
+                    stats = compute_stats_gpu(d_u_curr, n, d_min, d_max, d_sum, d_sum2, grid_size, block1d)
+                    write_stats_line(csvf, step, stats)
                     u_host = d_u_curr.copy_to_host()
                     writer.write(step, u_host)
-                    write_stats_line(csvf, step, compute_stats(u_host))
 
         t3 = time.perf_counter()
 

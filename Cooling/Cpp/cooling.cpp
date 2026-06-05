@@ -147,7 +147,7 @@ Config readInput(const std::string& fname)
             std::size_t used = 0;
             int v = std::stoi(s, &used);
             if (used != s.size()) {
-                throw std::runtime_error("");
+                throw std::runtime_error("not a pure integer");
             }
             return v;
         } catch (...) {
@@ -164,7 +164,7 @@ Config readInput(const std::string& fname)
             std::size_t used = 0;
             double v = std::stod(s, &used);
             if (used != s.size()) {
-                throw std::runtime_error("");
+                throw std::runtime_error("not a pure floating-point number");
             }
             return v;
         } catch (...) {
@@ -634,27 +634,31 @@ void applyBoundary(double* u, std::size_t nx, std::size_t ny)
 {
 #pragma omp parallel
     {
-#pragma omp for schedule(static)
+        // 1. Left and right edges
+#pragma omp for schedule(static) nowait
         for (std::size_t j = 1; j < ny - 1; ++j) {
             u[idx2D(0,      j, nx)] = u[idx2D(1,      j, nx)];
-            u[idx2D(nx - 1, j, nx)] = u[idx2D(nx - 2, j, nx)];
+            u[idx2D(nx-1,   j, nx)] = u[idx2D(nx-2,   j, nx)];
         }
 
+        // 2. Top and bottom edges (barrier at end)
 #pragma omp for schedule(static)
         for (std::size_t i = 1; i < nx - 1; ++i) {
             u[idx2D(i, 0,      nx)] = u[idx2D(i, 1,      nx)];
-            u[idx2D(i, ny - 1, nx)] = u[idx2D(i, ny - 2, nx)];
+            u[idx2D(i, ny-1,   nx)] = u[idx2D(i, ny-2,   nx)];
         }
 
-#pragma omp single
+        // 3. Corners
+#pragma omp single nowait
         {
-            u[idx2D(0,      0,      nx)] = u[idx2D(1,      0,      nx)];
-            u[idx2D(nx - 1, 0,      nx)] = u[idx2D(nx - 2, 0,      nx)];
-            u[idx2D(0,      ny - 1, nx)] = u[idx2D(1,      ny - 1, nx)];
-            u[idx2D(nx - 1, ny - 1, nx)] = u[idx2D(nx - 2, ny - 1, nx)];
+            u[idx2D(0,       0,       nx)] = u[idx2D(1,       0,       nx)];
+            u[idx2D(nx-1,    0,       nx)] = u[idx2D(nx-2,    0,       nx)];
+            u[idx2D(0,       ny-1,    nx)] = u[idx2D(1,       ny-1,    nx)];
+            u[idx2D(nx-1,    ny-1,    nx)] = u[idx2D(nx-2,    ny-1,    nx)];
         }
     }
 }
+
 
 void updateField(const double* RESTRICT u1,
                  double* RESTRICT u2,
