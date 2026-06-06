@@ -8,4 +8,5 @@ python3 -m venv cooling_venv --system-site-packages
 source cooling_venv/bin/activate
 pip install numba
 pip install h5py
+pip install cupy-cuda12x
 
