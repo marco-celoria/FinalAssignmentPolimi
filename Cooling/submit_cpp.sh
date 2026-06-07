@@ -5,7 +5,7 @@
 #SBATCH --partition=boost_usr_prod
 #SBATCH --time=0:30:00
 #SBATCH --mem=50GB
-#SBATCH --job-name=run_numba_cooling
+#SBATCH --job-name=run_cpp_cooling
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
 #SBATCH --gres=gpu:1
@@ -16,10 +16,7 @@ export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 module purge
 module load gcc/12.2.0 
 module load cmake/3.27.9
-module load hdf5/1.14.3--gcc--12.2.0-spack0.22
-
-cd ..
-source cooling_venv/bin/activate
-cd -
-srun python cooling_numba.py ../Cooling.inp 
+module load hdf5/1.14.3--gcc--12.2.0-spack0.22 
+mkdir -p output
+srun ./build/cooling_omp ./input/Cooling.in ./output/Cooling_cpp.h5 ./output/Cooling_cpp.csv
 

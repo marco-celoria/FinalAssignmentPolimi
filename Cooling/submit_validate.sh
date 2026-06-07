@@ -21,9 +21,9 @@ module load hdf5/1.14.3--gcc--12.2.0-spack0.22
 module load python/3.11.7 
 source cooling_venv/bin/activate
 echo "Cpp vs Cuda"
-srun python validate_cooling_h5.py Cpp/build/cooling.h5 Cuda/build/cooling.h5  
+srun python ./tools/validate_cooling_h5.py output/Cooling_cpp.h5 output/Cooling_cuda.h5 
 echo "Cpp vs Numba"
-srun python validate_cooling_h5.py Cpp/build/cooling.h5 Numba/cooling.h5
+srun python ./tools/validate_cooling_h5.py output/Cooling_cpp.h5 output/Cooling_numba.h5
 echo "Cpp vs NumbaCuda"
-srun python validate_cooling_h5.py Cpp/build/cooling.h5 NumbaCuda/cooling.h5
+srun python ./tools/validate_cooling_h5.py output/Cooling_cpp.h5 output/Cooling_numba_cuda.h5
 

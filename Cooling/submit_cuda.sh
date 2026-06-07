@@ -18,6 +18,5 @@ module load gcc/12.2.0
 module load cmake/3.27.9
 module load hdf5/1.14.3--gcc--12.2.0-spack0.22 
 module load cuda/12.2
-cd build
-srun ./cooling_sim ../../Cooling.inp 
-
+mkdir -p output
+srun ./build/cooling_cuda ./input/Cooling.in ./output/Cooling_cuda.h5 ./output/Cooling_cuda.csv
