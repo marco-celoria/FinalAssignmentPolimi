@@ -6,12 +6,12 @@ project(CoolingSimulation LANGUAGES CXX)
 # Build options
 # ============================================================
 
-option(COOLING_BUILD_OPENMP "Build the OpenMP C++ solver" ON)
-option(COOLING_BUILD_CUDA "Build the CUDA C++ solver" ON)
-option(COOLING_NATIVE_ARCH "Enable -march=native for host code" ON)
-option(COOLING_FAST_MATH_CUDA "Enable --use_fast_math for CUDA code" OFF)
+option(PARTICLES_BUILD_OPENMP "Build the OpenMP C++ solver" ON)
+option(PARTICLES_BUILD_CUDA "Build the CUDA C++ solver" ON)
+option(PARTICLES_NATIVE_ARCH "Enable -march=native for host code" ON)
+option(PARTICLES_FAST_MATH_CUDA "Enable --use_fast_math for CUDA code" OFF)
 
-set(COOLING_CUDA_ARCHITECTURES "80" CACHE STRING
+set(PARTICLES_CUDA_ARCHITECTURES "80" CACHE STRING
     "CUDA architectures to build for, e.g. 70;75;80;86;89;90"
 )
 
@@ -29,11 +29,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(HDF5 REQUIRED COMPONENTS C CXX)
 
-if(COOLING_BUILD_OPENMP)
+if(PARTICLES_BUILD_OPENMP)
     find_package(OpenMP REQUIRED COMPONENTS CXX)
 endif()
 
-if(COOLING_BUILD_CUDA)
+if(PARTICLES_BUILD_CUDA)
     include(CheckLanguage)
     check_language(CUDA)
 
@@ -44,10 +44,10 @@ if(COOLING_BUILD_CUDA)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON)
         set(CMAKE_CUDA_EXTENSIONS OFF)
 
-        set(CMAKE_CUDA_ARCHITECTURES ${COOLING_CUDA_ARCHITECTURES})
+        set(CMAKE_CUDA_ARCHITECTURES ${PARTICLES_CUDA_ARCHITECTURES})
     else()
         message(WARNING "CUDA compiler not found. Disabling CUDA target.")
-        set(COOLING_BUILD_CUDA OFF)
+        set(PARTICLES_BUILD_CUDA OFF)
     endif()
 endif()
 
@@ -82,7 +82,7 @@ function(cooling_apply_common_settings target_name)
                 $<$<COMPILE_LANGUAGE:CXX>:-O3 -Wall -Wextra -Wpedantic>
         )
 
-        if(COOLING_NATIVE_ARCH)
+        if(PARTICLES_NATIVE_ARCH)
             target_compile_options(${target_name}
                 PRIVATE
                     $<$<COMPILE_LANGUAGE:CXX>:-march=native>
@@ -95,9 +95,9 @@ endfunction()
 # OpenMP C++ executable
 # ============================================================
 
-if(COOLING_BUILD_OPENMP)
+if(PARTICLES_BUILD_OPENMP)
     add_executable(cooling_omp
-        src/cooling.cpp
+        src/cpp/cooling.cpp
     )
 
     cooling_apply_common_settings(cooling_omp)
@@ -112,9 +112,9 @@ endif()
 # CUDA C++ executable
 # ============================================================
 
-if(COOLING_BUILD_CUDA)
+if(PARTICLES_BUILD_CUDA)
     add_executable(cooling_cuda
-        src/cooling.cu
+        src/cpp/cooling.cu
     )
 
     cooling_apply_common_settings(cooling_cuda)
@@ -135,7 +135,7 @@ if(COOLING_BUILD_CUDA)
                 $<$<COMPILE_LANGUAGE:CUDA>:-O3>
         )
 
-        if(COOLING_FAST_MATH_CUDA)
+        if(PARTICLES_FAST_MATH_CUDA)
             target_compile_options(cooling_cuda
                 PRIVATE
                     $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
@@ -149,13 +149,13 @@ endif()
 # ============================================================
 
 message(STATUS "CoolingSimulation configuration")
-message(STATUS "  Build OpenMP solver:       ${COOLING_BUILD_OPENMP}")
-message(STATUS "  Build CUDA solver:         ${COOLING_BUILD_CUDA}")
-message(STATUS "  Native host architecture:  ${COOLING_NATIVE_ARCH}")
+message(STATUS "  Build OpenMP solver:       ${PARTICLES_BUILD_OPENMP}")
+message(STATUS "  Build CUDA solver:         ${PARTICLES_BUILD_CUDA}")
+message(STATUS "  Native host architecture:  ${PARTICLES_NATIVE_ARCH}")
 
-if(COOLING_BUILD_CUDA)
+if(PARTICLES_BUILD_CUDA)
     message(STATUS "  CUDA architectures:        ${CMAKE_CUDA_ARCHITECTURES}")
-    message(STATUS "  CUDA fast math:            ${COOLING_FAST_MATH_CUDA}")
+    message(STATUS "  CUDA fast math:            ${PARTICLES_FAST_MATH_CUDA}")
 endif()
 
 # ============================================================

@@ -6,8 +6,8 @@
 #SBATCH --time=4:00:00
 #SBATCH --mem=30GB
 #SBATCH --job-name=job_install_cooling_venv
-#SBATCH --output=%x_%j.out
-#SBATCH --error=%x_%j.err
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 module purge
@@ -18,9 +18,6 @@ module load hdf5/1.14.3--gcc--12.2.0-spack0.22
 module load python/3.11.7
 python3 -m venv cooling_venv --system-site-packages
 source cooling_venv/bin/activate
-pip install numba
-pip install h5py
-pip install cupy-cuda12x
-pip install matplotlib
+pip install -r requirements.txt
 deactivate
 

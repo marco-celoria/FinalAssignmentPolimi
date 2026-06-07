@@ -6,17 +6,13 @@
 #SBATCH --time=0:30:00
 #SBATCH --mem=50GB
 #SBATCH --job-name=run_cuda_cooling
-#SBATCH --output=%x_%j.out
-#SBATCH --error=%x_%j.err
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
 #SBATCH --gres=gpu:1
 #SBATCH --qos=boost_qos_dbg
 ##SBATCH --exclusive
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
-module purge
-module load gcc/12.2.0 
-module load cmake/3.27.9
-module load hdf5/1.14.3--gcc--12.2.0-spack0.22 
-module load cuda/12.2
-mkdir -p output
+source scripts/env.sh
 srun ./build/cooling_cuda ./input/Cooling.in ./output/Cooling_cuda.h5 ./output/Cooling_cuda.csv
+

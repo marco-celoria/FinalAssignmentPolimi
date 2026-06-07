@@ -841,7 +841,7 @@ def main() -> int:
     parser.add_argument(
         "--stats",
         choices=("accurate", "fast"),
-        default="accurate",
+        default="fast",
         help="Statistics mode: accurate uses longdouble, fast uses NumPy mean/std",
     )
 
