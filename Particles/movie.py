@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
 import argparse
+import shutil
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Optional, Sequence
 
 import h5py
-import numpy as np
-import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-from matplotlib.colors import LogNorm
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.colors import LogNorm, Normalize
 
+
+# ---------------------------------------------------------------------
+# HDF5 dataset names
+# ---------------------------------------------------------------------
 
 POS_DATASET = "/pos"
 VEL_DATASET = "/vel"
@@ -17,461 +24,647 @@ SCREEN_DATASET = "/screen"
 STEP_DATASET = "/step"
 
 
-def compute_global_speed_bounds(
-    vel_dataset: h5py.Dataset,
-    chunk_size: int = 50,
-) -> Tuple[float, float]:
-    if chunk_size <= 0:
-        raise ValueError("chunk_size must be > 0")
+# ---------------------------------------------------------------------
+# Visualization defaults
+# ---------------------------------------------------------------------
 
-    if vel_dataset.ndim != 3:
-        raise ValueError(
-            f"{VEL_DATASET} must have shape (nframes, nparticles, ndim), "
-            f"got {vel_dataset.shape}"
-        )
+TITLE = "Mandelbrot-seeded N-body simulation"
 
-    if vel_dataset.shape[2] < 2:
-        raise ValueError(
-            f"{VEL_DATASET} must contain at least vx/vy components, "
-            f"got last dimension={vel_dataset.shape[2]}"
-        )
+FIGSIZE = (9.0, 7.0)
+ASPECT = "equal"
 
-    num_frames = vel_dataset.shape[0]
+SCREEN_CMAP = "inferno"
+SCREEN_PERCENTILES = (1.0, 99.5)
+SAMPLE_FRAMES = 32
+MAX_PIXELS_PER_SAMPLED_FRAME = 500_000
 
-    if num_frames <= 0:
-        raise ValueError(f"{VEL_DATASET} contains no frames")
+PARTICLE_COLOR = "cyan"
+PARTICLE_SIZE = 4.0
+PARTICLE_ALPHA = 0.85
 
-    global_vmin = float("inf")
-    global_vmax = float("-inf")
-
-    for start in range(0, num_frames, chunk_size):
-        stop = min(start + chunk_size, num_frames)
-
-        chunk_vel = vel_dataset[start:stop, :, :2]
-        chunk_speed = np.linalg.norm(chunk_vel, axis=2)
-
-        local_min = float(np.min(chunk_speed))
-        local_max = float(np.max(chunk_speed))
-
-        global_vmin = min(global_vmin, local_min)
-        global_vmax = max(global_vmax, local_max)
-
-    if not np.isfinite(global_vmin) or not np.isfinite(global_vmax):
-        raise ValueError("Non-finite speed bounds detected")
-
-    if global_vmax <= global_vmin:
-        # Avoid a degenerate color scale.
-        global_vmax = global_vmin + 1.0e-30
-
-    return global_vmin, global_vmax
+EXTENT_PADDING = 0.05
 
 
-def compute_screen_log_bounds(
-    screen_dataset: h5py.Dataset,
-    chunk_size: int = 10,
-) -> Tuple[float, float]:
+# ---------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------
+
+def require_dataset(h5: h5py.File, name: str) -> h5py.Dataset:
+    if name not in h5:
+        raise ValueError(f"required dataset '{name}' not found in HDF5 file")
+    return h5[name]
+
+
+def validate_positions(pos: h5py.Dataset) -> tuple[int, int]:
     """
-    Compute positive min/max for LogNorm.
-    Zeros are ignored for vmin.
+    Validate /pos.
+
+    Expected shape:
+        /pos: (nframes, nparticles, ndim)
+
+    Only x/y coordinates are used, so ndim must be at least 2.
     """
-    if chunk_size <= 0:
-        raise ValueError("chunk_size must be > 0")
-
-    num_frames = screen_dataset.shape[0]
-
-    positive_min = float("inf")
-    global_max = 0.0
-
-    for start in range(0, num_frames, chunk_size):
-        stop = min(start + chunk_size, num_frames)
-
-        chunk = screen_dataset[start:stop]
-        local_max = float(np.max(chunk))
-
-        if local_max > global_max:
-            global_max = local_max
-
-        positive = chunk[chunk > 0]
-
-        if positive.size:
-            local_min = float(np.min(positive))
-            if local_min < positive_min:
-                positive_min = local_min
-
-    if global_max <= 0.0 or not np.isfinite(positive_min):
-        return 1.0, 1.0
-
-    return positive_min, global_max
-
-
-def validate_datasets(
-    pos_data: h5py.Dataset,
-    vel_data: h5py.Dataset,
-    screen_data: h5py.Dataset,
-    step_data: Optional[h5py.Dataset],
-) -> None:
-    if pos_data.ndim != 3:
+    if pos.ndim != 3:
         raise ValueError(
-            f"{POS_DATASET} must have shape (nframes, nparticles, 2), "
-            f"got {pos_data.shape}"
+            f"{POS_DATASET} must have shape (nframes, nparticles, ndim), "
+            f"got {pos.shape}"
         )
 
-    if vel_data.ndim != 3:
-        raise ValueError(
-            f"{VEL_DATASET} must have shape (nframes, nparticles, 2), "
-            f"got {vel_data.shape}"
-        )
+    nframes, nparticles, ndim = pos.shape
 
-    if screen_data.ndim != 3:
-        raise ValueError(
-            f"{SCREEN_DATASET} must have shape (nframes, ny, nx), "
-            f"got {screen_data.shape}"
-        )
+    if nframes <= 0:
+        raise ValueError(f"{POS_DATASET} contains no frames")
 
-    if pos_data.shape[0] <= 0:
-        raise ValueError("No frames found in HDF5 file")
+    if nparticles <= 0:
+        raise ValueError(f"{POS_DATASET} contains no particles")
 
-    if pos_data.shape[0] != vel_data.shape[0] or pos_data.shape[0] != screen_data.shape[0]:
-        raise ValueError(
-            "Frame count mismatch:\n"
-            f"  {POS_DATASET}:    {pos_data.shape[0]}\n"
-            f"  {VEL_DATASET}:    {vel_data.shape[0]}\n"
-            f"  {SCREEN_DATASET}: {screen_data.shape[0]}"
-        )
-
-    if pos_data.shape[1] != vel_data.shape[1]:
-        raise ValueError(
-            "Particle count mismatch:\n"
-            f"  {POS_DATASET}: {pos_data.shape[1]}\n"
-            f"  {VEL_DATASET}: {vel_data.shape[1]}"
-        )
-
-    if pos_data.shape[2] < 2:
+    if ndim < 2:
         raise ValueError(
             f"{POS_DATASET} must contain at least x/y coordinates, "
-            f"got last dimension={pos_data.shape[2]}"
+            f"got last dimension={ndim}"
         )
 
-    if vel_data.shape[2] < 2:
+    return int(nframes), int(nparticles)
+
+
+def validate_screen(screen: h5py.Dataset, expected_nframes: int) -> tuple[int, int]:
+    """
+    Validate /screen.
+
+    Expected shape:
+        /screen: (nframes, ny, nx)
+    """
+    if screen.ndim != 3:
+        raise ValueError(
+            f"{SCREEN_DATASET} must have shape (nframes, ny, nx), "
+            f"got {screen.shape}"
+        )
+
+    nframes, ny, nx = screen.shape
+
+    if nframes != expected_nframes:
+        raise ValueError(
+            "screen/frame count mismatch:\n"
+            f"  {SCREEN_DATASET}: {nframes}\n"
+            f"  expected:        {expected_nframes}"
+        )
+
+    if ny <= 0 or nx <= 0:
+        raise ValueError(f"{SCREEN_DATASET} has invalid shape {screen.shape}")
+
+    return int(ny), int(nx)
+
+
+def validate_optional_velocity(
+    vel: Optional[h5py.Dataset],
+    expected_nframes: int,
+    expected_nparticles: int,
+) -> None:
+    """
+    Validate optional /vel if present.
+
+    The animation does not use velocities, but validating them helps detect
+    inconsistent simulation output.
+    """
+    if vel is None:
+        return
+
+    if vel.ndim != 3:
+        raise ValueError(
+            f"{VEL_DATASET} must have shape (nframes, nparticles, ndim), "
+            f"got {vel.shape}"
+        )
+
+    nframes, nparticles, ndim = vel.shape
+
+    if nframes != expected_nframes:
+        raise ValueError(
+            "velocity/frame count mismatch:\n"
+            f"  {VEL_DATASET}: {nframes}\n"
+            f"  expected:     {expected_nframes}"
+        )
+
+    if nparticles != expected_nparticles:
+        raise ValueError(
+            "velocity/particle count mismatch:\n"
+            f"  {VEL_DATASET}: {nparticles}\n"
+            f"  expected:     {expected_nparticles}"
+        )
+
+    if ndim < 2:
         raise ValueError(
             f"{VEL_DATASET} must contain at least vx/vy components, "
-            f"got last dimension={vel_data.shape[2]}"
+            f"got last dimension={ndim}"
         )
 
-    if step_data is not None:
-        if step_data.ndim != 1:
-            raise ValueError(f"{STEP_DATASET} must be 1D, got shape {step_data.shape}")
 
-        if step_data.shape[0] != pos_data.shape[0]:
-            raise ValueError(
-                "Step/frame count mismatch:\n"
-                f"  {STEP_DATASET}: {step_data.shape[0]}\n"
-                f"  {POS_DATASET}:  {pos_data.shape[0]}"
+def validate_optional_steps(
+    steps: Optional[h5py.Dataset],
+    expected_nframes: int,
+) -> None:
+    """
+    Validate optional /step.
+
+    Expected shape:
+        /step: (nframes,)
+    """
+    if steps is None:
+        return
+
+    if steps.ndim != 1:
+        raise ValueError(
+            f"{STEP_DATASET} must have shape (nframes,), got {steps.shape}"
+        )
+
+    if steps.shape[0] != expected_nframes:
+        raise ValueError(
+            "step/frame count mismatch:\n"
+            f"  {STEP_DATASET}: {steps.shape[0]}\n"
+            f"  expected:       {expected_nframes}"
+        )
+
+
+def validate_cli_args(args: argparse.Namespace) -> None:
+    if args.fps <= 0:
+        raise ValueError("--fps must be greater than zero")
+
+    if args.stride <= 0:
+        raise ValueError("--stride must be greater than zero")
+
+
+# ---------------------------------------------------------------------
+# Frame and data helpers
+# ---------------------------------------------------------------------
+
+def make_frame_indices(nframes: int, stride: int) -> list[int]:
+    frames = list(range(0, nframes, stride))
+
+    if not frames:
+        raise ValueError("no frames selected; check --stride")
+
+    return frames
+
+
+def choose_sampled_frames(
+    frame_indices: Sequence[int],
+    sample_count: int,
+) -> list[int]:
+    """
+    Select approximately equally spaced frames for cheap global statistics.
+    """
+    if sample_count <= 0:
+        raise ValueError("sample_count must be greater than zero")
+
+    if len(frame_indices) <= sample_count:
+        return list(frame_indices)
+
+    positions = np.linspace(0, len(frame_indices) - 1, sample_count)
+    return [frame_indices[int(round(pos))] for pos in positions]
+
+
+def load_positions(pos: h5py.Dataset, frame: int) -> np.ndarray:
+    return pos[frame, :, :2]
+
+
+def load_screen(screen: h5py.Dataset, frame: int) -> np.ndarray:
+    return screen[frame]
+
+
+def build_title(
+    frame: int,
+    nframes: int,
+    steps: Optional[h5py.Dataset],
+) -> str:
+    if steps is None:
+        return f"{TITLE} — frame {frame}/{nframes - 1}"
+
+    return f"{TITLE} — frame {frame}/{nframes - 1} — step {int(steps[frame])}"
+
+
+# ---------------------------------------------------------------------
+# Extent and color scaling
+# ---------------------------------------------------------------------
+
+def read_screen_extent(screen: h5py.Dataset) -> Optional[tuple[float, float, float, float]]:
+    """
+    Read physical extent from /screen attributes if available.
+
+    Expected attributes:
+        xs, xe, ys, ye
+    """
+    required_attrs = ("xs", "xe", "ys", "ye")
+
+    if not all(name in screen.attrs for name in required_attrs):
+        return None
+
+    xs = float(screen.attrs["xs"])
+    xe = float(screen.attrs["xe"])
+    ys = float(screen.attrs["ys"])
+    ye = float(screen.attrs["ye"])
+
+    if xe <= xs or ye <= ys:
+        raise ValueError("invalid /screen extent attributes: require xe > xs and ye > ys")
+
+    return xs, xe, ys, ye
+
+
+def infer_extent_from_positions(
+    pos: h5py.Dataset,
+    frame_indices: Sequence[int],
+) -> tuple[float, float, float, float]:
+    """
+    Infer plotting extent from sampled particle positions.
+    """
+    sampled_frames = choose_sampled_frames(frame_indices, SAMPLE_FRAMES)
+
+    xmin = float("inf")
+    xmax = float("-inf")
+    ymin = float("inf")
+    ymax = float("-inf")
+
+    for frame in sampled_frames:
+        xy = load_positions(pos, frame)
+
+        finite = np.isfinite(xy).all(axis=1)
+        if not np.any(finite):
+            continue
+
+        xy = xy[finite]
+
+        xmin = min(xmin, float(np.min(xy[:, 0])))
+        xmax = max(xmax, float(np.max(xy[:, 0])))
+        ymin = min(ymin, float(np.min(xy[:, 1])))
+        ymax = max(ymax, float(np.max(xy[:, 1])))
+
+    if not all(np.isfinite(v) for v in (xmin, xmax, ymin, ymax)):
+        raise ValueError("could not infer finite plotting extent from /pos")
+
+    if xmax <= xmin:
+        delta = max(abs(xmin), 1.0) * 1.0e-6
+        xmin -= delta
+        xmax += delta
+
+    if ymax <= ymin:
+        delta = max(abs(ymin), 1.0) * 1.0e-6
+        ymin -= delta
+        ymax += delta
+
+    dx = xmax - xmin
+    dy = ymax - ymin
+
+    return (
+        xmin - EXTENT_PADDING * dx,
+        xmax + EXTENT_PADDING * dx,
+        ymin - EXTENT_PADDING * dy,
+        ymax + EXTENT_PADDING * dy,
+    )
+
+
+def determine_extent(
+    pos: h5py.Dataset,
+    screen: h5py.Dataset,
+    frame_indices: Sequence[int],
+) -> tuple[float, float, float, float]:
+    """
+    Determine plotting extent.
+
+    Priority:
+      1. /screen attributes xs, xe, ys, ye
+      2. inferred particle-position extent
+    """
+    extent = read_screen_extent(screen)
+
+    if extent is not None:
+        return extent
+
+    return infer_extent_from_positions(pos, frame_indices)
+
+
+def compute_screen_bounds(
+    screen: h5py.Dataset,
+    frame_indices: Sequence[int],
+    *,
+    log_scale: bool,
+) -> tuple[float, float]:
+    """
+    Compute robust color bounds for /screen using fixed percentiles.
+
+    For log-scale rendering, non-positive values are ignored because LogNorm
+    requires strictly positive values.
+    """
+    pmin, pmax = SCREEN_PERCENTILES
+    sampled_frames = choose_sampled_frames(frame_indices, SAMPLE_FRAMES)
+
+    sampled_values: list[np.ndarray] = []
+
+    for frame in sampled_frames:
+        values = np.ravel(load_screen(screen, frame))
+
+        if values.size > MAX_PIXELS_PER_SAMPLED_FRAME:
+            step = max(1, values.size // MAX_PIXELS_PER_SAMPLED_FRAME)
+            values = values[::step]
+
+        values = values[np.isfinite(values)]
+
+        if log_scale:
+            values = values[values > 0.0]
+
+        if values.size > 0:
+            sampled_values.append(values)
+
+    if not sampled_values:
+        if log_scale:
+            return 1.0, 10.0
+        raise ValueError(f"no finite values found in {SCREEN_DATASET}")
+
+    values = np.concatenate(sampled_values)
+
+    vmin = float(np.percentile(values, pmin))
+    vmax = float(np.percentile(values, pmax))
+
+    if not np.isfinite(vmin) or not np.isfinite(vmax):
+        raise ValueError("non-finite /screen color bounds detected")
+
+    if log_scale:
+        vmin = max(vmin, np.finfo(np.float64).tiny)
+
+    if vmax <= vmin:
+        if log_scale:
+            vmax = vmin * 10.0
+        else:
+            eps = max(abs(vmin), 1.0) * 1.0e-12
+            vmin -= eps
+            vmax += eps
+
+    return vmin, vmax
+
+
+# ---------------------------------------------------------------------
+# Animation
+# ---------------------------------------------------------------------
+
+def create_animation(
+    fig: plt.Figure,
+    ax: plt.Axes,
+    pos: h5py.Dataset,
+    screen: h5py.Dataset,
+    steps: Optional[h5py.Dataset],
+    frame_indices: Sequence[int],
+    extent: tuple[float, float, float, float],
+    screen_bounds: tuple[float, float],
+    *,
+    fps: int,
+    log_scale: bool,
+) -> animation.FuncAnimation:
+    first_frame = frame_indices[0]
+    nframes = int(pos.shape[0])
+
+    screen0 = load_screen(screen, first_frame)
+    pos0 = load_positions(pos, first_frame)
+
+    vmin, vmax = screen_bounds
+
+    if log_scale:
+        norm = LogNorm(vmin=vmin, vmax=vmax)
+        colorbar_label = "Weighted particle deposition, log scale"
+    else:
+        norm = Normalize(vmin=vmin, vmax=vmax)
+        colorbar_label = "Weighted particle deposition"
+
+    image = ax.imshow(
+        screen0,
+        origin="lower",
+        extent=extent,
+        cmap=SCREEN_CMAP,
+        norm=norm,
+        interpolation="bilinear",
+        animated=True,
+    )
+
+    scatter = ax.scatter(
+        pos0[:, 0],
+        pos0[:, 1],
+        color=PARTICLE_COLOR,
+        s=PARTICLE_SIZE,
+        alpha=PARTICLE_ALPHA,
+        edgecolors="none",
+        animated=True,
+    )
+
+    colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    colorbar.set_label(colorbar_label)
+
+    ax.set_xlim(extent[0], extent[1])
+    ax.set_ylim(extent[2], extent[3])
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_aspect(ASPECT, adjustable="box")
+
+    title = ax.set_title(build_title(first_frame, nframes, steps))
+
+    def update(frame_number: int):
+        frame = frame_indices[frame_number]
+
+        image.set_data(load_screen(screen, frame))
+        scatter.set_offsets(load_positions(pos, frame))
+        title.set_text(build_title(frame, nframes, steps))
+
+        return image, scatter, title
+
+    return animation.FuncAnimation(
+        fig,
+        update,
+        frames=len(frame_indices),
+        interval=1000.0 / fps,
+        blit=False,
+    )
+
+
+def save_or_show(
+    ani: animation.FuncAnimation,
+    output: Optional[Path],
+    fps: int,
+) -> None:
+    if output is None:
+        plt.tight_layout()
+        plt.show()
+        return
+
+    print(f"Saving animation to '{output}'...")
+
+    suffix = output.suffix.lower()
+
+    if suffix == ".gif":
+        ani.save(output, writer="pillow", fps=fps)
+    elif suffix == ".mp4":
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError(
+                "cannot save MP4 because ffmpeg was not found in PATH; "
+                "install ffmpeg or save as .gif instead"
             )
 
+        writer = animation.FFMpegWriter(
+            fps=fps,
+            codec="libx264",
+            extra_args=["-pix_fmt", "yuv420p"],
+        )
+        ani.save(output, writer=writer)
+    else:
+        raise ValueError("output file must have extension .gif or .mp4")
 
-def build_parser() -> argparse.ArgumentParser:
+    print("Save complete.")
+
+
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Animate an N-body simulation stored in HDF5."
+        description="Create an animation from N-body HDF5 output."
     )
 
     parser.add_argument(
         "filename",
         nargs="?",
         default="particles.h5",
-        help="Path to the HDF5 file. Default: particles.h5",
+        help="input HDF5 file, default: particles.h5",
     )
 
     parser.add_argument(
         "--save",
-        type=str,
-        help="Save animation to a file, e.g. output.mp4 or output.gif",
+        type=Path,
+        default=None,
+        help="output animation path, supported extensions: .gif, .mp4",
     )
 
     parser.add_argument(
         "--fps",
         type=int,
         default=30,
-        help="Playback frames per second. Default: 30",
+        help="animation frames per second, default: 30",
     )
 
     parser.add_argument(
         "--stride",
         type=int,
         default=1,
-        help="Animate every Nth saved frame. Default: 1",
-    )
-
-    parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=50,
-        help="Chunk size used to compute global speed bounds. Default: 50",
-    )
-
-    parser.add_argument(
-        "--particle-size",
-        type=float,
-        default=5.0,
-        help="Scatter marker size. Default: 5.0",
-    )
-
-    parser.add_argument(
-        "--grid-cmap",
-        type=str,
-        default="inferno",
-        help="Colormap for background screen. Default: inferno",
-    )
-
-    parser.add_argument(
-        "--particle-cmap",
-        type=str,
-        default="plasma",
-        help="Colormap for particle speeds. Default: plasma",
-    )
-
-    parser.add_argument(
-        "--xlim",
-        type=float,
-        nargs=2,
-        default=None,
-        metavar=("XMIN", "XMAX"),
-        help="X-axis limits. Default: 0 screen_nx",
-    )
-
-    parser.add_argument(
-        "--ylim",
-        type=float,
-        nargs=2,
-        default=None,
-        metavar=("YMIN", "YMAX"),
-        help="Y-axis limits. Default: 0 screen_ny",
+        help="use every Nth saved frame, default: 1",
     )
 
     parser.add_argument(
         "--log-screen",
         action="store_true",
-        help="Use logarithmic color scaling for the background screen.",
+        help="use logarithmic color scaling for /screen",
     )
 
-    parser.add_argument(
-        "--hide-particles",
-        action="store_true",
-        help="Show only the screen image, without particle scatter overlay.",
-    )
+    return parser.parse_args()
 
-    return parser
+
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
+
+def run(args: argparse.Namespace) -> None:
+    validate_cli_args(args)
+
+    input_path = Path(args.filename)
+
+    if not input_path.exists():
+        raise FileNotFoundError(f"file '{input_path}' not found")
+
+    with h5py.File(input_path, "r") as h5:
+        pos = require_dataset(h5, POS_DATASET)
+        screen = require_dataset(h5, SCREEN_DATASET)
+
+        vel = h5[VEL_DATASET] if VEL_DATASET in h5 else None
+        steps = h5[STEP_DATASET] if STEP_DATASET in h5 else None
+
+        nframes, nparticles = validate_positions(pos)
+        screen_ny, screen_nx = validate_screen(screen, nframes)
+        validate_optional_velocity(vel, nframes, nparticles)
+        validate_optional_steps(steps, nframes)
+
+        frame_indices = make_frame_indices(nframes, args.stride)
+        extent = determine_extent(pos, screen, frame_indices)
+
+        print(f"Loaded file:        {input_path}")
+        print(f"Frames displayed:   {len(frame_indices)} / {nframes}")
+        print(f"Particles:          {nparticles}")
+        print(f"Screen grid:        {screen_nx} x {screen_ny}")
+        print(f"Position dataset:   shape={pos.shape}, dtype={pos.dtype}")
+        print(f"Screen dataset:     shape={screen.shape}, dtype={screen.dtype}")
+
+        if vel is not None:
+            print(f"Velocity dataset:   shape={vel.shape}, dtype={vel.dtype}")
+        else:
+            print("Velocity dataset:   not present")
+
+        if steps is not None:
+            print(f"Step dataset:       shape={steps.shape}, dtype={steps.dtype}")
+
+        print(
+            "Extent:             "
+            f"x=[{extent[0]}, {extent[1]}], "
+            f"y=[{extent[2]}, {extent[3]}]"
+        )
+
+        print("Computing /screen color bounds...")
+
+        screen_bounds = compute_screen_bounds(
+            screen,
+            frame_indices,
+            log_scale=args.log_screen,
+        )
+
+        print(
+            "Screen color scale: "
+            f"vmin={screen_bounds[0]:.8g}, vmax={screen_bounds[1]:.8g}"
+        )
+        print(f"Log screen:         {args.log_screen}")
+
+        fig, ax = plt.subplots(figsize=FIGSIZE)
+
+        ani = create_animation(
+            fig,
+            ax,
+            pos,
+            screen,
+            steps,
+            frame_indices,
+            extent,
+            screen_bounds,
+            fps=args.fps,
+            log_scale=args.log_screen,
+        )
+
+        save_or_show(ani, args.save, args.fps)
 
 
 def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
+    try:
+        run(parse_args())
+        return 0
 
-    if args.fps <= 0:
-        print("ERROR: --fps must be > 0")
-        return 2
-
-    if args.stride <= 0:
-        print("ERROR: --stride must be > 0")
-        return 2
-
-    if args.chunk_size <= 0:
-        print("ERROR: --chunk-size must be > 0")
-        return 2
-
-    if args.particle_size <= 0:
-        print("ERROR: --particle-size must be > 0")
-        return 2
-
-    file_path = Path(args.filename)
-
-    if not file_path.exists():
-        print(f"ERROR: file '{file_path}' not found.")
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}")
         return 1
 
-    try:
-        with h5py.File(file_path, "r") as f:
-            for name in (POS_DATASET, VEL_DATASET, SCREEN_DATASET):
-                if name not in f:
-                    print(f"ERROR: dataset '{name}' not found in '{file_path}'.")
-                    return 1
-
-            pos_data = f[POS_DATASET]
-            vel_data = f[VEL_DATASET]
-            screen_data = f[SCREEN_DATASET]
-            step_data = f[STEP_DATASET] if STEP_DATASET in f else None
-
-            validate_datasets(pos_data, vel_data, screen_data, step_data)
-
-            num_frames = pos_data.shape[0]
-            num_particles = pos_data.shape[1]
-            screen_ny = screen_data.shape[1]
-            screen_nx = screen_data.shape[2]
-
-            frame_indices = list(range(0, num_frames, args.stride))
-
-            if not frame_indices:
-                raise ValueError("No frames selected. Check --stride.")
-
-            xlim = tuple(args.xlim) if args.xlim is not None else (0.0, float(screen_nx))
-            ylim = tuple(args.ylim) if args.ylim is not None else (0.0, float(screen_ny))
-
-            if xlim[1] <= xlim[0]:
-                raise ValueError("--xlim must satisfy XMAX > XMIN")
-
-            if ylim[1] <= ylim[0]:
-                raise ValueError("--ylim must satisfy YMAX > YMIN")
-
-            print(f"Loaded simulation from: {file_path}")
-            print(f"Frames:      {num_frames}")
-            print(f"Particles:   {num_particles}")
-            print(f"Screen grid: {screen_nx} x {screen_ny}")
-            print(f"Stride:      {args.stride}")
-            print(f"X limits:    {xlim}")
-            print(f"Y limits:    {ylim}")
-
-            print("Computing global particle-speed bounds...")
-            vmin, vmax = compute_global_speed_bounds(
-                vel_data,
-                chunk_size=args.chunk_size,
-            )
-            print(f"Speed range: [{vmin:.6g}, {vmax:.6g}]")
-
-            screen_norm = None
-
-            if args.log_screen:
-                print("Computing logarithmic screen color bounds...")
-                smin, smax = compute_screen_log_bounds(
-                    screen_data,
-                    chunk_size=max(1, args.chunk_size),
-                )
-                screen_norm = LogNorm(vmin=smin, vmax=smax)
-                print(f"Screen positive range: [{smin:.6g}, {smax:.6g}]")
-
-            fig, ax = plt.subplots(figsize=(9, 7))
-
-            frame0 = frame_indices[0]
-
-            grid0 = screen_data[frame0]
-            pos0 = pos_data[frame0, :, :2]
-            vel0 = vel_data[frame0, :, :2]
-            speed0 = np.linalg.norm(vel0, axis=1)
-
-            if step_data is not None:
-                physical_step0 = int(step_data[frame0])
-            else:
-                physical_step0 = frame0
-
-            im = ax.imshow(
-                grid0,
-                origin="lower",
-                extent=[xlim[0], xlim[1], ylim[0], ylim[1]],
-                cmap=args.grid_cmap,
-                norm=screen_norm,
-                animated=False,
-                aspect="auto",
-            )
-
-            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Screen intensity")
-
-            scat = None
-            particle_cbar = None
-
-            if not args.hide_particles:
-                scat = ax.scatter(
-                    pos0[:, 0],
-                    pos0[:, 1],
-                    c=speed0,
-                    cmap=args.particle_cmap,
-                    s=args.particle_size,
-                    vmin=vmin,
-                    vmax=vmax,
-                    edgecolors="none",
-                )
-
-                particle_cbar = fig.colorbar(
-                    scat,
-                    ax=ax,
-                    fraction=0.046,
-                    pad=0.10,
-                )
-                particle_cbar.set_label("Velocity magnitude")
-
-            ax.set_xlim(*xlim)
-            ax.set_ylim(*ylim)
-            ax.set_xlabel("x")
-            ax.set_ylabel("y")
-            ax.set_aspect("equal", adjustable="box")
-
-            title = ax.set_title(
-                f"N-body simulation — frame {frame0}/{num_frames - 1}, step {physical_step0}"
-            )
-
-            def update(k: int):
-                frame = frame_indices[k]
-
-                grid = screen_data[frame]
-                pos = pos_data[frame, :, :2]
-                vel = vel_data[frame, :, :2]
-                speed = np.linalg.norm(vel, axis=1)
-
-                if step_data is not None:
-                    physical_step = int(step_data[frame])
-                else:
-                    physical_step = frame
-
-                im.set_data(grid)
-
-                artists = [im, title]
-
-                if scat is not None:
-                    scat.set_offsets(pos)
-                    scat.set_array(speed)
-                    artists.append(scat)
-
-                title.set_text(
-                    f"N-body simulation — frame {frame}/{num_frames - 1}, step {physical_step}"
-                )
-
-                return artists
-
-            ani = animation.FuncAnimation(
-                fig,
-                update,
-                frames=len(frame_indices),
-                interval=1000.0 / args.fps,
-                blit=False,
-            )
-
-            plt.tight_layout()
-
-            if args.save:
-                print(f"Saving animation to '{args.save}'...")
-
-                output = args.save.lower()
-
-                if output.endswith(".gif"):
-                    ani.save(args.save, writer="pillow", fps=args.fps)
-                else:
-                    ani.save(
-                        args.save,
-                        fps=args.fps,
-                        extra_args=["-vcodec", "libx264", "-pix_fmt", "yuv420p"],
-                    )
-
-                print("Save complete.")
-            else:
-                plt.show()
-
     except OSError as exc:
-        print(f"ERROR: failed to read HDF5 file: {exc}")
+        print(f"ERROR: failed to open or read HDF5 file: {exc}")
+        return 2
+
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
         return 3
 
-    except Exception as exc:
+    except RuntimeError as exc:
         print(f"ERROR: {exc}")
         return 4
 
-    return 0
+    except Exception as exc:
+        print(f"ERROR: unexpected failure: {exc}")
+        return 5
 
 
 if __name__ == "__main__":

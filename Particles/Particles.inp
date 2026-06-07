@@ -19,7 +19,7 @@
 # iterations for particle generation
 3000
 # iterations for particle dynamics
-100
+1000
 # bit of time for particle dynamics
 0.001
 # output frequency
