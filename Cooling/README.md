@@ -10,3 +10,7 @@ pip install numba
 pip install h5py
 pip install cupy-cuda12x
 
+
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+
