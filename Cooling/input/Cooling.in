@@ -14,7 +14,6 @@
 #   8) Dimag
 #   9) maxIters
 #  10) steps
-#  11) legacyPPMFlag   (parsed but ignored by current code)
 #
 # Notes:
 # - Comments are ignored.
