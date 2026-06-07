@@ -97,7 +97,7 @@ endfunction()
 
 if(PARTICLES_BUILD_OPENMP)
     add_executable(particles_omp
-        src/particles.cpp
+        src/cpp/particles.cpp
     )
 
     particles_apply_common_settings(particles_omp)
@@ -114,7 +114,7 @@ endif()
 
 if(PARTICLES_BUILD_CUDA)
     add_executable(particles_cuda
-        src/particles.cu
+        src/cpp/particles.cu
     )
 
     particles_apply_common_settings(particles_cuda)
