@@ -247,32 +247,29 @@ def compute_forces_numba(x, y, w, fx, fy):
         fy[i] = fyi
 
 
+
 @njit(cache=True, parallel=True, fastmath=False)
 def half_kick_drift_numba(x, y, vx, vy, w, fx, fy, dt):
     n_particles = x.shape[0]
-    half_dt = 0.5 * dt
 
     for i in prange(n_particles):
         invm = 1.0 / w[i]
 
-        vx[i] += half_dt * fx[i] * invm
-        vy[i] += half_dt * fy[i] * invm
+        vx[i] += 0.5 * fx[i] * invm * dt
+        vy[i] += 0.5 * fy[i] * invm * dt
 
         x[i] += vx[i] * dt
         y[i] += vy[i] * dt
 
-
 @njit(cache=True, parallel=True, fastmath=False)
 def half_kick_numba(vx, vy, w, fx_new, fy_new, dt):
     n_particles = vx.shape[0]
-    half_dt = 0.5 * dt
 
     for i in prange(n_particles):
         invm = 1.0 / w[i]
 
-        vx[i] += half_dt * fx_new[i] * invm
-        vy[i] += half_dt * fy_new[i] * invm
-
+        vx[i] += 0.5 * fx_new[i] * invm * dt
+        vy[i] += 0.5 * fy_new[i] * invm * dt
 
 @njit(cache=True, fastmath=False)
 def build_screen_numba(values, nx, ny, xs, xe, ys, ye, x, y, w, wmin, wr):
@@ -346,6 +343,8 @@ def compute_generating_field(g: Grid, max_iter: int) -> None:
 
 
 def generate_particles(g: Grid, pg: Grid) -> Particles:
+    if g.values.size == 0:
+        raise RuntimeError("generate_particles: empty generating field")
     p = Particles()
 
     vmax = int(np.max(g.values))
@@ -355,25 +354,25 @@ def generate_particles(g: Grid, pg: Grid) -> Particles:
     vals2 = g.values.reshape(g.ny, g.nx)
     mask = vals2 >= np.uint64(vmin)
 
-    js, is_ = np.nonzero(mask)
-    count = int(is_.size)
+    j_idx, i_idx = np.nonzero(mask)
+
+    count = int(i_idx.size)
 
     if count == 0:
         raise RuntimeError("No particles generated")
 
     p.resize(count)
 
-    selected_vals = vals2[js, is_].astype(np.float64)
+    selected_vals = vals2[j_idx, i_idx].astype(np.float64)
+    dx_range = pg.xe - pg.xs
+    dy_range = pg.ye - pg.ys
+
+    denom_x = float(g.nx - 1)
+    denom_y = float(g.ny - 1)
 
     p.w[:] = np.maximum(1.0, 10.0 * selected_vals)
-
-    p.x[:] = pg.xs + (pg.xe - pg.xs) * (
-        is_.astype(np.float64) / float(g.nx - 1)
-    )
-
-    p.y[:] = pg.ys + (pg.ye - pg.ys) * (
-        js.astype(np.float64) / float(g.ny - 1)
-    )
+    p.x[:] = pg.xs + (dx_range * i_idx.astype(np.float64)) / denom_x
+    p.y[:] = pg.ys + (dy_range * j_idx.astype(np.float64)) / denom_y
 
     # p.vx and p.vy are already zero-filled by resize().
     return p

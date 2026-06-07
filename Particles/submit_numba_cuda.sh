@@ -20,6 +20,6 @@ module load cmake/3.27.9
 module load hdf5/1.14.3--gcc--12.2.0-spack0.22
 module load python/3.11.7
 
-source cooling_venv/bin/activate
-srun python python/cooling_numba_cuda.py ./input/Cooling.in ./output/Cooling_numba_cuda.h5 ./output/Cooling_numba_cuda.csv
+source particles_venv/bin/activate
+srun python ./python/particles_numba_cuda.py ./input/Particles.in ./output/Particles_numba_cuda.h5
 

@@ -59,9 +59,9 @@ class Particles:
 
         self.n = n_particles
 
-        self.w = np.empty(n_particles, dtype=np.float64)
-        self.x = np.empty(n_particles, dtype=np.float64)
-        self.y = np.empty(n_particles, dtype=np.float64)
+        self.w  = np.zeros(n_particles, dtype=np.float64)
+        self.x  = np.zeros(n_particles, dtype=np.float64)
+        self.y  = np.zeros(n_particles, dtype=np.float64)
         self.vx = np.zeros(n_particles, dtype=np.float64)
         self.vy = np.zeros(n_particles, dtype=np.float64)
 
@@ -401,41 +401,39 @@ def build_screen_kernel(
 def generate_particles(g: Grid, pg: Grid) -> Particles:
     if g.values.size == 0:
         raise RuntimeError("generate_particles: empty generating field")
-
     p = Particles()
 
     vmax = int(np.max(g.values))
     vmin = int(np.min(g.values))
-
     vmin = (29 * vmax + vmin) // 30
 
     vals2 = g.values.reshape(g.ny, g.nx)
     mask = vals2 >= np.uint64(vmin)
 
-    js, is_ = np.nonzero(mask)
-    count = int(is_.size)
+    j_idx, i_idx = np.nonzero(mask)
+
+    count = int(i_idx.size)
 
     if count == 0:
         raise RuntimeError("No particles generated")
 
     p.resize(count)
 
-    selected_vals = vals2[js, is_].astype(np.float64)
+    selected_vals = vals2[j_idx, i_idx].astype(np.float64)
+    
+    dx_range = pg.xe - pg.xs
+    dy_range = pg.ye - pg.ys
+
+    denom_x = float(g.nx - 1)
+    denom_y = float(g.ny - 1)
 
     p.w[:] = np.maximum(1.0, 10.0 * selected_vals)
+    p.x[:] = pg.xs + (dx_range * i_idx.astype(np.float64)) / denom_x
+    p.y[:] = pg.ys + (dy_range * j_idx.astype(np.float64)) / denom_y
 
-    p.x[:] = pg.xs + (pg.xe - pg.xs) * (
-        is_.astype(np.float64) / float(g.nx - 1)
-    )
-
-    p.y[:] = pg.ys + (pg.ye - pg.ys) * (
-        js.astype(np.float64) / float(g.ny - 1)
-    )
-
-    p.vx.fill(0.0)
-    p.vy.fill(0.0)
-
+    # p.vx and p.vy are already zero-filled by resize().
     return p
+
 
 
 def allocate_host_output_buffers(
