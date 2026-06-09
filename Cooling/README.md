@@ -17,15 +17,17 @@ cmake --build build -j
 
 ENV_SCRIPT=scripts/env.leonardo.sh \
 CMAKE_PRESET=leonardo-a100 \
+CLEAN=1 INSTALL=1 \
+scripts/build.sh
+
+ENV_SCRIPT=scripts/env.leonardo.sh \
+CMAKE_PRESET=validation-strict \
 CLEAN=1 \
-INSTALL=1 \
-VERBOSE=1 \
 scripts/build.sh
 
 
+ENV_SCRIPT=scripts/env.macos.sh \
+CMAKE_PRESET=macos-arm64-openmp \
 CLEAN=1 \
-BUILD_OPENMP=ON \
-BUILD_CUDA=OFF \
-NATIVE_ARCH=OFF \
-FAST_MATH_CUDA=OFF \
 scripts/build.sh
+

@@ -15,6 +15,7 @@
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "COOLING_NATIVE_ARCH": "OFF",
         "COOLING_FAST_MATH_CUDA": "OFF",
+        "COOLING_REPRODUCIBLE_FP": "MODERATE",
         "CMAKE_INSTALL_PREFIX": "${sourceDir}/install"
       }
     },
@@ -36,7 +37,20 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "COOLING_BUILD_OPENMP": "ON",
-        "COOLING_BUILD_CUDA": "OFF"
+        "COOLING_BUILD_CUDA": "OFF",
+        "COOLING_REPRODUCIBLE_FP": "STRICT"
+      }
+    },
+    {
+      "name": "macos-arm64-openmp",
+      "inherits": "base",
+      "displayName": "macOS Apple Silicon OpenMP only",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "COOLING_BUILD_OPENMP": "ON",
+        "COOLING_BUILD_CUDA": "OFF",
+        "COOLING_NATIVE_ARCH": "OFF",
+        "COOLING_REPRODUCIBLE_FP": "MODERATE"
       }
     },
     {
@@ -48,7 +62,8 @@
         "COOLING_BUILD_OPENMP": "ON",
         "COOLING_BUILD_CUDA": "ON",
         "COOLING_STRICT_CUDA": "ON",
-        "COOLING_CUDA_ARCHITECTURES": "AUTO"
+        "COOLING_CUDA_ARCHITECTURES": "AUTO",
+        "COOLING_REPRODUCIBLE_FP": "MODERATE"
       }
     },
     {
@@ -60,7 +75,8 @@
         "COOLING_BUILD_OPENMP": "ON",
         "COOLING_BUILD_CUDA": "ON",
         "COOLING_STRICT_CUDA": "ON",
-        "COOLING_CUDA_ARCHITECTURES": "80"
+        "COOLING_CUDA_ARCHITECTURES": "80",
+        "COOLING_REPRODUCIBLE_FP": "MODERATE"
       }
     },
     {
@@ -72,15 +88,52 @@
         "COOLING_BUILD_OPENMP": "ON",
         "COOLING_BUILD_CUDA": "ON",
         "COOLING_STRICT_CUDA": "ON",
-        "COOLING_CUDA_ARCHITECTURES": "90"
+        "COOLING_CUDA_ARCHITECTURES": "90",
+        "COOLING_REPRODUCIBLE_FP": "MODERATE"
+      }
+    },
+    {
+      "name": "validation-strict",
+      "inherits": "base",
+      "displayName": "Strict FP validation build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "COOLING_BUILD_OPENMP": "ON",
+        "COOLING_BUILD_CUDA": "ON",
+        "COOLING_STRICT_CUDA": "ON",
+        "COOLING_CUDA_ARCHITECTURES": "80",
+        "COOLING_REPRODUCIBLE_FP": "STRICT"
       }
     }
   ],
   "buildPresets": [
-    { "name": "release", "configurePreset": "release" },
-    { "name": "debug", "configurePreset": "debug" },
-    { "name": "cuda-release", "configurePreset": "cuda-release" },
-    { "name": "leonardo-a100", "configurePreset": "leonardo-a100" },
-    { "name": "hopper-h100", "configurePreset": "hopper-h100" }
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "macos-arm64-openmp",
+      "configurePreset": "macos-arm64-openmp"
+    },
+    {
+      "name": "cuda-release",
+      "configurePreset": "cuda-release"
+    },
+    {
+      "name": "leonardo-a100",
+      "configurePreset": "leonardo-a100"
+    },
+    {
+      "name": "hopper-h100",
+      "configurePreset": "hopper-h100"
+    },
+    {
+      "name": "validation-strict",
+      "configurePreset": "validation-strict"
+    }
   ]
 }
