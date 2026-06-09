@@ -13,6 +13,6 @@
 ##SBATCH --exclusive
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
-source scripts/env.sh
+source scripts/env.leonardo.sh
 srun python src/python/cooling_numba.py ./input/Cooling.in ./output/Cooling_numba.h5 ./output/Cooling_numba.csv
 

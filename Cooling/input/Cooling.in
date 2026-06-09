@@ -14,21 +14,24 @@
 #   8) Dimag
 #   9) maxIters
 #  10) steps
+#  11) outputEvery
 #
 # Notes:
 # - Comments are ignored.
 # - Keep all numeric values in the same order.
 # - Grid is node-centered and includes both boundaries.
+# - outputEvery is optional in the updated solver.
+#   If omitted, only the final state is written.
 #
 # ============================================================
 # Grid dimensions
 # ============================================================
 
 # Number of grid points in x direction
-2000
+4000
 
 # Number of grid points in y direction
-2000
+4000
 
 # ============================================================
 # Measured field samples
@@ -75,5 +78,7 @@
 4000
 
 # Number of time steps
-240
+500
 
+# Output every N time steps
+50

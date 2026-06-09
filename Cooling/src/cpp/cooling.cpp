@@ -12,6 +12,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 #ifdef _OPENMP
@@ -53,7 +55,11 @@ struct Config {
 
     int maxIters{};
     int steps{};
-    int outputEvery{1};
+
+    // outputEvery is intentionally optional.
+    // If hasOutputEvery == false, only the final state is written.
+    bool hasOutputEvery{false};
+    int outputEvery{0};
 
     std::vector<MeasuredPoint> measured;
 };
@@ -264,11 +270,27 @@ Config readInput(const std::string& fname) {
         throw std::runtime_error("Domain extents Dreal and Dimag must be > 0");
     }
 
+    // Optional outputEvery.
+    //
+    // Old format:
+    //   ... maxIters steps outputEvery
+    //
+    // New allowed format:
+    //   ... maxIters steps
+    //
+    // If outputEvery is absent, the simulation writes only the final state.
+    if (pos < tokens.size()) {
+        cfg.outputEvery = nextInt();
+        cfg.hasOutputEvery = true;
+
+        if (cfg.outputEvery <= 0) {
+            throw std::runtime_error("outputEvery must be > 0");
+        }
+    }
+
     if (pos != tokens.size()) {
         throw std::runtime_error("Malformed input: unexpected extra tokens at end of file");
     }
-
-    cfg.outputEvery = 1;
 
     return cfg;
 }
@@ -409,7 +431,7 @@ public:
             );
         }
 
-        // /step dataset
+        // /step dataset: [frame]
         {
             hsize_t dims[1] = {0};
             hsize_t maxdims[1] = {H5S_UNLIMITED};
@@ -417,7 +439,10 @@ public:
             H5::DataSpace space(1, dims, maxdims);
             H5::DSetCreatPropList prop;
 
-            hsize_t chunks[1] = {static_cast<hsize_t>(batch_)};
+            hsize_t chunks[1] = {
+                static_cast<hsize_t>(batch_)
+            };
+
             prop.setChunk(1, chunks);
 
             step_ = file_.createDataSet(
@@ -492,7 +517,9 @@ public:
                 static_cast<hsize_t>(frame_)
             };
 
-            hsize_t count[1] = {1};
+            hsize_t count[1] = {
+                1
+            };
 
             filespace.selectHyperslab(H5S_SELECT_SET, count, start);
 
@@ -516,8 +543,6 @@ public:
             return;
         }
 
-        closed_ = true;
-
         if (frame_ != capacity_) {
             extend(frame_);
         }
@@ -527,6 +552,8 @@ public:
         field_.close();
         step_.close();
         file_.close();
+
+        closed_ = true;
     }
 
 private:
@@ -550,6 +577,7 @@ private:
         }
     }
 
+private:
     H5::H5File file_;
     H5::DataSet field_;
     H5::DataSet step_;
@@ -842,12 +870,14 @@ void writeStatsLine(std::ostream& os, int step, const Stats& s) {
 // ============================================================
 
 struct CliOptions {
-    std::string inputFile{"Cooling.inp"};
-    std::string h5File{"cooling.h5"};
-    std::string csvFile{"Statistics.csv"};
+    std::string inputFile{"input/Cooling.in"};
+    std::string h5File{"output/Cooling.h5"};
+    std::string csvFile{"output/Statistics.csv"};
 
+    // Optional positional override:
+    //   program input h5 csv outputEvery
     bool hasOutputEvery{false};
-    int outputEvery{1};
+    int outputEvery{0};
 
     std::string statsMode{"accurate"};
 
@@ -956,11 +986,14 @@ int main(int argc, char** argv) {
 
         Config cfg = readInput(opt.inputFile);
 
+        // Command-line outputEvery overrides input-file outputEvery.
+        // If neither specifies it, the program writes only the final state.
         if (opt.hasOutputEvery) {
             cfg.outputEvery = opt.outputEvery;
+            cfg.hasOutputEvery = true;
         }
 
-        if (cfg.outputEvery <= 0) {
+        if (cfg.hasOutputEvery && cfg.outputEvery <= 0) {
             throw std::invalid_argument("outputEvery must be > 0");
         }
 
@@ -989,7 +1022,14 @@ int main(int argc, char** argv) {
         std::cout << "Measured points:              " << cfg.measured.size() << '\n';
         std::cout << "Max iterations:               " << cfg.maxIters << '\n';
         std::cout << "Time steps:                   " << cfg.steps << '\n';
-        std::cout << "Snapshot every:               " << cfg.outputEvery << " step(s)\n";
+
+        if (cfg.hasOutputEvery) {
+            std::cout << "Snapshot every:               "
+                      << cfg.outputEvery << " step(s)\n";
+        } else {
+            std::cout << "Snapshot every:               final step only\n";
+        }
+
         std::cout << "Stats mode:                   " << opt.statsMode << '\n';
         std::cout << "HDF5 chunk tile:              "
                   << std::min<std::size_t>(cfg.ny, opt.h5TileY)
@@ -1044,18 +1084,36 @@ int main(int argc, char** argv) {
             opt.h5TileX
         );
 
-        // Step 0 output.
-        {
+        bool hasLastWrittenStep = false;
+        int lastWrittenStep = -1;
+
+        auto writeOutputFrame = [&](int step) {
+            if (hasLastWrittenStep && step == lastWrittenStep) {
+                return;
+            }
+
             const auto outT0 = std::chrono::steady_clock::now();
 
-            writer.write(0, uCurr);
-            writeStatsLine(csv, 0, computeStats(uCurr, opt.statsMode));
+            writer.write(step, uCurr);
+            writeStatsLine(csv, step, computeStats(uCurr, opt.statsMode));
             ++outputFrames;
 
             const auto outT1 = std::chrono::steady_clock::now();
 
             outputStatsIoTime +=
                 std::chrono::duration<double>(outT1 - outT0).count();
+
+            hasLastWrittenStep = true;
+            lastWrittenStep = step;
+        };
+
+        // If outputEvery was explicitly specified, keep the traditional
+        // behavior and write the initial condition.
+        //
+        // If outputEvery was not specified, do not write step 0 here.
+        // In that mode, only the final state is written after the loop.
+        if (cfg.hasOutputEvery) {
+            writeOutputFrame(0);
         }
 
         for (int step = 1; step <= cfg.steps; ++step) {
@@ -1076,19 +1134,17 @@ int main(int argc, char** argv) {
             pureDynamicsTime +=
                 std::chrono::duration<double>(dynT1 - dynT0).count();
 
-            if ((step % cfg.outputEvery) == 0 || step == cfg.steps) {
-                const auto outT0 = std::chrono::steady_clock::now();
-
-                writer.write(step, uCurr);
-                writeStatsLine(csv, step, computeStats(uCurr, opt.statsMode));
-                ++outputFrames;
-
-                const auto outT1 = std::chrono::steady_clock::now();
-
-                outputStatsIoTime +=
-                    std::chrono::duration<double>(outT1 - outT0).count();
+            // Periodic loop output only exists when outputEvery was specified.
+            if (cfg.hasOutputEvery && (step % cfg.outputEvery) == 0) {
+                writeOutputFrame(step);
             }
         }
+
+        // Always write the final state.
+        //
+        // If periodic output already wrote this same final step,
+        // writeOutputFrame() avoids duplication.
+        writeOutputFrame(cfg.steps);
 
         writer.close();
 

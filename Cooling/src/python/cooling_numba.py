@@ -6,7 +6,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import h5py
 import numpy as np
@@ -34,7 +34,12 @@ class Config:
     Dimag: float
     maxIters: int
     steps: int
-    outputEvery: int
+
+    # outputEvery is optional.
+    # If hasOutputEvery is False, only the final state is written.
+    hasOutputEvery: bool
+    outputEvery: Optional[int]
+
     measured: List[MeasuredPoint]
 
 
@@ -152,6 +157,26 @@ def read_input(fname: str) -> Config:
     if dreal <= 0.0 or dimag <= 0.0:
         raise RuntimeError("Domain extents Dreal and Dimag must be > 0")
 
+    has_output_every = False
+    output_every: Optional[int] = None
+
+    # Optional outputEvery.
+    #
+    # Supported endings:
+    #
+    #   maxIters steps
+    #
+    # or:
+    #
+    #   maxIters steps outputEvery
+    #
+    # If outputEvery is absent, only the final state is written.
+    if pos < len(tokens):
+        output_every = next_int()
+        has_output_every = True
+
+        validate_output_every(output_every)
+
     if pos != len(tokens):
         raise RuntimeError("Malformed input: unexpected extra tokens at end of file")
 
@@ -164,7 +189,8 @@ def read_input(fname: str) -> Config:
         Dimag=dimag,
         maxIters=max_iters,
         steps=steps,
-        outputEvery=1,
+        hasOutputEvery=has_output_every,
+        outputEvery=output_every,
         measured=measured,
     )
 
@@ -234,12 +260,6 @@ def build_cooling_coeffs(
 
 # ============================================================
 # NUMBA CPU KERNELS
-#
-# These are intentionally CUDA-shaped:
-# - flat arrays
-# - explicit scalar parameters
-# - no Python objects in hot loops
-# - interior and boundary work separated
 # ============================================================
 
 @njit(parallel=True, fastmath=False)
@@ -469,13 +489,12 @@ class H5Writer:
         if self.closed:
             return
 
-        self.closed = True
-
         if self.frame != self.capacity:
             self._extend(self.frame)
 
         self.file.flush()
         self.file.close()
+        self.closed = True
 
     def __enter__(self):
         return self
@@ -626,6 +645,11 @@ def run_simulation(
 ) -> None:
     validate_stats_mode(stats_mode)
 
+    if cfg.hasOutputEvery:
+        if cfg.outputEvery is None:
+            raise ValueError("Internal error: hasOutputEvery is true but outputEvery is None")
+        validate_output_every(cfg.outputEvery)
+
     n = validated_grid_size(cfg.nx, cfg.ny)
 
     x0, y0, dx, dy = build_domain_params(cfg)
@@ -695,6 +719,8 @@ def run_simulation(
     output_stats_io_time_s = 0.0
     output_frames = 0
 
+    last_written_step: Optional[int] = None
+
     loop_t0 = time.perf_counter()
 
     with open(csv_file, "w", encoding="utf-8") as csvf:
@@ -708,16 +734,34 @@ def run_simulation(
             tile_y=h5_tile_y,
             tile_x=h5_tile_x,
         ) as writer:
-            # Step 0 output.
-            out_t0 = time.perf_counter()
 
-            stats0 = compute_stats(u_curr, stats_mode)
-            write_stats_line(csvf, 0, stats0)
-            writer.write(0, u_curr)
-            output_frames += 1
+            def write_output_frame(step: int) -> None:
+                nonlocal output_frames
+                nonlocal output_stats_io_time_s
+                nonlocal last_written_step
 
-            out_t1 = time.perf_counter()
-            output_stats_io_time_s += out_t1 - out_t0
+                if last_written_step == step:
+                    return
+
+                out_t0 = time.perf_counter()
+
+                stats = compute_stats(u_curr, stats_mode)
+                write_stats_line(csvf, step, stats)
+                writer.write(step, u_curr)
+                output_frames += 1
+
+                out_t1 = time.perf_counter()
+                output_stats_io_time_s += out_t1 - out_t0
+
+                last_written_step = step
+
+            # If outputEvery was explicitly specified, keep traditional behavior:
+            # write the initial condition at step 0.
+            #
+            # If outputEvery was not specified, do not write step 0 here.
+            # In that mode, only the final state is written after the loop.
+            if cfg.hasOutputEvery:
+                write_output_frame(0)
 
             for step in range(1, cfg.steps + 1):
                 dyn_t0 = time.perf_counter()
@@ -738,16 +782,16 @@ def run_simulation(
 
                 u_curr, u_next = u_next, u_curr
 
-                if (step % cfg.outputEvery) == 0 or step == cfg.steps:
-                    out_t0 = time.perf_counter()
+                # Periodic output only when outputEvery was explicitly specified.
+                if cfg.hasOutputEvery:
+                    assert cfg.outputEvery is not None
 
-                    stats = compute_stats(u_curr, stats_mode)
-                    write_stats_line(csvf, step, stats)
-                    writer.write(step, u_curr)
-                    output_frames += 1
+                    if (step % cfg.outputEvery) == 0:
+                        write_output_frame(step)
 
-                    out_t1 = time.perf_counter()
-                    output_stats_io_time_s += out_t1 - out_t0
+            # Always write the final state.
+            # If periodic output already wrote it, the duplicate guard skips it.
+            write_output_frame(cfg.steps)
 
     loop_t1 = time.perf_counter()
     total_wall_t1 = time.perf_counter()
@@ -764,7 +808,13 @@ def run_simulation(
     print(f"Measured points:              {len(cfg.measured)}")
     print(f"Max iterations:               {cfg.maxIters}")
     print(f"Time steps:                   {cfg.steps}")
-    print(f"Snapshot every:               {cfg.outputEvery} step(s)")
+
+    if cfg.hasOutputEvery:
+        assert cfg.outputEvery is not None
+        print(f"Snapshot every:               {cfg.outputEvery} step(s)")
+    else:
+        print("Snapshot every:               final step only")
+
     print(f"Output frames:                {output_frames}")
     print(f"Stats mode:                   {stats_mode}")
     print(f"Numba threads:                {get_num_threads()}")
@@ -805,21 +855,21 @@ def main() -> int:
     parser.add_argument(
         "input",
         nargs="?",
-        default="Cooling.inp",
+        default="input/Cooling.in",
         help="Input file",
     )
 
     parser.add_argument(
         "h5",
         nargs="?",
-        default="cooling.h5",
+        default="output/Cooling.h5",
         help="Output HDF5 file",
     )
 
     parser.add_argument(
         "csv",
         nargs="?",
-        default="Statistics.csv",
+        default="output/Statistics.csv",
         help="Output CSV file",
     )
 
@@ -828,7 +878,10 @@ def main() -> int:
         nargs="?",
         type=int,
         default=None,
-        help="Snapshot cadence override",
+        help=(
+            "Optional snapshot cadence override. "
+            "If omitted and absent from input file, only the final state is written."
+        ),
     )
 
     parser.add_argument(
@@ -872,10 +925,17 @@ def main() -> int:
 
     cfg = read_input(args.input)
 
+    # Command-line outputEvery overrides input-file outputEvery.
+    # If neither specifies outputEvery, only the final state is written.
     if args.outputEvery is not None:
+        validate_output_every(args.outputEvery)
         cfg.outputEvery = args.outputEvery
+        cfg.hasOutputEvery = True
 
-    validate_output_every(cfg.outputEvery)
+    if cfg.hasOutputEvery:
+        assert cfg.outputEvery is not None
+        validate_output_every(cfg.outputEvery)
+
     validate_stats_mode(args.stats)
 
     print(f"Input file:                   {args.input}")
@@ -900,4 +960,5 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"CRITICAL ERROR: {e}", file=sys.stderr)
         raise SystemExit(1)
+
 

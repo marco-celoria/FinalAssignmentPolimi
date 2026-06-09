@@ -19,6 +19,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -222,7 +223,11 @@ struct Config {
 
     int maxIters{};
     int steps{};
-    int outputEvery{1};
+
+    // Optional output frequency.
+    // If hasOutputEvery == false, only the final state is written.
+    bool hasOutputEvery{false};
+    int outputEvery{0};
 
     std::vector<MeasuredPoint> measured;
 };
@@ -351,7 +356,7 @@ Config readInput(const std::string& fname) {
             int v = std::stoi(s, &used);
 
             if (used != s.size()) {
-                throw std::runtime_error("");
+                throw std::runtime_error("not a pure integer");
             }
 
             return v;
@@ -374,7 +379,7 @@ Config readInput(const std::string& fname) {
             double v = std::stod(s, &used);
 
             if (used != s.size()) {
-                throw std::runtime_error("");
+                throw std::runtime_error("not a pure floating-point number");
             }
 
             return v;
@@ -432,11 +437,29 @@ Config readInput(const std::string& fname) {
         throw std::runtime_error("Domain extents Dreal and Dimag must be > 0");
     }
 
+    // Optional outputEvery.
+    //
+    // Supported input endings:
+    //
+    //   maxIters steps
+    //
+    // or:
+    //
+    //   maxIters steps outputEvery
+    //
+    // If outputEvery is absent, only the final state is written.
+    if (pos < tokens.size()) {
+        cfg.outputEvery = nextInt();
+        cfg.hasOutputEvery = true;
+
+        if (cfg.outputEvery <= 0) {
+            throw std::runtime_error("outputEvery must be > 0");
+        }
+    }
+
     if (pos != tokens.size()) {
         throw std::runtime_error("Malformed input: unexpected extra tokens at end of file");
     }
-
-    cfg.outputEvery = 1;
 
     return cfg;
 }
@@ -578,7 +601,7 @@ public:
             );
         }
 
-        // /step dataset
+        // /step dataset: [frame]
         {
             hsize_t dims[1] = {0};
             hsize_t maxdims[1] = {H5S_UNLIMITED};
@@ -586,7 +609,10 @@ public:
             H5::DataSpace space(1, dims, maxdims);
             H5::DSetCreatPropList prop;
 
-            hsize_t chunks[1] = {static_cast<hsize_t>(batch_)};
+            hsize_t chunks[1] = {
+                static_cast<hsize_t>(batch_)
+            };
+
             prop.setChunk(1, chunks);
 
             step_ = file_.createDataSet(
@@ -689,8 +715,6 @@ public:
             return;
         }
 
-        closed_ = true;
-
         if (frame_ != capacity_) {
             extend(frame_);
         }
@@ -700,6 +724,8 @@ public:
         field_.close();
         step_.close();
         file_.close();
+
+        closed_ = true;
     }
 
 private:
@@ -723,6 +749,7 @@ private:
         }
     }
 
+private:
     H5::H5File file_;
     H5::DataSet field_;
     H5::DataSet step_;
@@ -1127,17 +1154,30 @@ int main(int argc, char** argv) {
     H5::Exception::dontPrint();
 
     try {
-        const std::string inputFile = (argc > 1) ? argv[1] : "Cooling.inp";
-        const std::string h5File = (argc > 2) ? argv[2] : "cooling.h5";
-        const std::string csvFile = (argc > 3) ? argv[3] : "Statistics.csv";
+        if (argc > 5) {
+            throw std::runtime_error(
+                "Too many positional arguments. Expected: input h5 csv outputEvery"
+            );
+        }
+
+        const std::string inputFile = (argc > 1) ? argv[1] : "inout/Cooling.in";
+        const std::string h5File = (argc > 2) ? argv[2] : "output/Cooling.h5";
+        const std::string csvFile = (argc > 3) ? argv[3] : "output/Statistics.csv";
 
         Config cfg = readInput(inputFile);
 
+        // Command-line outputEvery overrides input-file outputEvery.
+        // If neither specifies outputEvery, only the final state is written.
         if (argc > 4) {
             cfg.outputEvery = parseStrictInt(argv[4], "outputEvery");
+            cfg.hasOutputEvery = true;
+
+            if (cfg.outputEvery <= 0) {
+                throw std::invalid_argument("outputEvery must be > 0");
+            }
         }
 
-        if (cfg.outputEvery <= 0) {
+        if (cfg.hasOutputEvery && cfg.outputEvery <= 0) {
             throw std::invalid_argument("outputEvery must be > 0");
         }
 
@@ -1184,8 +1224,16 @@ int main(int argc, char** argv) {
         std::cout << "Measured points:              " << cfg.measured.size() << '\n';
         std::cout << "Max iterations:               " << cfg.maxIters << '\n';
         std::cout << "Time steps:                   " << cfg.steps << '\n';
-        std::cout << "Snapshot every:               " << cfg.outputEvery << " step(s)\n";
-        std::cout << "CUDA block2d:                 " << block2d.x << " x " << block2d.y << '\n';
+
+        if (cfg.hasOutputEvery) {
+            std::cout << "Snapshot every:               "
+                      << cfg.outputEvery << " step(s)\n";
+        } else {
+            std::cout << "Snapshot every:               final step only\n";
+        }
+
+        std::cout << "CUDA block2d:                 "
+                  << block2d.x << " x " << block2d.y << '\n';
         std::cout << "CUDA block1d:                 " << block1d << "\n\n";
 
         CudaEvent weightStart;
@@ -1268,22 +1316,66 @@ int main(int argc, char** argv) {
 
         H5Writer writer(h5File, cfg.nx, cfg.ny, 32);
 
-        // Step 0 output.
-        CUDA_CHECK(cudaMemcpy(
-            uHost.data(),
-            d_uCurr.get(),
-            N * sizeof(double),
-            cudaMemcpyDeviceToHost
-        ));
+        int outputFrames = 0;
+        bool hasLastWrittenStep = false;
+        int lastWrittenStep = -1;
 
-        writer.write(0, uHost.data(), N);
+        auto writeOutputFrame = [&](int step) {
+            if (hasLastWrittenStep && step == lastWrittenStep) {
+                return;
+            }
 
-        Stats s0 = computeStatsGPU(d_uCurr.get(), N);
-        writeStatsLine(csv, 0, s0);
+            CUDA_CHECK(cudaMemcpy(
+                uHost.data(),
+                d_uCurr.get(),
+                N * sizeof(double),
+                cudaMemcpyDeviceToHost
+            ));
 
-        if (cfg.steps > 0) {
-            CUDA_CHECK(cudaEventRecord(dynBatchStart.get()));
+            writer.write(step, uHost.data(), N);
+
+            Stats s = computeStatsGPU(d_uCurr.get(), N);
+            writeStatsLine(csv, step, s);
+
+            hasLastWrittenStep = true;
+            lastWrittenStep = step;
+            ++outputFrames;
+        };
+
+        bool dynTimerRunning = false;
+
+        auto startDynTimer = [&]() {
+            if (!dynTimerRunning && cfg.steps > 0) {
+                CUDA_CHECK(cudaEventRecord(dynBatchStart.get()));
+                dynTimerRunning = true;
+            }
+        };
+
+        auto stopDynTimerAndAccumulate = [&]() {
+            if (dynTimerRunning) {
+                CUDA_CHECK(cudaEventRecord(dynBatchStop.get()));
+                CUDA_CHECK(cudaEventSynchronize(dynBatchStop.get()));
+
+                float batchMs = 0.0f;
+
+                CUDA_CHECK(cudaEventElapsedTime(
+                    &batchMs,
+                    dynBatchStart.get(),
+                    dynBatchStop.get()
+                ));
+
+                tDynUpdateKernelMsAccum += batchMs;
+                dynTimerRunning = false;
+            }
+        };
+
+        // If outputEvery was explicitly specified, write the initial condition.
+        // If not specified, do not write step 0 here.
+        if (cfg.hasOutputEvery) {
+            writeOutputFrame(0);
         }
+
+        startDynTimer();
 
         for (int step = 1; step <= cfg.steps; ++step) {
             launchUpdateField(
@@ -1301,37 +1393,25 @@ int main(int argc, char** argv) {
 
             swap(d_uCurr, d_uNext);
 
-            if ((step % cfg.outputEvery) == 0 || step == cfg.steps) {
-                CUDA_CHECK(cudaEventRecord(dynBatchStop.get()));
-                CUDA_CHECK(cudaEventSynchronize(dynBatchStop.get()));
+            // Intermediate output only when outputEvery was explicitly specified.
+            if (cfg.hasOutputEvery && (step % cfg.outputEvery) == 0) {
+                stopDynTimerAndAccumulate();
 
-                float batchMs = 0.0f;
-
-                CUDA_CHECK(cudaEventElapsedTime(
-                    &batchMs,
-                    dynBatchStart.get(),
-                    dynBatchStop.get()
-                ));
-
-                tDynUpdateKernelMsAccum += batchMs;
-
-                CUDA_CHECK(cudaMemcpy(
-                    uHost.data(),
-                    d_uCurr.get(),
-                    N * sizeof(double),
-                    cudaMemcpyDeviceToHost
-                ));
-
-                writer.write(step, uHost.data(), N);
-
-                Stats s = computeStatsGPU(d_uCurr.get(), N);
-                writeStatsLine(csv, step, s);
+                writeOutputFrame(step);
 
                 if (step < cfg.steps) {
-                    CUDA_CHECK(cudaEventRecord(dynBatchStart.get()));
+                    startDynTimer();
                 }
             }
         }
+
+        // If no periodic output happened at the final step, stop the kernel timer
+        // before final host copy/stats/HDF5 output.
+        stopDynTimerAndAccumulate();
+
+        // Always write the final state.
+        // If it was already written by periodic output, the duplicate guard skips it.
+        writeOutputFrame(cfg.steps);
 
         CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -1353,6 +1433,9 @@ int main(int argc, char** argv) {
 
         std::cout << "Dynamics loop wall incl. copy/stats/I/O: "
                   << tDynWall << " s\n";
+
+        std::cout << "Output frames:                      "
+                  << outputFrames << '\n';
 
         if (cfg.steps > 0) {
             const double updates =

@@ -13,6 +13,6 @@
 ##SBATCH --exclusive
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
-source scripts/env.sh
-srun ./build/cooling_omp ./input/Cooling.in ./output/Cooling_cpp.h5 ./output/Cooling_cpp.csv
+source scripts/env.leonardo.sh
+srun ./install/bin/cooling_omp ./input/Cooling.in ./output/Cooling_cpp.h5 ./output/Cooling_cpp.csv
 

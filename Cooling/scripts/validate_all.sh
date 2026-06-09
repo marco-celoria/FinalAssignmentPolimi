@@ -26,6 +26,20 @@ python "${VALIDATOR}" \
   --rtol="${RTOL}" \
   --atol="${ATOL}"
 
+echo "Cuda vs Numba"
+python "${VALIDATOR}" \
+  output/Cooling_cuda.h5 \
+  output/Cooling_numba.h5 \
+  --rtol="${RTOL}" \
+  --atol="${ATOL}"
+
+echo "Cuda vs NumbaCuda"
+python "${VALIDATOR}" \
+  output/Cooling_cuda.h5 \
+  output/Cooling_numba_cuda.h5 \
+  --rtol="${RTOL}" \
+  --atol="${ATOL}"
+
 echo "Numba vs NumbaCuda"
 python "${VALIDATOR}" \
   output/Cooling_numba.h5 \

@@ -14,3 +14,18 @@ pip install cupy-cuda12x
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
+
+ENV_SCRIPT=scripts/env.leonardo.sh \
+CMAKE_PRESET=leonardo-a100 \
+CLEAN=1 \
+INSTALL=1 \
+VERBOSE=1 \
+scripts/build.sh
+
+
+CLEAN=1 \
+BUILD_OPENMP=ON \
+BUILD_CUDA=OFF \
+NATIVE_ARCH=OFF \
+FAST_MATH_CUDA=OFF \
+scripts/build.sh

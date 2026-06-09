@@ -1,0 +1,86 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 18,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "COOLING_NATIVE_ARCH": "OFF",
+        "COOLING_FAST_MATH_CUDA": "OFF",
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/install"
+      }
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "displayName": "Release, OpenMP, CUDA auto",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "COOLING_BUILD_OPENMP": "ON",
+        "COOLING_BUILD_CUDA": "AUTO",
+        "COOLING_CUDA_ARCHITECTURES": "AUTO"
+      }
+    },
+    {
+      "name": "debug",
+      "inherits": "base",
+      "displayName": "Debug, OpenMP only",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "COOLING_BUILD_OPENMP": "ON",
+        "COOLING_BUILD_CUDA": "OFF"
+      }
+    },
+    {
+      "name": "cuda-release",
+      "inherits": "base",
+      "displayName": "Release, CUDA required, architecture AUTO",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "COOLING_BUILD_OPENMP": "ON",
+        "COOLING_BUILD_CUDA": "ON",
+        "COOLING_STRICT_CUDA": "ON",
+        "COOLING_CUDA_ARCHITECTURES": "AUTO"
+      }
+    },
+    {
+      "name": "leonardo-a100",
+      "inherits": "base",
+      "displayName": "Leonardo A100 Release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "COOLING_BUILD_OPENMP": "ON",
+        "COOLING_BUILD_CUDA": "ON",
+        "COOLING_STRICT_CUDA": "ON",
+        "COOLING_CUDA_ARCHITECTURES": "80"
+      }
+    },
+    {
+      "name": "hopper-h100",
+      "inherits": "base",
+      "displayName": "Hopper H100 Release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "COOLING_BUILD_OPENMP": "ON",
+        "COOLING_BUILD_CUDA": "ON",
+        "COOLING_STRICT_CUDA": "ON",
+        "COOLING_CUDA_ARCHITECTURES": "90"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "release", "configurePreset": "release" },
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "cuda-release", "configurePreset": "cuda-release" },
+    { "name": "leonardo-a100", "configurePreset": "leonardo-a100" },
+    { "name": "hopper-h100", "configurePreset": "hopper-h100" }
+  ]
+}
