@@ -32,7 +32,6 @@ NATIVE_ARCH="${NATIVE_ARCH:-OFF}"
 FAST_MATH_CUDA="${FAST_MATH_CUDA:-OFF}"
 STRICT_CUDA="${STRICT_CUDA:-0}"
 
-REPRODUCIBLE_FP="${REPRODUCIBLE_FP:-MODERATE}"
 CUDA_ARCH="${CUDA_ARCH:-AUTO}"
 
 INSTALL_PREFIX="${INSTALL_PREFIX:-${PROJECT_ROOT}/install}"
@@ -84,15 +83,6 @@ normalize_on_off_auto() {
     esac
 }
 
-normalize_fp_policy() {
-    case "$1" in
-        OFF|off) echo "OFF" ;;
-        MODERATE|moderate) echo "MODERATE" ;;
-        STRICT|strict) echo "STRICT" ;;
-        *) echo "[ERROR] Invalid FP policy: $1" >&2; exit 1 ;;
-    esac
-}
-
 is_macos() {
     [[ "$(uname -s)" == "Darwin" ]]
 }
@@ -102,7 +92,6 @@ BUILD_OPENMP="$(normalize_on_off "${BUILD_OPENMP}")"
 BUILD_CUDA="$(normalize_on_off_auto "${BUILD_CUDA}")"
 NATIVE_ARCH="$(normalize_on_off "${NATIVE_ARCH}")"
 FAST_MATH_CUDA="$(normalize_on_off "${FAST_MATH_CUDA}")"
-REPRODUCIBLE_FP="$(normalize_fp_policy "${REPRODUCIBLE_FP}")"
 
 # ------------------------------------------------------------
 # Optional environment loading
@@ -124,7 +113,6 @@ BUILD_OPENMP="$(normalize_on_off "${BUILD_OPENMP}")"
 BUILD_CUDA="$(normalize_on_off_auto "${BUILD_CUDA}")"
 NATIVE_ARCH="$(normalize_on_off "${NATIVE_ARCH}")"
 FAST_MATH_CUDA="$(normalize_on_off "${FAST_MATH_CUDA}")"
-REPRODUCIBLE_FP="$(normalize_fp_policy "${REPRODUCIBLE_FP}")"
 
 # ------------------------------------------------------------
 # macOS CUDA guard
@@ -194,7 +182,7 @@ echo "Build CUDA:          ${BUILD_CUDA}"
 echo "CUDA arch:           ${CUDA_ARCH}"
 echo "Native arch:         ${NATIVE_ARCH}"
 echo "CUDA fast math:      ${FAST_MATH_CUDA}"
-echo "FP policy:           ${REPRODUCIBLE_FP}"
+echo "FP policy:           moderate (built-in)"
 echo "Install:             ${INSTALL}"
 echo "Install prefix:      ${INSTALL_PREFIX}"
 echo "CXX compiler:        ${CXX_COMPILER:-default}"
@@ -223,7 +211,6 @@ if [[ -n "${CMAKE_PRESET}" ]]; then
     PRESET_ARGS=(
         --preset "${CMAKE_PRESET}"
         -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}"
-        -DCOOLING_REPRODUCIBLE_FP="${REPRODUCIBLE_FP}"
     )
 
     if [[ -n "${HDF5_ROOT}" ]]; then
@@ -267,7 +254,6 @@ else
         -DCOOLING_FAST_MATH_CUDA="${FAST_MATH_CUDA}"
         -DCOOLING_CUDA_ARCHITECTURES="${CUDA_ARCH}"
         -DCOOLING_STRICT_CUDA="${STRICT_CUDA}"
-        -DCOOLING_REPRODUCIBLE_FP="${REPRODUCIBLE_FP}"
     )
 
     if [[ -n "${HDF5_ROOT}" ]]; then

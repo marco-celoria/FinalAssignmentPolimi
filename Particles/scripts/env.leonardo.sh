@@ -31,10 +31,10 @@ else
     echo "[WARN] nvcc not found after loading cuda module"
 fi
 
-if [[ -n "${PROJECT_ROOT:-}" && -d "${PROJECT_ROOT}/cooling_venv" ]]; then
+if [[ -n "${PROJECT_ROOT:-}" && -d "${PROJECT_ROOT}/particles_venv" ]]; then
     # shellcheck source=/dev/null
-    source "${PROJECT_ROOT}/cooling_venv/bin/activate"
-elif [[ -d "cooling_venv" ]]; then
+    source "${PROJECT_ROOT}/particles_venv/bin/activate"
+elif [[ -d "particles_venv" ]]; then
     # shellcheck source=/dev/null
-    source "cooling_venv/bin/activate"
+    source "particles_venv/bin/activate"
 fi

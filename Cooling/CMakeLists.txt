@@ -9,9 +9,11 @@ project(CoolingSimulation LANGUAGES CXX)
 set(COOLING_BUILD_OPENMP "ON" CACHE STRING
     "Build the OpenMP C++ solver: ON or OFF"
 )
+
 set(COOLING_BUILD_CUDA "AUTO" CACHE STRING
     "Build the CUDA C++ solver: ON, OFF, or AUTO"
 )
+
 set(COOLING_CUDA_ARCHITECTURES "AUTO" CACHE STRING
     "CUDA architectures: AUTO, native, 70, 75, 80, 86, 89, 90, or a list like 70;80;90"
 )
@@ -33,11 +35,6 @@ option(COOLING_STRICT_CUDA
     "Fail if CUDA was requested but unavailable"
     OFF
 )
-
-set(COOLING_REPRODUCIBLE_FP "MODERATE" CACHE STRING
-    "Floating-point policy: OFF, MODERATE, STRICT"
-)
-set_property(CACHE COOLING_REPRODUCIBLE_FP PROPERTY STRINGS OFF MODERATE STRICT)
 
 # ------------------------------------------------------------
 # Backward Compatibility Configuration
@@ -63,10 +60,6 @@ if(DEFINED PARTICLES_CUDA_ARCHITECTURES)
     set(COOLING_CUDA_ARCHITECTURES "${PARTICLES_CUDA_ARCHITECTURES}" CACHE STRING "" FORCE)
 endif()
 
-if(DEFINED PARTICLES_REPRODUCIBLE_FP)
-    set(COOLING_REPRODUCIBLE_FP "${PARTICLES_REPRODUCIBLE_FP}" CACHE STRING "" FORCE)
-endif()
-
 # ============================================================
 # Validate Options
 # ============================================================
@@ -77,10 +70,6 @@ endif()
 
 if(NOT COOLING_BUILD_CUDA MATCHES "^(ON|OFF|AUTO)$")
     message(FATAL_ERROR "COOLING_BUILD_CUDA must be ON, OFF, or AUTO")
-endif()
-
-if(NOT COOLING_REPRODUCIBLE_FP MATCHES "^(OFF|MODERATE|STRICT)$")
-    message(FATAL_ERROR "COOLING_REPRODUCIBLE_FP must be OFF, MODERATE, or STRICT")
 endif()
 
 # Native macOS cannot build the CUDA C++ target.
@@ -248,57 +237,31 @@ function(cooling_apply_optimization target_name)
 endfunction()
 
 function(cooling_apply_fp_policy target_name)
-    if(COOLING_REPRODUCIBLE_FP STREQUAL "OFF")
-        return()
-    endif()
-
+    # Fixed "moderate" scientific FP policy:
+    # - no fast math
+    # - no unsafe math optimizations
+    # - keep FMA contraction enabled on CPU for performance
+    # - do not force strict CUDA math
     if(MSVC)
-        if(COOLING_REPRODUCIBLE_FP STREQUAL "STRICT")
-            target_compile_options(${target_name}
-                PRIVATE
-                    $<$<COMPILE_LANGUAGE:CXX>:/fp:strict>
-                    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/fp:strict>
-            )
-        else()
-            target_compile_options(${target_name}
-                PRIVATE
-                    $<$<COMPILE_LANGUAGE:CXX>:/fp:precise>
-                    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/fp:precise>
-            )
-        endif()
+        target_compile_options(${target_name}
+            PRIVATE
+                $<$<COMPILE_LANGUAGE:CXX>:/fp:precise>
+                $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/fp:precise>
+        )
         return()
     endif()
 
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-        if(COOLING_REPRODUCIBLE_FP STREQUAL "STRICT")
-            target_compile_options(${target_name}
-                PRIVATE
-                    $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math>
-                    $<$<COMPILE_LANGUAGE:CXX>:-fno-unsafe-math-optimizations>
-                    $<$<COMPILE_LANGUAGE:CXX>:-fno-associative-math>
-                    $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>
-                    $<$<COMPILE_LANGUAGE:CXX>:-fexcess-precision=standard>
-            )
-        else()
-            target_compile_options(${target_name}
-                PRIVATE
-                    $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math>
-                    $<$<COMPILE_LANGUAGE:CXX>:-fno-unsafe-math-optimizations>
-                    $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=fast>
-            )
-        endif()
+        target_compile_options(${target_name}
+            PRIVATE
+                $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math>
+                $<$<COMPILE_LANGUAGE:CXX>:-fno-unsafe-math-optimizations>
+                $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=fast>
+        )
     endif()
 
-    if(CMAKE_CUDA_COMPILER)
-        if(COOLING_REPRODUCIBLE_FP STREQUAL "STRICT")
-            target_compile_options(${target_name}
-                PRIVATE
-                    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
-                    $<$<COMPILE_LANGUAGE:CUDA>:--prec-div=true>
-                    $<$<COMPILE_LANGUAGE:CUDA>:--prec-sqrt=true>
-            )
-        endif()
-    endif()
+    # CUDA fast math remains controlled separately by COOLING_FAST_MATH_CUDA.
+    # Default is OFF.
 endfunction()
 
 function(cooling_apply_common_settings target_name)
@@ -389,7 +352,7 @@ message(STATUS "  Build OpenMP solver:       ${COOLING_BUILD_OPENMP}")
 message(STATUS "  Build CUDA solver:         ${COOLING_BUILD_CUDA}")
 message(STATUS "  CUDA available:            ${COOLING_CUDA_AVAILABLE}")
 message(STATUS "  Native host architecture:  ${COOLING_NATIVE_ARCH}")
-message(STATUS "  FP reproducibility mode:   ${COOLING_REPRODUCIBLE_FP}")
+message(STATUS "  FP policy:                 moderate (built-in)")
 
 if(COOLING_BUILD_OPENMP STREQUAL "ON")
     message(STATUS "  OpenMP CXX flags:          ${OpenMP_CXX_FLAGS}")

@@ -26,9 +26,24 @@ python "${VALIDATOR}" \
   --rtol="${RTOL}" \
   --atol="${ATOL}"
 
+echo "Cuda vs Numba"
+python "${VALIDATOR}" \
+  output/Particles_cuda.h5 \
+  output/Particles_numba.h5 \
+  --rtol="${RTOL}" \
+  --atol="${ATOL}"
+
+echo "Cuda vs NumbaCuda"
+python "${VALIDATOR}" \
+  output/Particles_cuda.h5 \
+  output/Particles_numba_cuda.h5 \
+  --rtol="${RTOL}" \
+  --atol="${ATOL}"
+
 echo "Numba vs NumbaCuda"
 python "${VALIDATOR}" \
   output/Particles_numba.h5 \
   output/Particles_numba_cuda.h5 \
   --rtol="${RTOL}" \
   --atol="${ATOL}"
+

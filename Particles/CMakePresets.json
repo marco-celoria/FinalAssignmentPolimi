@@ -13,8 +13,8 @@
       "binaryDir": "${sourceDir}/build/${presetName}",
       "cacheVariables": {
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "COOLING_NATIVE_ARCH": "OFF",
-        "COOLING_FAST_MATH_CUDA": "OFF",
+        "PARTICLES_NATIVE_ARCH": "OFF",
+        "PARTICLES_FAST_MATH_CUDA": "OFF",
         "CMAKE_INSTALL_PREFIX": "${sourceDir}/install"
       }
     },
@@ -24,9 +24,9 @@
       "displayName": "Release, OpenMP, CUDA auto",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "COOLING_BUILD_OPENMP": "ON",
-        "COOLING_BUILD_CUDA": "AUTO",
-        "COOLING_CUDA_ARCHITECTURES": "AUTO"
+        "PARTICLES_BUILD_OPENMP": "ON",
+        "PARTICLES_BUILD_CUDA": "AUTO",
+        "PARTICLES_CUDA_ARCHITECTURES": "AUTO"
       }
     },
     {
@@ -35,8 +35,8 @@
       "displayName": "Debug, OpenMP only",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "COOLING_BUILD_OPENMP": "ON",
-        "COOLING_BUILD_CUDA": "OFF"
+        "PARTICLES_BUILD_OPENMP": "ON",
+        "PARTICLES_BUILD_CUDA": "OFF"
       }
     },
     {
@@ -45,9 +45,9 @@
       "displayName": "macOS Apple Silicon OpenMP only",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "COOLING_BUILD_OPENMP": "ON",
-        "COOLING_BUILD_CUDA": "OFF",
-        "COOLING_NATIVE_ARCH": "OFF"
+        "PARTICLES_BUILD_OPENMP": "ON",
+        "PARTICLES_BUILD_CUDA": "OFF",
+        "PARTICLES_NATIVE_ARCH": "OFF"
       }
     },
     {
@@ -56,10 +56,10 @@
       "displayName": "Release, CUDA required, architecture AUTO",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "COOLING_BUILD_OPENMP": "ON",
-        "COOLING_BUILD_CUDA": "ON",
-        "COOLING_STRICT_CUDA": "ON",
-        "COOLING_CUDA_ARCHITECTURES": "AUTO"
+        "PARTICLES_BUILD_OPENMP": "ON",
+        "PARTICLES_BUILD_CUDA": "ON",
+        "PARTICLES_STRICT_CUDA": "ON",
+        "PARTICLES_CUDA_ARCHITECTURES": "AUTO"
       }
     },
     {
@@ -68,10 +68,10 @@
       "displayName": "Leonardo A100 Release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "COOLING_BUILD_OPENMP": "ON",
-        "COOLING_BUILD_CUDA": "ON",
-        "COOLING_STRICT_CUDA": "ON",
-        "COOLING_CUDA_ARCHITECTURES": "80"
+        "PARTICLES_BUILD_OPENMP": "ON",
+        "PARTICLES_BUILD_CUDA": "ON",
+        "PARTICLES_STRICT_CUDA": "ON",
+        "PARTICLES_CUDA_ARCHITECTURES": "80"
       }
     },
     {
@@ -80,10 +80,10 @@
       "displayName": "Hopper H100 Release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "COOLING_BUILD_OPENMP": "ON",
-        "COOLING_BUILD_CUDA": "ON",
-        "COOLING_STRICT_CUDA": "ON",
-        "COOLING_CUDA_ARCHITECTURES": "90"
+        "PARTICLES_BUILD_OPENMP": "ON",
+        "PARTICLES_BUILD_CUDA": "ON",
+        "PARTICLES_STRICT_CUDA": "ON",
+        "PARTICLES_CUDA_ARCHITECTURES": "90"
       }
     }
   ],

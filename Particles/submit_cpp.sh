@@ -13,6 +13,6 @@
 ##SBATCH --exclusive
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
-source scripts/env.sh
-srun ./build/particles_omp ./input/Particles.in ./output/Particles_cpp.h5
+source scripts/env.leonardo.sh
+srun ./install/bin/particles_omp ./input/Particles.in ./output/Particles_cpp.h5
 

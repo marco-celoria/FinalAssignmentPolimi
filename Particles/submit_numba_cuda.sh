@@ -13,6 +13,6 @@
 ##SBATCH --exclusive
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
-source scripts/env.sh
+source scripts/env.leonardo.sh
 srun python ./src/python/particles_numba_cuda.py ./input/Particles.in ./output/Particles_numba_cuda.h5
 
