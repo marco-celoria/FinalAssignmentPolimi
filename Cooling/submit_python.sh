@@ -5,7 +5,7 @@
 #SBATCH --partition=boost_usr_prod
 #SBATCH --time=0:30:00
 #SBATCH --mem=50GB
-#SBATCH --job-name=run_cpp_cooling
+#SBATCH --job-name=run_python_cooling
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 #SBATCH --gres=gpu:1
@@ -14,5 +14,5 @@
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 source scripts/env.leonardo.sh
-srun ./install/bin/cooling_serial ./input/Cooling.in ./output/Cooling_cpp.h5 ./output/Cooling_cpp.csv
+srun python src/python/cooling.py ./input/Cooling.in ./output/Cooling_python.h5 ./output/Cooling_python.csv
 
