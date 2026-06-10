@@ -16,6 +16,11 @@
 #include <utility>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+
 // ============================================================
 // PORTABILITY HELPERS
 // ============================================================
@@ -27,6 +32,7 @@
 #endif
 
 using index_t = std::ptrdiff_t;
+
 
 // ============================================================
 // DATA STRUCTURES
@@ -50,7 +56,8 @@ struct Config {
     int maxIters{};
     int steps{};
 
-    // Optional. If false, only the final state is written.
+    // outputEvery is intentionally optional.
+    // If hasOutputEvery == false, only the final state is written.
     bool hasOutputEvery{false};
     int outputEvery{0};
 
@@ -80,6 +87,7 @@ struct Stats {
     double maxv{};
     double stddev{};
 };
+
 
 // ============================================================
 // UTILITIES
@@ -129,6 +137,7 @@ std::size_t parseStrictPositiveSize(const std::string& s, const std::string& wha
 bool startsWithDashDash(const std::string& s) {
     return s.rfind("--", 0) == 0;
 }
+
 
 // ============================================================
 // INPUT PARSER
@@ -235,6 +244,7 @@ Config readInput(const std::string& fname) {
 
     for (int i = 0; i < nMeasured; ++i) {
         auto& m = cfg.measured[static_cast<std::size_t>(i)];
+
         m.x = nextDouble();
         m.y = nextDouble();
         m.v = nextDouble();
@@ -261,11 +271,14 @@ Config readInput(const std::string& fname) {
     }
 
     // Optional outputEvery.
+    //
     // Old format:
     //   ... maxIters steps outputEvery
-    // New format:
+    //
+    // New allowed format:
     //   ... maxIters steps
-    // If outputEvery is absent, only the final state is written.
+    //
+    // If outputEvery is absent, the simulation writes only the final state.
     if (pos < tokens.size()) {
         cfg.outputEvery = nextInt();
         cfg.hasOutputEvery = true;
@@ -282,16 +295,19 @@ Config readInput(const std::string& fname) {
     return cfg;
 }
 
+
 // ============================================================
-// PHYSICS / MODEL HELPERS
+// PHYSICS HELPERS
 // ============================================================
 
 DomainMap buildDomainMap(const Config& cfg) {
     DomainMap map{};
+
     map.x0 = cfg.Sreal;
     map.y0 = cfg.Simag;
     map.dx = cfg.Dreal / static_cast<double>(cfg.nx - 1);
     map.dy = cfg.Dimag / static_cast<double>(cfg.ny - 1);
+
     return map;
 }
 
@@ -307,10 +323,14 @@ double computeDiscrepancy(const Config& cfg) {
     long double sum = 0.0L;
 
     for (const auto& m : cfg.measured) {
-        sum += static_cast<long double>(m.v - analyticalField(m.x, m.y));
+        sum += static_cast<long double>(
+            m.v - analyticalField(m.x, m.y)
+        );
     }
 
-    return static_cast<double>(sum / static_cast<long double>(cfg.measured.size()));
+    return static_cast<double>(
+        sum / static_cast<long double>(cfg.measured.size())
+    );
 }
 
 CoolingCoeffs buildCoolingCoeffs(double dx, double dy, double dd = 100.0) {
@@ -323,6 +343,7 @@ CoolingCoeffs buildCoolingCoeffs(double dx, double dy, double dd = 100.0) {
     }
 
     CoolingCoeffs c{};
+
     c.dd = dd;
     c.hx = dx;
     c.hy = dy;
@@ -335,6 +356,7 @@ CoolingCoeffs buildCoolingCoeffs(double dx, double dy, double dd = 100.0) {
 
     return c;
 }
+
 
 // ============================================================
 // HDF5 WRITER
@@ -370,8 +392,11 @@ public:
             throw std::invalid_argument("H5Writer: tile sizes must be > 0");
         }
 
-        const hsize_t chunkY = static_cast<hsize_t>(std::min<std::size_t>(ny_, tileY));
-        const hsize_t chunkX = static_cast<hsize_t>(std::min<std::size_t>(nx_, tileX));
+        const hsize_t chunkY =
+            static_cast<hsize_t>(std::min<std::size_t>(ny_, tileY));
+
+        const hsize_t chunkX =
+            static_cast<hsize_t>(std::min<std::size_t>(nx_, tileX));
 
         // /field dataset: [frame, y, x]
         {
@@ -390,7 +415,12 @@ public:
             H5::DataSpace space(3, dims, maxdims);
             H5::DSetCreatPropList prop;
 
-            hsize_t chunks[3] = {1, chunkY, chunkX};
+            hsize_t chunks[3] = {
+                1,
+                chunkY,
+                chunkX
+            };
+
             prop.setChunk(3, chunks);
 
             field_ = file_.createDataSet(
@@ -409,7 +439,10 @@ public:
             H5::DataSpace space(1, dims, maxdims);
             H5::DSetCreatPropList prop;
 
-            hsize_t chunks[1] = {static_cast<hsize_t>(batch_)};
+            hsize_t chunks[1] = {
+                static_cast<hsize_t>(batch_)
+            };
+
             prop.setChunk(1, chunks);
 
             step_ = file_.createDataSet(
@@ -427,7 +460,7 @@ public:
         try {
             close();
         } catch (...) {
-            // Never throw from a destructor.
+            // Never throw from destructor.
         }
     }
 
@@ -452,27 +485,54 @@ public:
         {
             H5::DataSpace filespace = field_.getSpace();
 
-            hsize_t start[3] = {static_cast<hsize_t>(frame_), 0, 0};
-            hsize_t count[3] = {1, static_cast<hsize_t>(ny_), static_cast<hsize_t>(nx_)};
+            hsize_t start[3] = {
+                static_cast<hsize_t>(frame_),
+                0,
+                0
+            };
+
+            hsize_t count[3] = {
+                1,
+                static_cast<hsize_t>(ny_),
+                static_cast<hsize_t>(nx_)
+            };
 
             filespace.selectHyperslab(H5S_SELECT_SET, count, start);
+
             H5::DataSpace memspace(3, count);
 
-            field_.write(field.data(), H5::PredType::NATIVE_DOUBLE, memspace, filespace);
+            field_.write(
+                field.data(),
+                H5::PredType::NATIVE_DOUBLE,
+                memspace,
+                filespace
+            );
         }
 
         // Write /step[frame]
         {
             H5::DataSpace filespace = step_.getSpace();
 
-            hsize_t start[1] = {static_cast<hsize_t>(frame_)};
-            hsize_t count[1] = {1};
+            hsize_t start[1] = {
+                static_cast<hsize_t>(frame_)
+            };
+
+            hsize_t count[1] = {
+                1
+            };
 
             filespace.selectHyperslab(H5S_SELECT_SET, count, start);
+
             H5::DataSpace memspace(1, count);
 
             int value = stepNumber;
-            step_.write(&value, H5::PredType::NATIVE_INT, memspace, filespace);
+
+            step_.write(
+                &value,
+                H5::PredType::NATIVE_INT,
+                memspace,
+                filespace
+            );
         }
 
         ++frame_;
@@ -488,9 +548,11 @@ public:
         }
 
         file_.flush(H5F_SCOPE_GLOBAL);
+
         field_.close();
         step_.close();
         file_.close();
+
         closed_ = true;
     }
 
@@ -502,11 +564,15 @@ private:
                 static_cast<hsize_t>(ny_),
                 static_cast<hsize_t>(nx_)
             };
+
             field_.extend(dims);
         }
 
         {
-            hsize_t dims[1] = {static_cast<hsize_t>(n)};
+            hsize_t dims[1] = {
+                static_cast<hsize_t>(n)
+            };
+
             step_.extend(dims);
         }
     }
@@ -525,8 +591,9 @@ private:
     bool closed_{false};
 };
 
+
 // ============================================================
-// COMPUTE KERNELS
+// OPENMP COMPUTE ROUTINES
 // ============================================================
 
 void computeWeight(
@@ -543,10 +610,13 @@ void computeWeight(
     const index_t nx = static_cast<index_t>(cfg.nx);
     const index_t ny = static_cast<index_t>(cfg.ny);
 
+    // Mandelbrot work is irregular, so dynamic scheduling improves load balance.
+#pragma omp parallel for collapse(2) schedule(dynamic, 64)
     for (index_t j = 0; j < ny; ++j) {
         for (index_t i = 0; i < nx; ++i) {
             const std::size_t is = static_cast<std::size_t>(i);
             const std::size_t js = static_cast<std::size_t>(j);
+
             const std::size_t p = idx2D(is, js, cfg.nx);
 
             const double ca = map.x0 + map.dx * static_cast<double>(i);
@@ -554,6 +624,7 @@ void computeWeight(
 
             double za = 0.0;
             double zb = 0.0;
+
             int it = 0;
 
             for (; it < cfg.maxIters; ++it) {
@@ -584,24 +655,32 @@ void initializeField(
         throw std::runtime_error("initializeField: size mismatch");
     }
 
-    const auto [wminIt, wmaxIt] = std::minmax_element(weight.begin(), weight.end());
+    const auto [wminIt, wmaxIt] =
+        std::minmax_element(weight.begin(), weight.end());
+
     const int wmin = *wminIt;
     const int wmax = *wmaxIt;
-    const double denom = (wmax > wmin) ? static_cast<double>(wmax - wmin) : 1.0;
+
+    const double denom =
+        (wmax > wmin) ? static_cast<double>(wmax - wmin) : 1.0;
 
     const index_t nx = static_cast<index_t>(cfg.nx);
     const index_t ny = static_cast<index_t>(cfg.ny);
 
+#pragma omp parallel for collapse(2) schedule(static)
     for (index_t j = 0; j < ny; ++j) {
         for (index_t i = 0; i < nx; ++i) {
             const std::size_t is = static_cast<std::size_t>(i);
             const std::size_t js = static_cast<std::size_t>(j);
+
             const std::size_t p = idx2D(is, js, cfg.nx);
 
             const double x = map.x0 + map.dx * static_cast<double>(i);
             const double y = map.y0 + map.dy * static_cast<double>(j);
+
             const double F = analyticalField(x, y);
-            const double wnorm = static_cast<double>(weight[p] - wmin) / denom;
+            const double wnorm =
+                static_cast<double>(weight[p] - wmin) / denom;
 
             u[p] = 293.16 + 80.0 * (discrepancy + F) * wnorm;
         }
@@ -618,22 +697,24 @@ void updateInterior(
     const index_t nx = static_cast<index_t>(nxSize);
     const index_t ny = static_cast<index_t>(nySize);
 
+#pragma omp parallel for collapse(2) schedule(static)
     for (index_t j = 1; j < ny - 1; ++j) {
         for (index_t i = 1; i < nx - 1; ++i) {
             const std::size_t is = static_cast<std::size_t>(i);
             const std::size_t js = static_cast<std::size_t>(j);
+
             const std::size_t p = idx2D(is, js, nxSize);
 
             u2[p] =
                 c.CX * (
-                    u1[idx2D(is - 1, js, nxSize)] +
-                    u1[idx2D(is + 1, js, nxSize)] +
-                    (c.dgx + 0.5 / c.CX) * u1[p]
+                    u1[idx2D(is - 1, js, nxSize)]
+                    + u1[idx2D(is + 1, js, nxSize)]
+                    + (c.dgx + 0.5 / c.CX) * u1[p]
                 )
                 + c.CY * (
-                    u1[idx2D(is, js - 1, nxSize)] +
-                    u1[idx2D(is, js + 1, nxSize)] +
-                    (c.dgy + 0.5 / c.CY) * u1[p]
+                    u1[idx2D(is, js - 1, nxSize)]
+                    + u1[idx2D(is, js + 1, nxSize)]
+                    + (c.dgy + 0.5 / c.CY) * u1[p]
                 );
         }
     }
@@ -643,21 +724,31 @@ void applyBoundary(double* u, std::size_t nxSize, std::size_t nySize) {
     const index_t nx = static_cast<index_t>(nxSize);
     const index_t ny = static_cast<index_t>(nySize);
 
-    // Left/right boundaries first, excluding corners.
+    // 1. Left/right boundaries first, excluding corners.
+#pragma omp parallel for schedule(static)
     for (index_t j = 1; j < ny - 1; ++j) {
         const std::size_t js = static_cast<std::size_t>(j);
 
-        u[idx2D(0, js, nxSize)] = u[idx2D(1, js, nxSize)];
-        u[idx2D(nxSize - 1, js, nxSize)] = u[idx2D(nxSize - 2, js, nxSize)];
+        u[idx2D(0, js, nxSize)] =
+            u[idx2D(1, js, nxSize)];
+
+        u[idx2D(nxSize - 1, js, nxSize)] =
+            u[idx2D(nxSize - 2, js, nxSize)];
     }
 
-    // Top/bottom boundaries including corners.
-    // This order preserves the same corner behavior as the two-stage update.
+    // 2. Top/bottom boundaries including corners.
+    //
+    // This intentionally runs after the left/right update to preserve
+    // the same corner behavior as the CUDA-style two-kernel version.
+#pragma omp parallel for schedule(static)
     for (index_t i = 0; i < nx; ++i) {
         const std::size_t is = static_cast<std::size_t>(i);
 
-        u[idx2D(is, 0, nxSize)] = u[idx2D(is, 1, nxSize)];
-        u[idx2D(is, nySize - 1, nxSize)] = u[idx2D(is, nySize - 2, nxSize)];
+        u[idx2D(is, 0, nxSize)] =
+            u[idx2D(is, 1, nxSize)];
+
+        u[idx2D(is, nySize - 1, nxSize)] =
+            u[idx2D(is, nySize - 2, nxSize)];
     }
 }
 
@@ -672,6 +763,7 @@ void updateField(
     applyBoundary(u2, nx, ny);
 }
 
+
 // ============================================================
 // STATISTICS
 // ============================================================
@@ -681,32 +773,40 @@ Stats computeStatsAccurate(const std::vector<double>& u) {
         throw std::runtime_error("computeStatsAccurate: empty field");
     }
 
-    const auto [mnIt, mxIt] = std::minmax_element(u.begin(), u.end());
+    const auto [mnIt, mxIt] =
+        std::minmax_element(u.begin(), u.end());
 
     long double sum = 0.0L;
+
     for (double v : u) {
         sum += static_cast<long double>(v);
     }
 
-    const long double mean = sum / static_cast<long double>(u.size());
+    const long double mean =
+        sum / static_cast<long double>(u.size());
 
     long double ssd = 0.0L;
+
     for (double v : u) {
         const long double d = static_cast<long double>(v) - mean;
         ssd += d * d;
     }
 
     Stats s{};
+
     s.minv = *mnIt;
     s.maxv = *mxIt;
     s.mean = static_cast<double>(mean);
-    s.stddev = static_cast<double>(std::sqrt(ssd / static_cast<long double>(u.size())));
+    s.stddev = static_cast<double>(
+        std::sqrt(ssd / static_cast<long double>(u.size()))
+    );
+
     return s;
 }
 
-Stats computeStatsFast(const std::vector<double>& u) {
+Stats computeStatsFastOpenMP(const std::vector<double>& u) {
     if (u.empty()) {
-        throw std::runtime_error("computeStatsFast: empty field");
+        throw std::runtime_error("computeStatsFastOpenMP: empty field");
     }
 
     double minv = std::numeric_limits<double>::infinity();
@@ -716,8 +816,10 @@ Stats computeStatsFast(const std::vector<double>& u) {
 
     const index_t n = static_cast<index_t>(u.size());
 
+#pragma omp parallel for schedule(static) reduction(min:minv) reduction(max:maxv) reduction(+:sum,sum2)
     for (index_t i = 0; i < n; ++i) {
         const double v = u[static_cast<std::size_t>(i)];
+
         minv = std::min(minv, v);
         maxv = std::max(maxv, v);
         sum += v;
@@ -729,10 +831,12 @@ Stats computeStatsFast(const std::vector<double>& u) {
     const double var = std::max(0.0, sum2 / count - mean * mean);
 
     Stats s{};
+
     s.minv = minv;
     s.maxv = maxv;
     s.mean = mean;
     s.stddev = std::sqrt(var);
+
     return s;
 }
 
@@ -742,7 +846,7 @@ Stats computeStats(const std::vector<double>& u, const std::string& mode) {
     }
 
     if (mode == "fast") {
-        return computeStatsFast(u);
+        return computeStatsFastOpenMP(u);
     }
 
     throw std::runtime_error("Unknown stats mode: " + mode);
@@ -760,8 +864,9 @@ void writeStatsLine(std::ostream& os, int step, const Stats& s) {
        << std::setprecision(15) << s.stddev << '\n';
 }
 
+
 // ============================================================
-// COMMAND LINE PARSER
+// SIMPLE CLI PARSER
 // ============================================================
 
 struct CliOptions {
@@ -775,7 +880,9 @@ struct CliOptions {
     int outputEvery{0};
 
     std::string statsMode{"accurate"};
+
     int threads{0}; // 0 means use environment/default.
+
     std::size_t h5TileY{256};
     std::size_t h5TileX{256};
 };
@@ -793,6 +900,7 @@ CliOptions parseCommandLine(int argc, char** argv) {
             }
 
             opt.threads = parseStrictInt(argv[++i], "threads");
+
             if (opt.threads <= 0) {
                 throw std::runtime_error("--threads must be > 0");
             }
@@ -802,6 +910,7 @@ CliOptions parseCommandLine(int argc, char** argv) {
             }
 
             opt.statsMode = argv[++i];
+
             if (opt.statsMode != "accurate" && opt.statsMode != "fast") {
                 throw std::runtime_error("--stats must be either 'accurate' or 'fast'");
             }
@@ -833,15 +942,19 @@ CliOptions parseCommandLine(int argc, char** argv) {
     if (positional.size() >= 1) {
         opt.inputFile = positional[0];
     }
+
     if (positional.size() >= 2) {
         opt.h5File = positional[1];
     }
+
     if (positional.size() >= 3) {
         opt.csvFile = positional[2];
     }
+
     if (positional.size() >= 4) {
         opt.outputEvery = parseStrictInt(positional[3], "outputEvery");
         opt.hasOutputEvery = true;
+
         if (opt.outputEvery <= 0) {
             throw std::runtime_error("outputEvery must be > 0");
         }
@@ -849,6 +962,7 @@ CliOptions parseCommandLine(int argc, char** argv) {
 
     return opt;
 }
+
 
 // ============================================================
 // MAIN
@@ -860,13 +974,19 @@ int main(int argc, char** argv) {
     try {
         const CliOptions opt = parseCommandLine(argc, argv);
 
+#ifdef _OPENMP
+        if (opt.threads > 0) {
+            omp_set_num_threads(opt.threads);
+        }
+#else
         if (opt.threads > 0) {
             std::cerr << "WARNING: --threads ignored because OpenMP is not enabled.\n";
         }
+#endif
 
         Config cfg = readInput(opt.inputFile);
 
-        // Command-line outputEvery overrides the input-file value.
+        // Command-line outputEvery overrides input-file outputEvery.
         // If neither specifies it, the program writes only the final state.
         if (opt.hasOutputEvery) {
             cfg.outputEvery = opt.outputEvery;
@@ -878,6 +998,7 @@ int main(int argc, char** argv) {
         }
 
         const std::size_t N = safeGridSize(cfg.nx, cfg.ny);
+
         const DomainMap map = buildDomainMap(cfg);
         const CoolingCoeffs cooling = buildCoolingCoeffs(map.dx, map.dy, 100.0);
         const double discrepancy = computeDiscrepancy(cfg);
@@ -887,6 +1008,7 @@ int main(int argc, char** argv) {
         std::vector<double> uNext(N);
 
         std::ofstream csv(opt.csvFile);
+
         if (!csv) {
             throw std::runtime_error("Cannot open CSV output file: " + opt.csvFile);
         }
@@ -902,7 +1024,8 @@ int main(int argc, char** argv) {
         std::cout << "Time steps:                   " << cfg.steps << '\n';
 
         if (cfg.hasOutputEvery) {
-            std::cout << "Snapshot every:               " << cfg.outputEvery << " step(s)\n";
+            std::cout << "Snapshot every:               "
+                      << cfg.outputEvery << " step(s)\n";
         } else {
             std::cout << "Snapshot every:               final step only\n";
         }
@@ -914,7 +1037,12 @@ int main(int argc, char** argv) {
                   << std::min<std::size_t>(cfg.nx, opt.h5TileX)
                   << '\n';
 
+#ifdef _OPENMP
+        std::cout << "OpenMP enabled:               yes\n";
+        std::cout << "OpenMP max threads:           " << omp_get_max_threads() << '\n';
+#else
         std::cout << "OpenMP enabled:               no\n";
+#endif
 
         std::cout << '\n';
 
@@ -924,14 +1052,18 @@ int main(int argc, char** argv) {
         // Weight field
         // ----------------------------------------------------
         const auto weightT0 = std::chrono::steady_clock::now();
+
         computeWeight(weight, cfg, map);
+
         const auto weightT1 = std::chrono::steady_clock::now();
 
         // ----------------------------------------------------
         // Initialization
         // ----------------------------------------------------
         const auto initT0 = std::chrono::steady_clock::now();
+
         initializeField(uCurr, weight, cfg, map, discrepancy);
+
         const auto initT1 = std::chrono::steady_clock::now();
 
         // ----------------------------------------------------
@@ -967,14 +1099,19 @@ int main(int argc, char** argv) {
             ++outputFrames;
 
             const auto outT1 = std::chrono::steady_clock::now();
-            outputStatsIoTime += std::chrono::duration<double>(outT1 - outT0).count();
+
+            outputStatsIoTime +=
+                std::chrono::duration<double>(outT1 - outT0).count();
 
             hasLastWrittenStep = true;
             lastWrittenStep = step;
         };
 
-        // If outputEvery was explicitly specified, preserve the traditional
+        // If outputEvery was explicitly specified, keep the traditional
         // behavior and write the initial condition.
+        //
+        // If outputEvery was not specified, do not write step 0 here.
+        // In that mode, only the final state is written after the loop.
         if (cfg.hasOutputEvery) {
             writeOutputFrame(0);
         }
@@ -993,14 +1130,20 @@ int main(int argc, char** argv) {
             std::swap(uCurr, uNext);
 
             const auto dynT1 = std::chrono::steady_clock::now();
-            pureDynamicsTime += std::chrono::duration<double>(dynT1 - dynT0).count();
 
+            pureDynamicsTime +=
+                std::chrono::duration<double>(dynT1 - dynT0).count();
+
+            // Periodic loop output only exists when outputEvery was specified.
             if (cfg.hasOutputEvery && (step % cfg.outputEvery) == 0) {
                 writeOutputFrame(step);
             }
         }
 
         // Always write the final state.
+        //
+        // If periodic output already wrote this same final step,
+        // writeOutputFrame() avoids duplication.
         writeOutputFrame(cfg.steps);
 
         writer.close();
@@ -1008,38 +1151,46 @@ int main(int argc, char** argv) {
         const auto loopT1 = std::chrono::steady_clock::now();
         const auto totalT1 = std::chrono::steady_clock::now();
 
-        const double weightTime = std::chrono::duration<double>(weightT1 - weightT0).count();
-        const double initTime = std::chrono::duration<double>(initT1 - initT0).count();
-        const double loopWallTime = std::chrono::duration<double>(loopT1 - loopT0).count();
-        const double totalWallTime = std::chrono::duration<double>(totalT1 - totalT0).count();
+        const double weightTime =
+            std::chrono::duration<double>(weightT1 - weightT0).count();
+
+        const double initTime =
+            std::chrono::duration<double>(initT1 - initT0).count();
+
+        const double loopWallTime =
+            std::chrono::duration<double>(loopT1 - loopT0).count();
+
+        const double totalWallTime =
+            std::chrono::duration<double>(totalT1 - totalT0).count();
 
         const double updates =
-            static_cast<double>(cfg.nx - 2) *
-            static_cast<double>(cfg.ny - 2) *
-            static_cast<double>(cfg.steps);
+            static_cast<double>(cfg.nx - 2)
+            * static_cast<double>(cfg.ny - 2)
+            * static_cast<double>(cfg.steps);
 
         std::cout << "Weight field time:            " << weightTime << " s\n";
         std::cout << "Init field time:              " << initTime << " s\n";
-        std::cout << "Pure dynamics compute time:    " << pureDynamicsTime << " s\n";
-        std::cout << "Stats + CSV + HDF5 time:       " << outputStatsIoTime << " s\n";
-        std::cout << "Dynamics loop wall time:       " << loopWallTime << " s\n";
-        std::cout << "Total measured wall time:      " << totalWallTime << " s\n";
-        std::cout << "Output frames:                 " << outputFrames << '\n';
+        std::cout << "Pure dynamics compute time:   " << pureDynamicsTime << " s\n";
+        std::cout << "Stats + CSV + HDF5 time:      " << outputStatsIoTime << " s\n";
+        std::cout << "Dynamics loop wall time:      " << loopWallTime << " s\n";
+        std::cout << "Total measured wall time:     " << totalWallTime << " s\n";
+        std::cout << "Output frames:                " << outputFrames << '\n';
 
         if (cfg.steps > 0 && pureDynamicsTime > 0.0) {
-            std::cout << "Dynamics perf:                 "
+            std::cout << "Pure OpenMP dynamics perf:    "
                       << updates / pureDynamicsTime / 1e9
                       << " GLUP/s\n";
         }
 
         if (cfg.steps > 0 && loopWallTime > 0.0) {
-            std::cout << "End-to-end loop performance:   "
+            std::cout << "End-to-end loop performance:  "
                       << updates / loopWallTime / 1e9
                       << " GLUP/s\n";
         }
 
-        std::cout << "Mean discrepancy:              "
+        std::cout << "Mean discrepancy:             "
                   << std::setprecision(15) << discrepancy << '\n';
+
         std::cout << "\nSimulation completed successfully.\n";
 
         return 0;
@@ -1057,4 +1208,3 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
-

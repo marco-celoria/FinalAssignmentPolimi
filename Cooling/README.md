@@ -11,18 +11,20 @@ pip install h5py
 pip install cupy-cuda12x
 
 
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
 
+cmake --preset generic-x86-nogpu
+cmake --build --preset generic-x86-nogpu -j
+cmake --install build/generic-x86-nogpu
 
-ENV_SCRIPT=scripts/env.leonardo.sh \
-CMAKE_PRESET=leonardo-a100 \
-CLEAN=1 INSTALL=1 \
-scripts/build.sh
+cmake --preset generic-x86-nvidia
+cmake --build --preset generic-x86-nvidia -j
+cmake --install build/generic-x86-nvidia
 
+cmake --preset macos-arm64 -DOpenMP_ROOT=/opt/homebrew/opt/libomp -DHDF5_ROOT=$(brew --prefix hdf5)
+cmake --build --preset macos-arm64 -j
+cmake --install build/macos-arm64
 
-ENV_SCRIPT=scripts/env.macos.sh \
-CMAKE_PRESET=macos-arm64-openmp \
-CLEAN=1 \
-scripts/build.sh
+cmake --preset leonardo-a100
+cmake --build --preset leonardo-a100 -j
+cmake --install build/leonardo-a100
 
