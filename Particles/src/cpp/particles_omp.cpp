@@ -19,6 +19,10 @@
 #include <utility>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 
 // ============================================================
 // CONSTANTS
@@ -264,6 +268,7 @@ void computeGeneratingField(Grid& g, std::size_t maxIter) {
     const double dx = (g.xe - g.xs) / static_cast<double>(g.nx - 1);
     const double dy = (g.ye - g.ys) / static_cast<double>(g.ny - 1);
 
+#pragma omp parallel for collapse(2) schedule(dynamic)
     for (std::size_t j = 0; j < g.ny; ++j) {
         for (std::size_t i = 0; i < g.nx; ++i) {
             const double ca = g.xs + static_cast<double>(i) * dx;
@@ -379,6 +384,7 @@ void computeForces(const Particles& P, double* fx, double* fy) {
     const double* const y = P.y.data();
     const double* const w = P.w.data();
 
+#pragma omp parallel for schedule(static)
     for (std::size_t i = 0; i < N; ++i) {
         const double xi = x[i];
         const double yi = y[i];
@@ -387,6 +393,7 @@ void computeForces(const Particles& P, double* fx, double* fy) {
         double fxi = 0.0;
         double fyi = 0.0;
 
+#pragma omp simd reduction(+:fxi,fyi)
         for (std::size_t j = 0; j < N; ++j) {
             if (i != j) {
                 const double dx = x[j] - xi;
@@ -430,6 +437,7 @@ void integrateVV(
         throw std::runtime_error("integrateVV: force array size mismatch");
     }
 
+#pragma omp parallel for schedule(static)
     for (std::size_t i = 0; i < N; ++i) {
         assert(P.w[i] > 0.0);
 
@@ -444,6 +452,7 @@ void integrateVV(
 
     computeForces(P, fx_new.data(), fy_new.data());
 
+#pragma omp parallel for schedule(static)
     for (std::size_t i = 0; i < N; ++i) {
         assert(P.w[i] > 0.0);
 
@@ -716,6 +725,7 @@ public:
             extendDatasets(capacity_);
         }
 
+#pragma omp parallel for schedule(static)
         for (std::size_t i = 0; i < np_; ++i) {
             Pbuf_[2 * i]     = P.x[i];
             Pbuf_[2 * i + 1] = P.y[i];
@@ -943,7 +953,12 @@ int main(int argc, char** argv) {
         std::cout << "Max iterations:             " << cfg.maxIters << "\n";
         std::cout << "Steps:                      " << cfg.maxSteps << "\n";
         std::cout << "Output every:               " << cfg.outputEvery << "\n";
+
+#ifdef _OPENMP
+        std::cout << "OpenMP threads:             " << omp_get_max_threads() << "\n";
+#else
         std::cout << "OpenMP:                     disabled at compile time\n";
+#endif
 
         // ----------------------------------------------------
         // 1. Generate Mandelbrot field

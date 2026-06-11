@@ -5,7 +5,7 @@
 #SBATCH --partition=boost_usr_prod
 #SBATCH --time=0:30:00
 #SBATCH --mem=50GB
-#SBATCH --job-name=run_cpp_particles
+#SBATCH --job-name=run_omp_particles
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 #SBATCH --gres=gpu:1
@@ -14,5 +14,5 @@
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 source scripts/env.leonardo.sh
-srun ./install/bin/particles_serial ./input/Particles.in ./output/Particles_cpp.h5
+srun ./install/bin/particles_omp ./input/Particles.in ./output/Particles_omp.h5
 
