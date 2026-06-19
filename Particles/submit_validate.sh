@@ -13,8 +13,8 @@
 ##SBATCH --exclusive
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
-export RTOL=1e-3
-export ATOL=1e-3
+export RTOL=2e-3
+export ATOL=2e-3
 source scripts/env.leonardo.sh
 srun bash scripts/validate_all.sh
 

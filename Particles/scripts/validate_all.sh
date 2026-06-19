@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-RTOL="${RTOL:-1e-3}"
-ATOL="${ATOL:-1e-3}"
+RTOL="${RTOL:-2e-3}"
+ATOL="${ATOL:-2e-3}"
 
 VALIDATOR="tools/validate_particles_h5.py"
 

@@ -10,13 +10,18 @@ baseline, and the Numba multicore reference solution.
 
 Primary GPU offload targets
 ---------------------------
-  1. mandelbrot_kernel(...): initial generating field, one GPU thread per grid
-     point.
-  2. compute_forces_tiled_kernel(...): O(N^2) all-pairs force kernel, one GPU
+  1. compute_forces_tiled_kernel(...): O(N^2) all-pairs force kernel, one GPU
      thread per target particle and shared-memory tiling over source particles.
-  3. half_kick_drift_kernel(...) and half_kick_kernel(...): Velocity-Verlet
+  2. half_kick_drift_kernel(...) and half_kick_kernel(...): Velocity-Verlet
      integration update.
-  4. build_screen_kernel(...): optional visualization/debug screen for HDF5 mode.
+  3. build_screen_kernel(...): optional visualization/debug screen for HDF5 mode.
+
+Host-side initialization
+------------------------
+  The Mandelbrot/generating field is intentionally computed on the host with the
+  same Numba multicore kernel used by particles_numba_reference.py. This avoids
+  CPU/GPU Mandelbrot boundary differences that can otherwise change the particle
+  count and initial particle set.
 
 Official benchmark/no-output mode
 ---------------------------------
@@ -39,24 +44,7 @@ Command line
 
 Input format
 ------------
-Same as the serial C++17 baseline:
-
-  generatingGridNx
-  generatingGridNy
-  generatingGridXs
-  generatingGridXe
-  generatingGridYs
-  generatingGridYe
-  screenGridNx
-  screenGridNy
-  screenGridXs
-  screenGridXe
-  screenGridYs
-  screenGridYe
-  maxFractalIterations
-  timeSteps
-  dt
-  outputEvery
+Same as the serial C++17 baseline.
 
 outputEvery:
   0  means final HDF5 frame only, if HDF5 output is enabled.
@@ -71,6 +59,8 @@ Notes for instructors
   * HDF5 output is optional and excluded from benchmark/no-output mode.
   * Final validation quantities are computed on the host after copying the final
     particle state back from the GPU.
+  * Bitwise identity with the serial C++ baseline is not expected for the GPU
+    dynamics. Validation should use numerical tolerances.
 ================================================================================
 """
 
@@ -85,7 +75,7 @@ from dataclasses import dataclass, field
 from typing import Iterator, Optional, Tuple
 
 import numpy as np
-from numba import cuda, float64
+from numba import cuda, float64, njit, prange
 
 try:
     import h5py  # type: ignore
@@ -104,7 +94,6 @@ EPS2 = EPS * EPS
 # The shared-memory force kernel below is specialized for TILE_SIZE. Keep this
 # constant equal to the launch block size used for the force kernel.
 TILE_SIZE = 256
-MANDELBROT_BLOCK = (16, 16)
 
 
 # ============================================================
@@ -307,35 +296,48 @@ def blocks_1d(n: int, threads: int) -> int:
 
 
 # ============================================================
-# CUDA KERNELS
+# HOST-SIDE NUMBA GENERATING FIELD KERNEL
+# This is intentionally identical in loop order to the Numba multicore reference.
 # ============================================================
 
 
-@cuda.jit
-def mandelbrot_kernel(values, nx, ny, xs, ys, dx, dy, max_iter):
-    i, j = cuda.grid(2)
+@njit(cache=True, parallel=True, fastmath=False)
+def compute_generating_field_numba(values, nx, ny, xs, xe, ys, ye, max_iter):
+    dx = (xe - xs) / (nx - 1)
+    dy = (ye - ys) / (ny - 1)
 
-    if i >= nx or j >= ny:
-        return
+    for j in prange(ny):
+        cb = ys + j * dy
+        base = j * nx
 
-    ca = xs + i * dx
-    cb = ys + j * dy
+        for i in range(nx):
+            ca = xs + i * dx
+            za = 0.0
+            zb = 0.0
+            it = 0
 
-    za = 0.0
-    zb = 0.0
-    it = 0
+            while it < max_iter:
+                a = za * za - zb * zb + ca
+                b = 2.0 * za * zb + cb
+                za = a
+                zb = b
 
-    while it < max_iter:
-        a = za * za - zb * zb + ca
-        b = 2.0 * za * zb + cb
-        za = a
-        zb = b
+                if za * za + zb * zb > 4.0:
+                    break
+                it += 1
 
-        if za * za + zb * zb > 4.0:
-            break
-        it += 1
+            values[base + i] = np.uint64(it)
 
-    values[i + j * nx] = np.uint64(it)
+
+def compute_generating_field(g: Grid, max_iter: int) -> None:
+    if g.values.size == 0:
+        raise RuntimeError("compute_generating_field: empty grid")
+    compute_generating_field_numba(g.values, g.nx, g.ny, g.xs, g.xe, g.ys, g.ye, max_iter)
+
+
+# ============================================================
+# CUDA KERNELS
+# ============================================================
 
 
 @cuda.jit
@@ -469,8 +471,6 @@ def build_screen_kernel(screen, x, y, w, nx, ny, xs, ys, invdx, invdy, wmin, wr,
             jx = ix + di
             if jx < 0 or jx >= nx:
                 continue
-            # int64 screen is used because Numba CUDA int64 atomics are broadly
-            # supported. Values are non-negative and converted to uint64 for HDF5.
             cuda.atomic.add(screen, row + jx, wp)
 
 
@@ -522,7 +522,6 @@ def compute_validation_quantities(p: Particles) -> ValidationQuantities:
     q.kinetic_energy = float(0.5 * np.sum(p.w * (p.vx * p.vx + p.vy * p.vy)))
 
     potential = 0.0
-    # Host-side blocked validation avoids allocating a full NxN matrix.
     block_size = 256
     for start in range(0, n, block_size):
         stop = min(start + block_size, n)
@@ -628,32 +627,16 @@ class H5StreamWriter:
         screen_chunk_x = min(self.nx, screen_tile_x)
 
         self.pos = self.file.create_dataset(
-            "/pos",
-            shape=(0, self.np, 2),
-            maxshape=(None, self.np, 2),
-            chunks=(1, self.np, 2),
-            dtype=np.float64,
+            "/pos", shape=(0, self.np, 2), maxshape=(None, self.np, 2), chunks=(1, self.np, 2), dtype=np.float64
         )
         self.vel = self.file.create_dataset(
-            "/vel",
-            shape=(0, self.np, 2),
-            maxshape=(None, self.np, 2),
-            chunks=(1, self.np, 2),
-            dtype=np.float64,
+            "/vel", shape=(0, self.np, 2), maxshape=(None, self.np, 2), chunks=(1, self.np, 2), dtype=np.float64
         )
         self.screen = self.file.create_dataset(
-            "/screen",
-            shape=(0, self.ny, self.nx),
-            maxshape=(None, self.ny, self.nx),
-            chunks=(1, screen_chunk_y, screen_chunk_x),
-            dtype=np.uint64,
+            "/screen", shape=(0, self.ny, self.nx), maxshape=(None, self.ny, self.nx), chunks=(1, screen_chunk_y, screen_chunk_x), dtype=np.uint64
         )
         self.step = self.file.create_dataset(
-            "/step",
-            shape=(0,),
-            maxshape=(None,),
-            chunks=(self.chunk_frames,),
-            dtype=np.int64,
+            "/step", shape=(0,), maxshape=(None,), chunks=(self.chunk_frames,), dtype=np.int64
         )
         self.weight = self.file.create_dataset("/weight", shape=(self.np,), dtype=np.float64)
 
@@ -745,14 +728,14 @@ class H5StreamWriter:
 
 
 # ============================================================
-# CUDA WARM-UP
+# WARM-UP
 # ============================================================
 
 
 def warmup_cuda() -> None:
-    """Compile CUDA kernels before timing the real workload."""
-    d_vals = cuda.device_array(4, dtype=np.uint64)
-    mandelbrot_kernel[(1, 1), (2, 2)](d_vals, 2, 2, -2.0, -1.0, 3.0, 2.0, 4)
+    """Compile host Numba and CUDA kernels before timing the real workload."""
+    values = np.zeros(4, dtype=np.uint64)
+    compute_generating_field_numba(values, 2, 2, -2.0, 1.0, -1.0, 1.0, 4)
 
     x = np.array([0.0, 1.0], dtype=np.float64)
     y = np.array([0.0, 0.5], dtype=np.float64)
@@ -807,19 +790,7 @@ def queue_screen_build_and_output(
 ) -> None:
     zero_int64_kernel[blocks_screen, threads, stream](screen_d, screen.nx * screen.ny)
     build_screen_kernel[blocks_particles, threads, stream](
-        screen_d,
-        x_d,
-        y_d,
-        w_d,
-        screen.nx,
-        screen.ny,
-        screen.xs,
-        screen.ys,
-        invdx_screen,
-        invdy_screen,
-        wmin,
-        wr,
-        nparticles,
+        screen_d, x_d, y_d, w_d, screen.nx, screen.ny, screen.xs, screen.ys, invdx_screen, invdy_screen, wmin, wr, nparticles
     )
     launch_output_copy(screen_d, x_d, y_d, vx_d, vy_d, host, stream)
 
@@ -846,15 +817,13 @@ def parse_args(argv: Optional[list[str]] = None):
 
     parser.add_argument("--device", type=int, default=None, help="CUDA device id")
     parser.add_argument(
-        "--threads-per-block",
-        type=int,
-        default=TILE_SIZE,
+        "--threads-per-block", type=int, default=TILE_SIZE,
         help=f"CUDA threads per block. For this reference force kernel, use {TILE_SIZE}.",
     )
     parser.add_argument("--chunk-frames", type=int, default=64, help="HDF5 frame chunk size")
     parser.add_argument("--screen-tile-y", type=int, default=256, help="HDF5 /screen chunk tile size in y")
     parser.add_argument("--screen-tile-x", type=int, default=256, help="HDF5 /screen chunk tile size in x")
-    parser.add_argument("--no-warmup", action="store_true", help="Do not compile CUDA kernels before measured sections")
+    parser.add_argument("--no-warmup", action="store_true", help="Do not compile kernels before measured sections")
 
     return parser.parse_args(argv)
 
@@ -869,25 +838,25 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if not cuda.is_available():
         raise RuntimeError("CUDA is not available")
-     
+
     if args.device is not None:
         cuda.select_device(args.device)
-     
+
     if args.threads_per_block != TILE_SIZE:
         raise ValueError(
             f"This reference implementation requires --threads-per-block {TILE_SIZE}, "
             "because the shared-memory tile size is fixed at compile time."
         )
-    
+
     input_file = args.input
     output_file = args.output
     write_hdf5 = not is_no_hdf5_token(output_file)
-    
+
     if write_hdf5:
         if args.chunk_frames <= 0:
             raise ValueError("--chunk-frames must be > 0")
         validate_h5_tiles(args.screen_tile_y, args.screen_tile_x)
-     
+
     if write_hdf5 and h5py is None:
         raise RuntimeError("HDF5 output requested, but h5py is not available. Use 'none' or install h5py.")
 
@@ -921,30 +890,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"CUDA device:                {device.name.decode() if isinstance(device.name, bytes) else device.name}")
     print(f"CUDA compute capability:    {device.compute_capability[0]}.{device.compute_capability[1]}")
     print(f"Threads per block:          {TILE_SIZE}")
-    print(f"CUDA JIT warm-up:           {'disabled' if args.no_warmup else 'enabled'}")
+    print(f"CUDA/Numba warm-up:         {'disabled' if args.no_warmup else 'enabled'}")
     print(f"NUMBA_CUDA_DRIVER:          {os.environ.get('NUMBA_CUDA_DRIVER', '(not set)')}")
 
     # --------------------------------------------------------
-    # 1. Generate Mandelbrot field on GPU
+    # 1. Generate Mandelbrot field on host with multicore Numba kernel
     # --------------------------------------------------------
-    d_vals = cuda.device_array(gen.nx * gen.ny, dtype=np.uint64, stream=main_stream)
-    grid2d = (
-        (gen.nx + MANDELBROT_BLOCK[0] - 1) // MANDELBROT_BLOCK[0],
-        (gen.ny + MANDELBROT_BLOCK[1] - 1) // MANDELBROT_BLOCK[1],
-    )
-    dx_gen = (gen.xe - gen.xs) / float(gen.nx - 1)
-    dy_gen = (gen.ye - gen.ys) / float(gen.ny - 1)
-
-    mandel_start = cuda.event()
-    mandel_stop = cuda.event()
-    mandel_start.record(main_stream)
-    mandelbrot_kernel[grid2d, MANDELBROT_BLOCK, main_stream](d_vals, gen.nx, gen.ny, gen.xs, gen.ys, dx_gen, dy_gen, cfg.max_iters)
-    mandel_stop.record(main_stream)
-    mandel_stop.synchronize()
-    mandel_gpu_s = cuda.event_elapsed_time(mandel_start, mandel_stop) / 1000.0
-
-    gen.values = d_vals.copy_to_host(stream=main_stream)
-    main_stream.synchronize()
+    gen_t0 = time.perf_counter()
+    compute_generating_field(gen, cfg.max_iters)
+    gen_t1 = time.perf_counter()
+    mandel_host_s = gen_t1 - gen_t0
 
     # --------------------------------------------------------
     # 2. Generate particles on host
@@ -969,13 +924,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     fx_new_d = cuda.device_array(particles.n, dtype=np.float64, stream=main_stream)
     fy_new_d = cuda.device_array(particles.n, dtype=np.float64, stream=main_stream)
 
-    screen_size = screen.nx * screen.ny
-    # int64 screen is used because Numba CUDA int64 atomics are broadly supported.
-    screen_d = cuda.device_array(screen_size, dtype=np.int64, stream=main_stream)
-
     threads = TILE_SIZE
     blocks_particles = blocks_1d(particles.n, threads)
-    blocks_screen = blocks_1d(screen_size, threads)
+
+    screen_size = screen.nx * screen.ny
+    screen_d = None
+    blocks_screen = 0
+
+    if write_hdf5:
+        screen_d = cuda.device_array(screen_size, dtype=np.int64, stream=main_stream)
+        blocks_screen = blocks_1d(screen_size, threads)
 
     # --------------------------------------------------------
     # 4. Initial force computation
@@ -1041,7 +999,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         nonlocal output_frames, screen_and_copy_ms, hdf5_write_s
         nonlocal has_last_written_step, last_written_step
 
-        if h5 is None or host is None:
+        if h5 is None or host is None or screen_d is None:
             return
         if has_last_written_step and step == last_written_step:
             return
@@ -1149,7 +1107,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     print("Simulation completed successfully.")
     print(f"Output frames:                   {output_frames}")
-    print(f"Mandelbrot GPU time:             {mandel_gpu_s:.17g} s")
+    print(f"Mandelbrot host wall time:       {mandel_host_s:.17g} s")
     print(f"Particle generation wall time:   {particle_generation_s:.17g} s")
     print(f"Initial force GPU time:          {init_force_gpu_s:.17g} s")
     print(f"Pure dynamics GPU time:          {pure_dynamics_gpu_s:.17g} s")

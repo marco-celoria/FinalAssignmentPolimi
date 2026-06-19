@@ -13,8 +13,14 @@ Primary CUDA targets
      conservative one-thread-per-target-particle strategy and shared-memory
      tiling over source particles.
   2. halfKickDriftKernel(...) and halfKickKernel(...): Velocity-Verlet update.
-  3. mandelbrotKernel(...): generation of the initial field.
-  4. buildScreenKernel(...): optional visualization/debug screen for HDF5 mode.
+  3. buildScreenKernel(...): optional visualization/debug screen for HDF5 mode.
+
+Host-side initialization
+------------------------
+  The Mandelbrot/generating field is intentionally computed on the host using
+  the same scalar algorithm and operation order as the serial C++17 baseline.
+  This avoids CPU/GPU boundary-classification differences that can otherwise
+  change the particle count and initial particle set by one or more particles.
 
 Reference benchmark/no-output mode
 ----------------------------------
@@ -65,7 +71,6 @@ Notes for instructors
 
 #include <algorithm>
 #include <array>
-#include <cassert>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -121,8 +126,6 @@ constexpr double kForce = 1.0e-3;
 constexpr double eps    = 1.0e-2;
 constexpr double eps2   = eps * eps;
 constexpr int CUDA_BLOCK_SIZE = 256;
-constexpr int MANDELBROT_BLOCK_X = 16;
-constexpr int MANDELBROT_BLOCK_Y = 16;
 
 // ============================================================
 // RAII CUDA HELPERS
@@ -135,6 +138,9 @@ public:
 
     explicit DeviceBuffer(std::size_t n) : ptr_(nullptr), size_(n) {
         if (size_ > 0) {
+            if (size_ > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+                throw std::overflow_error("DeviceBuffer allocation size overflow");
+            }
             CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ptr_), size_ * sizeof(T)));
         }
     }
@@ -299,8 +305,6 @@ struct Grid {
 
 struct Particles {
     std::size_t n{};
-
-    // Structure-of-arrays layout, matching the serial baseline.
     std::vector<double> w;
     std::vector<double> x;
     std::vector<double> y;
@@ -438,50 +442,48 @@ Config readInput(const std::string& file, Grid& g, Grid& pg) {
 }
 
 // ============================================================
-// CUDA KERNELS
+// HOST MANDELBROT FIELD GENERATION
 // ============================================================
 
-__global__
-void mandelbrotKernel(
-    unsigned long long* values,
-    std::size_t nx,
-    std::size_t ny,
-    double xs,
-    double xe,
-    double ys,
-    double ye,
-    std::size_t maxIter
-) {
-    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::size_t j = static_cast<std::size_t>(blockIdx.y) * blockDim.y + threadIdx.y;
-
-    if (i >= nx || j >= ny) {
-        return;
+void computeGeneratingField(Grid& g, std::size_t maxIter) {
+    if (g.values.empty()) {
+        throw std::runtime_error("computeGeneratingField: empty grid");
     }
 
-    const double dx = (xe - xs) / static_cast<double>(nx - 1);
-    const double dy = (ye - ys) / static_cast<double>(ny - 1);
-    const double ca = xs + static_cast<double>(i) * dx;
-    const double cb = ys + static_cast<double>(j) * dy;
+    const double dx = (g.xe - g.xs) / static_cast<double>(g.nx - 1);
+    const double dy = (g.ye - g.ys) / static_cast<double>(g.ny - 1);
 
-    double za = 0.0;
-    double zb = 0.0;
-    std::size_t iter = 0;
+    for (std::size_t j = 0; j < g.ny; ++j) {
+        for (std::size_t i = 0; i < g.nx; ++i) {
+            const double ca = g.xs + static_cast<double>(i) * dx;
+            const double cb = g.ys + static_cast<double>(j) * dy;
 
-    while (iter < maxIter) {
-        const double a = za * za - zb * zb + ca;
-        const double b = 2.0 * za * zb + cb;
-        za = a;
-        zb = b;
+            double za = 0.0;
+            double zb = 0.0;
+            std::size_t iter = 0;
 
-        if (za * za + zb * zb > 4.0) {
-            break;
+            while (iter < maxIter) {
+                const double a = za * za - zb * zb + ca;
+                const double b = 2.0 * za * zb + cb;
+
+                za = a;
+                zb = b;
+
+                if (za * za + zb * zb > 4.0) {
+                    break;
+                }
+
+                ++iter;
+            }
+
+            g.values[idx2D(i, j, g.nx)] = static_cast<unsigned long long>(iter);
         }
-        ++iter;
     }
-
-    values[idx2D(i, j, nx)] = static_cast<unsigned long long>(iter);
 }
+
+// ============================================================
+// CUDA KERNELS
+// ============================================================
 
 template <int TILE_SIZE>
 __global__
@@ -673,7 +675,6 @@ Particles generateParticles(const Grid& g, const Grid& pg) {
     const auto vmax = *std::max_element(g.values.begin(), g.values.end());
     auto vmin       = *std::min_element(g.values.begin(), g.values.end());
 
-    // floor((29*vmax + vmin)/30) without forming 29*vmax directly.
     const unsigned long long qmax = vmax / 30ULL;
     const unsigned long long rmax = vmax % 30ULL;
     const unsigned long long qmin = vmin / 30ULL;
@@ -1069,19 +1070,6 @@ unsigned blocks1D(std::size_t n, int threads) {
     return static_cast<unsigned>(blocks);
 }
 
-void launchMandelbrot(unsigned long long* d_values, const Grid& gen, std::size_t maxIters) {
-    const dim3 block(MANDELBROT_BLOCK_X, MANDELBROT_BLOCK_Y);
-    const dim3 grid(
-        static_cast<unsigned>((gen.nx + block.x - 1) / block.x),
-        static_cast<unsigned>((gen.ny + block.y - 1) / block.y)
-    );
-
-    mandelbrotKernel<<<grid, block>>>(
-        d_values, gen.nx, gen.ny, gen.xs, gen.xe, gen.ys, gen.ye, maxIters
-    );
-    CUDA_CHECK_LAST();
-}
-
 void launchComputeForces(const double* d_x, const double* d_y, const double* d_w, double* d_fx, double* d_fy, std::size_t N) {
     computeForcesKernelTiled<CUDA_BLOCK_SIZE><<<blocks1D(N, CUDA_BLOCK_SIZE), CUDA_BLOCK_SIZE>>>(
         d_x, d_y, d_w, d_fx, d_fy, N
@@ -1163,9 +1151,7 @@ int main(int argc, char** argv) {
             cfg.outputEvery = static_cast<std::size_t>(outEvery);
         }
 
-        const std::size_t genSize = safeGridSize(gen.nx, gen.ny);
         const std::size_t screenSize = safeGridSize(screen.nx, screen.ny);
-        const std::size_t genBytes = safeMul(genSize, sizeof(unsigned long long), "generating field bytes");
         const std::size_t screenBytes = safeMul(screenSize, sizeof(unsigned long long), "screen bytes");
 
         std::cout << std::setprecision(17);
@@ -1192,20 +1178,12 @@ int main(int argc, char** argv) {
         printCudaDeviceSummary();
 
         // ----------------------------------------------------
-        // 1. Generate Mandelbrot field on GPU
+        // 1. Generate Mandelbrot field on host to match baseline
         // ----------------------------------------------------
-        DeviceBuffer<unsigned long long> d_gen_values(genSize);
-        CudaEvent mandelStart;
-        CudaEvent mandelStop;
-
-        CUDA_CHECK(cudaEventRecord(mandelStart.get()));
-        launchMandelbrot(d_gen_values.get(), gen, cfg.maxIters);
-        CUDA_CHECK(cudaEventRecord(mandelStop.get()));
-        CUDA_CHECK(cudaEventSynchronize(mandelStop.get()));
-
-        const double mandelGpuSeconds = static_cast<double>(elapsedMilliseconds(mandelStart, mandelStop)) / 1000.0;
-
-        CUDA_CHECK(cudaMemcpy(gen.values.data(), d_gen_values.get(), genBytes, cudaMemcpyDeviceToHost));
+        const auto mandelStart = std::chrono::steady_clock::now();
+        computeGeneratingField(gen, cfg.maxIters);
+        const auto mandelStop = std::chrono::steady_clock::now();
+        const double mandelCpuSeconds = std::chrono::duration<double>(mandelStop - mandelStart).count();
 
         // ----------------------------------------------------
         // 2. Generate particles on host
@@ -1317,15 +1295,12 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaEventRecord(dynamicsStart.get()));
         for (std::size_t step = 0; step < cfg.maxSteps; ++step) {
             if (h5 && shouldWriteStep(step, cfg.maxSteps, cfg.outputEvery)) {
-                // Close the current pure-dynamics timing segment before any
-                // output-related kernels, device-to-host copies, or HDF5 calls.
                 CUDA_CHECK(cudaEventRecord(dynamicsStop.get()));
                 CUDA_CHECK(cudaEventSynchronize(dynamicsStop.get()));
                 pureDynamicsGpuSeconds += static_cast<double>(elapsedMilliseconds(dynamicsStart, dynamicsStop)) / 1000.0;
 
                 writeOutputFrame(step);
 
-                // Start a new pure-dynamics timing segment after output.
                 CUDA_CHECK(cudaEventRecord(dynamicsStart.get()));
             }
 
@@ -1373,7 +1348,7 @@ int main(int argc, char** argv) {
 
         std::cout << "Simulation completed successfully.\n";
         std::cout << "Output frames:              " << outputFrames << "\n";
-        std::cout << "Mandelbrot GPU time:        " << mandelGpuSeconds << " s\n";
+        std::cout << "Mandelbrot CPU wall time:   " << mandelCpuSeconds << " s\n";
         std::cout << "Particle generation wall:   " << particleGenerationSeconds << " s\n";
         std::cout << "Initial force GPU time:     " << initForceGpuSeconds << " s\n";
         std::cout << "Pure dynamics GPU time:     " << pureDynamicsGpuSeconds << " s\n";
