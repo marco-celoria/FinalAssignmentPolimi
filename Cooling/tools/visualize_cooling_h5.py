@@ -396,8 +396,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "filename",
         nargs="?",
-        default="cooling.h5",
-        help="Path to HDF5 file. Default: cooling.h5.",
+        default="output/Cooling.h5",
+        help="Path to HDF5 file. Default: output/Cooling.h5.",
     )
 
     parser.add_argument(

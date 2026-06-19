@@ -1,16 +1,69 @@
 #!/usr/bin/env python3
+"""
+Cooling / field-evolution solver - Numba CPU reference implementation.
+
+This file is the official/reference Numba multicore CPU version aligned with
+the Python/NumPy, C++17, OpenMP, and CUDA versions of the assignment.
+
+It keeps the same numerical model and output conventions while replacing the
+main NumPy compute kernels with explicit Numba-compiled loops.
+
+Parallelized with Numba CPU:
+
+  1) compute_fractal_weights_kernel()
+  2) initialize_temperature_field_kernel()
+  3) update_interior_kernel()
+  4) boundary kernels
+
+Host-side by design:
+
+  - HDF5 output
+  - CSV output
+  - snapshot statistics and checksum
+
+Important design choices:
+
+  - HDF5 output is optional and disabled by default.
+  - Statistics are computed using a two-pass float64 implementation.
+  - outputEvery = 0 means final frame/statistics only.
+  - outputEvery > 0 means step 0, every outputEvery steps, and final step.
+  - CSV statistics include L2_norm and a deterministic checksum.
+
+Official performance mode:
+
+  ./cooling_numba_cpu.py input_final.in none Statistics_numba.csv 0
+
+or with explicit thread count:
+
+  ./cooling_numba_cpu.py --threads 16 input_final.in none Statistics_numba.csv 0
+
+Command line:
+
+  ./cooling_numba_cpu.py [options] [inputFile] [h5File|none] [csvFile] [outputEvery]
+
+Examples:
+
+  ./cooling_numba_cpu.py --threads 8 input_final.in none Statistics_numba.csv 0
+  ./cooling_numba_cpu.py --threads 8 input_medium.in output.h5 Statistics_numba.csv 50
+  ./cooling_numba_cpu.py --threads 8 --no-hdf5 input_final.in none Statistics_numba.csv 0
+"""
+
+from __future__ import annotations
 
 import argparse
 import math
 import os
+import platform
+import re
 import sys
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from pathlib import Path
+from typing import List, Optional, Sequence, Tuple
 
-import h5py
+import numba
 import numpy as np
-from numba import njit, prange, get_num_threads, set_num_threads
+from numba import get_num_threads, njit, prange, set_num_threads
 
 
 # ============================================================
@@ -18,76 +71,176 @@ from numba import njit, prange, get_num_threads, set_num_threads
 # ============================================================
 
 @dataclass
-class MeasuredPoint:
+class SamplePoint:
     x: float
     y: float
-    v: float
+    value: float
 
 
 @dataclass
-class Config:
-    nx: int
-    ny: int
-    Sreal: float
-    Simag: float
-    Dreal: float
-    Dimag: float
-    maxIters: int
-    steps: int
+class SimulationConfig:
+    grid_width: int
+    grid_height: int
 
-    # outputEvery is optional.
-    # If hasOutputEvery is False, only the final state is written.
-    hasOutputEvery: bool
-    outputEvery: Optional[int]
+    domain_start_x: float
+    domain_start_y: float
+    domain_width: float
+    domain_height: float
 
-    measured: List[MeasuredPoint]
+    max_fractal_iterations: int
+    time_steps: int
+    output_every: int  # 0 means final-only output
+
+    measured_points: List[SamplePoint]
+
+
+@dataclass
+class GridMapping:
+    x0: float
+    y0: float
+    dx: float
+    dy: float
+
+
+@dataclass
+class UpdateCoefficients:
+    damping: float
+    step_x: float
+    step_y: float
+    laplace_x: float
+    laplace_y: float
+    coeff_x: float
+    coeff_y: float
+    center_x: float
+    center_y: float
+
+
+@dataclass
+class FieldStatistics:
+    min_value: float
+    mean_value: float
+    max_value: float
+    std_dev: float
+    l2_norm: float
+    checksum: float
+
+
+@dataclass
+class RunTimings:
+    weight_time: float = 0.0
+    weight_range_time: float = 0.0
+    init_time: float = 0.0
+    pure_dynamics_time: float = 0.0
+    statistics_time: float = 0.0
+    csv_time: float = 0.0
+    hdf5_time: float = 0.0
+    loop_wall_time: float = 0.0
+    total_wall_time: float = 0.0
+    warmup_time: float = 0.0
 
 
 # ============================================================
-# VALIDATION
+# VALIDATION / UTILITY
 # ============================================================
 
-def validated_grid_size(nx: int, ny: int) -> int:
-    if nx <= 0 or ny <= 0:
+_INTEGER_RE = re.compile(r"^[+-]?[0-9]+$")
+
+
+def parse_strict_int(token: str) -> int:
+    """
+    Strict integer parser aligned with the C++ baseline behavior.
+    Rejects strings such as '1.0' or '1_000'.
+    """
+    if not _INTEGER_RE.match(token):
+        raise RuntimeError(f"Malformed input: invalid integer token '{token}'")
+    return int(token)
+
+
+def checked_grid_size(grid_width: int, grid_height: int) -> int:
+    if grid_width <= 0 or grid_height <= 0:
         raise ValueError("Grid dimensions must be > 0")
 
-    n = nx * ny
+    total_cells = grid_width * grid_height
 
-    if n <= 0:
+    if total_cells <= 0:
         raise ValueError("Invalid total grid size")
 
-    return n
+    return total_cells
 
 
 def validate_output_every(output_every: int) -> None:
+    if output_every < 0:
+        raise ValueError("outputEvery must be >= 0; use 0 for final-only output")
+
+
+def is_no_hdf5_token(text: str) -> bool:
+    return text in {"none", "NONE", "-", "--no-hdf5"}
+
+
+def ensure_parent_directory_exists(file_name: str) -> None:
+    if not file_name or is_no_hdf5_token(file_name):
+        return
+
+    parent = Path(file_name).expanduser().parent
+
+    if str(parent) in {"", "."}:
+        return
+
+    parent.mkdir(parents=True, exist_ok=True)
+
+    if not parent.is_dir():
+        raise RuntimeError(f"Output path parent exists but is not a directory: {parent}")
+
+
+def build_output_schedule(final_step: int, output_every: int) -> List[int]:
+    validate_output_every(output_every)
+
+    steps: List[int] = []
+
+    if output_every > 0:
+        steps.append(0)
+
+        step = output_every
+        while step < final_step:
+            steps.append(step)
+            step += output_every
+
+    if not steps or steps[-1] != final_step:
+        steps.append(final_step)
+
+    return steps
+
+
+def should_write_step(step: int, final_step: int, output_every: int) -> bool:
+    if step == final_step:
+        return True
+
     if output_every <= 0:
-        raise ValueError("outputEvery must be > 0")
+        return False
 
+    if step == 0:
+        return True
 
-def validate_stats_mode(mode: str) -> None:
-    if mode not in ("accurate", "fast"):
-        raise ValueError("stats mode must be either 'accurate' or 'fast'")
+    return (step % output_every) == 0
 
 
 # ============================================================
 # INPUT PARSER
 # ============================================================
 
-def read_input(fname: str) -> Config:
+def read_configuration_file(file_name: str) -> SimulationConfig:
     tokens: List[str] = []
 
     try:
-        with open(fname, "r", encoding="utf-8") as f:
+        with open(file_name, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.split("#", 1)[0]
-                parts = line.split()
-                if parts:
-                    tokens.extend(parts)
+                tokens.extend(line.split())
     except OSError as e:
-        raise RuntimeError(f"Cannot open input file: {fname}") from e
+        raise RuntimeError(f"Cannot open input file: {file_name}") from e
 
     if not tokens:
-        raise RuntimeError(f"Input file is empty or contains no numeric tokens: {fname}")
+        raise RuntimeError(f"Input file contains no numeric tokens: {file_name}")
 
     pos = 0
 
@@ -97,13 +250,10 @@ def read_input(fname: str) -> Config:
         if pos >= len(tokens):
             raise RuntimeError("Malformed input: missing integer token")
 
-        tok = tokens[pos]
+        token = tokens[pos]
         pos += 1
 
-        try:
-            return int(tok)
-        except Exception as e:
-            raise RuntimeError(f"Malformed input: invalid integer token '{tok}'") from e
+        return parse_strict_int(token)
 
     def next_float() -> float:
         nonlocal pos
@@ -111,347 +261,371 @@ def read_input(fname: str) -> Config:
         if pos >= len(tokens):
             raise RuntimeError("Malformed input: missing floating-point token")
 
-        tok = tokens[pos]
+        token = tokens[pos]
         pos += 1
 
         try:
-            return float(tok)
+            value = float(token)
         except Exception as e:
-            raise RuntimeError(f"Malformed input: invalid floating-point token '{tok}'") from e
+            raise RuntimeError(f"Malformed input: invalid floating-point token '{token}'") from e
 
-    nx = next_int()
-    ny = next_int()
+        if not math.isfinite(value):
+            raise RuntimeError(f"Malformed input: non-finite floating-point token '{token}'")
 
-    if nx < 3 or ny < 3:
+        return value
+
+    grid_width = next_int()
+    grid_height = next_int()
+
+    if grid_width < 3 or grid_height < 3:
         raise RuntimeError("Grid dimensions must be at least 3 x 3")
 
-    n_measured = next_int()
+    measured_count = next_int()
 
-    if n_measured < 0:
+    if measured_count < 0:
         raise RuntimeError("Number of measured points cannot be negative")
 
-    measured: List[MeasuredPoint] = []
+    measured_points: List[SamplePoint] = []
 
-    for _ in range(n_measured):
-        measured.append(
-            MeasuredPoint(
+    for _ in range(measured_count):
+        measured_points.append(
+            SamplePoint(
                 x=next_float(),
                 y=next_float(),
-                v=next_float(),
+                value=next_float(),
             )
         )
 
-    sreal = next_float()
-    simag = next_float()
-    dreal = next_float()
-    dimag = next_float()
-    max_iters = next_int()
-    steps = next_int()
+    domain_start_x = next_float()
+    domain_start_y = next_float()
+    domain_width = next_float()
+    domain_height = next_float()
+    max_fractal_iterations = next_int()
+    time_steps = next_int()
 
-    if max_iters <= 0:
-        raise RuntimeError("maxIters must be > 0")
+    if max_fractal_iterations <= 0:
+        raise RuntimeError("maxFractalIterations must be > 0")
 
-    if steps < 0:
-        raise RuntimeError("steps must be >= 0")
+    if time_steps < 0:
+        raise RuntimeError("timeSteps must be >= 0")
 
-    if dreal <= 0.0 or dimag <= 0.0:
-        raise RuntimeError("Domain extents Dreal and Dimag must be > 0")
+    if domain_width <= 0.0 or domain_height <= 0.0:
+        raise RuntimeError("domainWidth and domainHeight must be > 0")
 
-    has_output_every = False
-    output_every: Optional[int] = None
+    output_every = 0
 
-    # Optional outputEvery.
-    #
-    # Supported endings:
-    #
-    #   maxIters steps
-    #
-    # or:
-    #
-    #   maxIters steps outputEvery
-    #
-    # If outputEvery is absent, only the final state is written.
     if pos < len(tokens):
         output_every = next_int()
-        has_output_every = True
-
         validate_output_every(output_every)
 
     if pos != len(tokens):
         raise RuntimeError("Malformed input: unexpected extra tokens at end of file")
 
-    return Config(
-        nx=nx,
-        ny=ny,
-        Sreal=sreal,
-        Simag=simag,
-        Dreal=dreal,
-        Dimag=dimag,
-        maxIters=max_iters,
-        steps=steps,
-        hasOutputEvery=has_output_every,
-        outputEvery=output_every,
-        measured=measured,
+    return SimulationConfig(
+        grid_width=grid_width,
+        grid_height=grid_height,
+        domain_start_x=domain_start_x,
+        domain_start_y=domain_start_y,
+        domain_width=domain_width,
+        domain_height=domain_height,
+        max_fractal_iterations=max_fractal_iterations,
+        time_steps=time_steps,
+        output_every=output_every,
+        measured_points=measured_points,
     )
 
 
 # ============================================================
-# HOST-SIDE PHYSICS HELPERS
+# HOST-SIDE MODEL HELPERS
 # ============================================================
 
-def build_domain_params(cfg: Config) -> Tuple[float, float, float, float]:
-    """
-    Node-centered geometry including both boundaries:
-
-        x(i) = x0 + i * dx,   dx = Dreal / (nx - 1)
-        y(j) = y0 + j * dy,   dy = Dimag / (ny - 1)
-    """
-    x0 = cfg.Sreal
-    y0 = cfg.Simag
-    dx = cfg.Dreal / float(cfg.nx - 1)
-    dy = cfg.Dimag / float(cfg.ny - 1)
-
-    return x0, y0, dx, dy
+def build_grid_mapping(cfg: SimulationConfig) -> GridMapping:
+    return GridMapping(
+        x0=cfg.domain_start_x,
+        y0=cfg.domain_start_y,
+        dx=cfg.domain_width / float(cfg.grid_width - 1),
+        dy=cfg.domain_height / float(cfg.grid_height - 1),
+    )
 
 
-def analytical_field(x: float, y: float) -> float:
+def reference_field(x: float, y: float) -> float:
     return (x * x * x + y * y * y) / 6.0
 
 
-def compute_discrepancy(cfg: Config) -> float:
-    """
-    Computes:
-
-        mean(measured_value - analytical_field(x, y))
-    """
-    if not cfg.measured:
+def compute_mean_discrepancy(cfg: SimulationConfig) -> float:
+    if not cfg.measured_points:
         return 0.0
 
-    acc = np.longdouble(0.0)
+    total = 0.0
 
-    for m in cfg.measured:
-        acc += np.longdouble(m.v - analytical_field(m.x, m.y))
+    for point in cfg.measured_points:
+        total += point.value - reference_field(point.x, point.y)
 
-    return float(acc / np.longdouble(len(cfg.measured)))
+    return total / float(len(cfg.measured_points))
 
 
-def build_cooling_coeffs(
+def build_update_coefficients(
     dx: float,
     dy: float,
-    dd: float = 100.0,
-) -> Tuple[float, float, float, float, float, float, float]:
+    damping: float = 100.0,
+) -> UpdateCoefficients:
     if dx <= 0.0 or dy <= 0.0:
-        raise ValueError("build_cooling_coeffs: dx and dy must be > 0")
+        raise ValueError("build_update_coefficients: dx and dy must be > 0")
 
-    if dd <= 0.0:
-        raise ValueError("build_cooling_coeffs: dd must be > 0")
+    if damping <= 0.0:
+        raise ValueError("build_update_coefficients: damping must be > 0")
 
-    hx = dx
-    hy = dy
+    step_x = dx
+    step_y = dy
 
-    dgx = -2.0 * (1.0 + dd * hx / (hx * hx + dd))
-    dgy = -2.0 * (1.0 + dd * hy / (hy * hy + dd))
+    laplace_x = -2.0 * (1.0 + damping * step_x / (step_x * step_x + damping))
+    laplace_y = -2.0 * (1.0 + damping * step_y / (step_y * step_y + damping))
 
-    CX = (hx + dd * math.exp(hx)) / (15.0 * dd + hx)
-    CY = (hy + dd * math.exp(hy)) / (15.0 * dd + hy)
+    coeff_x = (step_x + damping * math.exp(step_x)) / (15.0 * damping + step_x)
+    coeff_y = (step_y + damping * math.exp(step_y)) / (15.0 * damping + step_y)
 
-    return dd, hx, hy, dgx, dgy, CX, CY
+    center_x = laplace_x + 0.5 / coeff_x
+    center_y = laplace_y + 0.5 / coeff_y
+
+    return UpdateCoefficients(
+        damping=damping,
+        step_x=step_x,
+        step_y=step_y,
+        laplace_x=laplace_x,
+        laplace_y=laplace_y,
+        coeff_x=coeff_x,
+        coeff_y=coeff_y,
+        center_x=center_x,
+        center_y=center_y,
+    )
 
 
 # ============================================================
 # NUMBA CPU KERNELS
 # ============================================================
 
-@njit(parallel=True, fastmath=False)
-def compute_weight_kernel(
-    weight: np.ndarray,
-    nx: int,
-    ny: int,
+@njit(parallel=True, fastmath=False, cache=True)
+def compute_fractal_weights_kernel(
+    weight_field: np.ndarray,
+    grid_width: int,
+    grid_height: int,
     x0: float,
     y0: float,
     dx: float,
     dy: float,
-    max_iters: int,
+    max_fractal_iterations: int,
 ) -> None:
-    for j in prange(ny):
-        row = j * nx
+    for j in prange(grid_height):
+        row = j * grid_width
         y = y0 + dy * float(j)
 
-        for i in range(nx):
+        for i in range(grid_width):
             x = x0 + dx * float(i)
             p = row + i
 
-            za = 0.0
-            zb = 0.0
-            it = 0
+            z_real = 0.0
+            z_imag = 0.0
+            iteration = 0
 
-            while it < max_iters:
-                if za * za + zb * zb > 4.0:
+            while iteration < max_fractal_iterations:
+                if z_real * z_real + z_imag * z_imag > 4.0:
                     break
 
-                tmp = za * za - zb * zb + x
-                zb = 2.0 * za * zb + y
-                za = tmp
+                tmp = z_real * z_real - z_imag * z_imag + x
+                z_imag = 2.0 * z_real * z_imag + y
+                z_real = tmp
 
-                it += 1
+                iteration += 1
 
-            weight[p] = it
+            weight_field[p] = iteration
 
 
-@njit(parallel=True, fastmath=False)
-def initialize_field_kernel(
-    u: np.ndarray,
-    weight: np.ndarray,
-    nx: int,
-    ny: int,
+@njit(parallel=True, fastmath=False, cache=True)
+def initialize_temperature_field_kernel(
+    temperature: np.ndarray,
+    weight_field: np.ndarray,
+    grid_width: int,
+    grid_height: int,
     x0: float,
     y0: float,
     dx: float,
     dy: float,
-    discrepancy: float,
-    wmin: int,
-    wmax: int,
+    mean_discrepancy: float,
+    min_weight: int,
+    max_weight: int,
 ) -> None:
-    denom = float(wmax - wmin) if wmax > wmin else 1.0
+    denom = float(max_weight - min_weight) if max_weight > min_weight else 1.0
 
-    for j in prange(ny):
-        y = y0 + dy * j
-        row = j * nx
+    for j in prange(grid_height):
+        y = y0 + dy * float(j)
+        row = j * grid_width
 
-        for i in range(nx):
-            x = x0 + dx * i
+        for i in range(grid_width):
+            x = x0 + dx * float(i)
             p = row + i
 
-            F = (x * x * x + y * y * y) / 6.0
-            wnorm = (weight[p] - wmin) / denom
+            field_value = (x * x * x + y * y * y) / 6.0
+            normalized_weight = float(weight_field[p] - min_weight) / denom
 
-            u[p] = 293.16 + 80.0 * (discrepancy + F) * wnorm
+            temperature[p] = (
+                293.16
+                + 80.0 * (mean_discrepancy + field_value) * normalized_weight
+            )
 
 
-@njit(parallel=True, fastmath=False)
+@njit(parallel=True, fastmath=False, cache=True)
 def update_interior_kernel(
-    u1: np.ndarray,
-    u2: np.ndarray,
-    nx: int,
-    ny: int,
-    dgx: float,
-    dgy: float,
-    CX: float,
-    CY: float,
+    current_field: np.ndarray,
+    next_field: np.ndarray,
+    grid_width: int,
+    grid_height: int,
+    center_x: float,
+    center_y: float,
+    coeff_x: float,
+    coeff_y: float,
 ) -> None:
-    for j in prange(1, ny - 1):
-        row = j * nx
-        row_up = (j - 1) * nx
-        row_dn = (j + 1) * nx
+    for j in prange(1, grid_height - 1):
+        row = j * grid_width
+        row_up = (j - 1) * grid_width
+        row_down = (j + 1) * grid_width
 
-        for i in range(1, nx - 1):
+        for i in range(1, grid_width - 1):
             p = row + i
 
-            u2[p] = (
-                CX * (
-                    u1[p - 1]
-                    + u1[p + 1]
-                    + (dgx + 0.5 / CX) * u1[p]
+            next_field[p] = (
+                coeff_x
+                * (
+                    current_field[p - 1]
+                    + current_field[p + 1]
+                    + center_x * current_field[p]
                 )
-                + CY * (
-                    u1[row_up + i]
-                    + u1[row_dn + i]
-                    + (dgy + 0.5 / CY) * u1[p]
+                + coeff_y
+                * (
+                    current_field[row_up + i]
+                    + current_field[row_down + i]
+                    + center_y * current_field[p]
                 )
             )
 
 
-@njit(parallel=True, fastmath=False)
-def apply_boundary_lr_kernel(u: np.ndarray, nx: int, ny: int) -> None:
-    """
-    Left/right boundaries excluding corners.
-    """
-    for j in prange(1, ny - 1):
-        row = j * nx
-        u[row] = u[row + 1]
-        u[row + nx - 1] = u[row + nx - 2]
-
-
-@njit(parallel=True, fastmath=False)
-def apply_boundary_tb_kernel(u: np.ndarray, nx: int, ny: int) -> None:
-    """
-    Top/bottom boundaries including corners.
-
-    This intentionally runs after apply_boundary_lr_kernel to preserve
-    the same corner behavior as the original CUDA-style version.
-    """
-    row_top = 0
-    row_1 = nx
-    row_nm2 = (ny - 2) * nx
-    row_nm1 = (ny - 1) * nx
-
-    for i in prange(nx):
-        u[row_top + i] = u[row_1 + i]
-        u[row_nm1 + i] = u[row_nm2 + i]
-
-
-def update_field(
-    u1: np.ndarray,
-    u2: np.ndarray,
-    nx: int,
-    ny: int,
-    dgx: float,
-    dgy: float,
-    CX: float,
-    CY: float,
+@njit(parallel=True, fastmath=False, cache=True)
+def apply_boundary_left_right_kernel(
+    field: np.ndarray,
+    grid_width: int,
+    grid_height: int,
 ) -> None:
-    """
-    Host-side launch sequence.
+    for j in prange(1, grid_height - 1):
+        row = j * grid_width
 
-    Kept intentionally close to CUDA launch ordering:
-      1. update interior
-      2. apply left/right boundaries
-      3. apply top/bottom boundaries
-    """
-    update_interior_kernel(u1, u2, nx, ny, dgx, dgy, CX, CY)
-    apply_boundary_lr_kernel(u2, nx, ny)
-    apply_boundary_tb_kernel(u2, nx, ny)
+        field[row] = field[row + 1]
+        field[row + grid_width - 1] = field[row + grid_width - 2]
+
+
+@njit(parallel=True, fastmath=False, cache=True)
+def apply_boundary_top_bottom_kernel(
+    field: np.ndarray,
+    grid_width: int,
+    grid_height: int,
+) -> None:
+    row_top = 0
+    row_1 = grid_width
+    row_nm2 = (grid_height - 2) * grid_width
+    row_nm1 = (grid_height - 1) * grid_width
+
+    for i in prange(grid_width):
+        field[row_top + i] = field[row_1 + i]
+        field[row_nm1 + i] = field[row_nm2 + i]
+
+
+def advance_temperature_field(
+    current_field: np.ndarray,
+    next_field: np.ndarray,
+    grid_width: int,
+    grid_height: int,
+    coeffs: UpdateCoefficients,
+) -> None:
+    update_interior_kernel(
+        current_field,
+        next_field,
+        grid_width,
+        grid_height,
+        coeffs.center_x,
+        coeffs.center_y,
+        coeffs.coeff_x,
+        coeffs.coeff_y,
+    )
+
+    apply_boundary_left_right_kernel(next_field, grid_width, grid_height)
+    apply_boundary_top_bottom_kernel(next_field, grid_width, grid_height)
+
+
+def advance_temperature_field_steps(
+    current_field: np.ndarray,
+    next_field: np.ndarray,
+    number_of_steps: int,
+    grid_width: int,
+    grid_height: int,
+    coeffs: UpdateCoefficients,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if number_of_steps < 0:
+        raise ValueError("number_of_steps must be >= 0")
+
+    current = current_field
+    nxt = next_field
+
+    for _ in range(number_of_steps):
+        advance_temperature_field(current, nxt, grid_width, grid_height, coeffs)
+        current, nxt = nxt, current
+
+    return current, nxt
 
 
 # ============================================================
 # HDF5 WRITER
 # ============================================================
 
-class H5Writer:
+class TimeSeriesWriter:
     def __init__(
         self,
-        fname: str,
-        nx: int,
-        ny: int,
+        file_name: str,
+        grid_width: int,
+        grid_height: int,
         batch: int = 32,
         tile_y: int = 256,
         tile_x: int = 256,
     ):
-        if nx <= 0 or ny <= 0:
-            raise ValueError("H5Writer: nx and ny must be > 0")
+        if grid_width <= 0 or grid_height <= 0:
+            raise ValueError("TimeSeriesWriter: grid dimensions must be > 0")
 
         if batch <= 0:
-            raise ValueError("H5Writer: batch must be > 0")
+            raise ValueError("TimeSeriesWriter: batch must be > 0")
 
         if tile_y <= 0 or tile_x <= 0:
-            raise ValueError("H5Writer: tile sizes must be > 0")
+            raise ValueError("TimeSeriesWriter: tile sizes must be > 0")
 
-        self.nx = nx
-        self.ny = ny
+        try:
+            import h5py
+        except ImportError as e:
+            raise RuntimeError(
+                "h5py is required for HDF5 output; use --no-hdf5 to disable it"
+            ) from e
+
+        self.grid_width = grid_width
+        self.grid_height = grid_height
         self.batch = batch
-        self.frame = 0
+        self.frame_count = 0
         self.capacity = batch
         self.closed = False
 
-        chunk_y = min(ny, tile_y)
-        chunk_x = min(nx, tile_x)
+        chunk_y = min(grid_height, tile_y)
+        chunk_x = min(grid_width, tile_x)
 
-        self.file = h5py.File(fname, "w")
+        self.file = h5py.File(file_name, "w")
 
         self.field = self.file.create_dataset(
             "field",
-            shape=(0, ny, nx),
-            maxshape=(None, ny, nx),
+            shape=(0, grid_height, grid_width),
+            maxshape=(None, grid_height, grid_width),
             chunks=(1, chunk_y, chunk_x),
             dtype=np.float64,
         )
@@ -466,40 +640,43 @@ class H5Writer:
 
         self._extend(self.capacity)
 
-    def _extend(self, n: int) -> None:
-        self.field.resize((n, self.ny, self.nx))
-        self.step.resize((n,))
+    def _extend(self, new_size: int) -> None:
+        self.field.resize((new_size, self.grid_height, self.grid_width))
+        self.step.resize((new_size,))
 
-    def write(self, step_number: int, field_1d: np.ndarray) -> None:
+    def write_frame(self, step_number: int, field_1d: np.ndarray) -> None:
         if self.closed:
-            raise RuntimeError("H5Writer: write() called after close()")
+            raise RuntimeError("TimeSeriesWriter: write_frame() called after close()")
 
-        if field_1d.size != self.nx * self.ny:
-            raise RuntimeError("H5Writer: field size mismatch")
+        if field_1d.size != self.grid_width * self.grid_height:
+            raise RuntimeError("TimeSeriesWriter: field size mismatch")
 
-        if self.frame >= self.capacity:
+        if self.frame_count >= self.capacity:
             self.capacity += self.batch
             self._extend(self.capacity)
 
-        self.field[self.frame, :, :] = field_1d.reshape(self.ny, self.nx)
-        self.step[self.frame] = np.int32(step_number)
-        self.frame += 1
+        self.field[self.frame_count, :, :] = field_1d.reshape(
+            self.grid_height,
+            self.grid_width,
+        )
+        self.step[self.frame_count] = np.int32(step_number)
+        self.frame_count += 1
 
     def close(self) -> None:
         if self.closed:
             return
 
-        if self.frame != self.capacity:
-            self._extend(self.frame)
+        if self.frame_count != self.capacity:
+            self._extend(self.frame_count)
 
         self.file.flush()
         self.file.close()
         self.closed = True
 
-    def __enter__(self):
+    def __enter__(self) -> "TimeSeriesWriter":
         return self
 
-    def __exit__(self, exc_type, exc, tb):
+    def __exit__(self, exc_type, exc, tb) -> bool:
         self.close()
         return False
 
@@ -508,368 +685,382 @@ class H5Writer:
 # STATISTICS
 # ============================================================
 
-def compute_stats_accurate(u: np.ndarray) -> Tuple[float, float, float, float]:
-    """
-    Numerically careful statistics.
+def compute_field_statistics(field: np.ndarray) -> FieldStatistics:
+    if field.size == 0:
+        raise RuntimeError("compute_field_statistics: empty field")
 
-    This is close to your original implementation:
-    - min/max in float64
-    - mean/std using longdouble accumulation
+    min_value = float(np.min(field))
+    max_value = float(np.max(field))
 
-    More accurate, but slower and allocates a temporary longdouble array.
-    """
-    if u.size == 0:
-        raise RuntimeError("compute_stats_accurate: empty field")
+    sum_value = float(np.sum(field, dtype=np.float64))
+    mean_value = sum_value / float(field.size)
 
-    mn = float(np.min(u))
-    mx = float(np.max(u))
+    sum_squares = float(np.sum(field * field, dtype=np.float64))
+    l2_norm = float(np.sqrt(sum_squares))
 
-    mean_ld = np.sum(u, dtype=np.longdouble) / np.longdouble(u.size)
-    diff_ld = u.astype(np.longdouble) - mean_ld
-    std_ld = np.sqrt(
-        np.sum(diff_ld * diff_ld, dtype=np.longdouble) / np.longdouble(u.size)
+    checksum_weights = (
+        (np.arange(field.size, dtype=np.uint64) % np.uint64(1009))
+        + np.uint64(1)
+    )
+    checksum = float(
+        np.sum(field * checksum_weights.astype(np.float64), dtype=np.float64)
     )
 
-    return float(mn), float(mean_ld), float(mx), float(std_ld)
+    diff = field - mean_value
+    std_dev = float(
+        np.sqrt(np.sum(diff * diff, dtype=np.float64) / float(field.size))
+    )
+
+    return FieldStatistics(
+        min_value=min_value,
+        mean_value=mean_value,
+        max_value=max_value,
+        std_dev=std_dev,
+        l2_norm=l2_norm,
+        checksum=checksum,
+    )
 
 
-def compute_stats_fast(u: np.ndarray) -> Tuple[float, float, float, float]:
-    """
-    Fast statistics.
-
-    Useful for performance runs where exact longdouble agreement is not required.
-    """
-    if u.size == 0:
-        raise RuntimeError("compute_stats_fast: empty field")
-
-    mn = float(np.min(u))
-    mx = float(np.max(u))
-    mean = float(np.mean(u))
-    std = float(np.std(u))
-
-    return mn, mean, mx, std
+def write_statistics_header(f) -> None:
+    f.write("Step;Min;Mean;Max;Std_dev;L2_norm;Checksum\n")
 
 
-def compute_stats(u: np.ndarray, mode: str) -> Tuple[float, float, float, float]:
-    if mode == "accurate":
-        return compute_stats_accurate(u)
-
-    if mode == "fast":
-        return compute_stats_fast(u)
-
-    raise ValueError("Unknown stats mode")
-
-
-def write_stats_header(f) -> None:
-    f.write("Step;Min;Mean;Max;Std_dev\n")
-
-
-def write_stats_line(
-    f,
-    step: int,
-    stats: Tuple[float, float, float, float],
-) -> None:
-    mn, mean, mx, std = stats
-    f.write(f"{step};{mn:.15g};{mean:.15g};{mx:.15g};{std:.15g}\n")
+def write_statistics_row(f, step: int, stats: FieldStatistics) -> None:
+    f.write(
+        f"{step};"
+        f"{stats.min_value:.15g};"
+        f"{stats.mean_value:.15g};"
+        f"{stats.max_value:.15g};"
+        f"{stats.std_dev:.15g};"
+        f"{stats.l2_norm:.15g};"
+        f"{stats.checksum:.15g}\n"
+    )
 
 
 # ============================================================
 # NUMBA WARM-UP
 # ============================================================
 
-def warmup_numba() -> None:
+def warmup_numba(verbose: bool = True) -> float:
     """
-    Forces Numba to compile kernels before measured sections.
+    Force Numba to compile kernels before measured sections.
 
-    The array dtypes match the real simulation:
-      weight : int32
-      u      : float64
+    Returned wall time is reported separately and excluded from kernel timings.
     """
-    print("Warming up Numba JIT compiler...")
+    if verbose:
+        print("Warming up Numba JIT compiler...")
 
-    nx, ny = 3, 3
-    n = nx * ny
+    start = time.perf_counter()
 
-    x0 = 0.0
-    y0 = 0.0
-    dx = 0.1
-    dy = 0.1
+    grid_width = 4
+    grid_height = 4
+    total_cells = grid_width * grid_height
 
-    dgx = 1.0
-    dgy = 1.0
-    CX = 1.0
-    CY = 1.0
+    mapping = GridMapping(x0=0.0, y0=0.0, dx=0.1, dy=0.1)
+    coeffs = build_update_coefficients(mapping.dx, mapping.dy, 100.0)
 
-    discrepancy = 0.0
-    wmin = 0
-    wmax = 10
-    max_iters = 2
+    weight_field = np.empty(total_cells, dtype=np.int32)
+    current_field = np.zeros(total_cells, dtype=np.float64)
+    next_field = np.zeros(total_cells, dtype=np.float64)
 
-    weight = np.empty(n, dtype=np.int32)
-    u_curr = np.zeros(n, dtype=np.float64)
-    u_next = np.zeros(n, dtype=np.float64)
-
-    compute_weight_kernel(weight, nx, ny, x0, y0, dx, dy, max_iters)
-    initialize_field_kernel(
-        u_curr,
-        weight,
-        nx,
-        ny,
-        x0,
-        y0,
-        dx,
-        dy,
-        discrepancy,
-        wmin,
-        wmax,
+    compute_fractal_weights_kernel(
+        weight_field,
+        grid_width,
+        grid_height,
+        mapping.x0,
+        mapping.y0,
+        mapping.dx,
+        mapping.dy,
+        2,
     )
 
-    update_interior_kernel(u_curr, u_next, nx, ny, dgx, dgy, CX, CY)
-    apply_boundary_lr_kernel(u_next, nx, ny)
-    apply_boundary_tb_kernel(u_next, nx, ny)
+    initialize_temperature_field_kernel(
+        current_field,
+        weight_field,
+        grid_width,
+        grid_height,
+        mapping.x0,
+        mapping.y0,
+        mapping.dx,
+        mapping.dy,
+        0.0,
+        0,
+        10,
+    )
 
-    print("JIT warmup completed; reported timings exclude compilation.")
+    advance_temperature_field(
+        current_field,
+        next_field,
+        grid_width,
+        grid_height,
+        coeffs,
+    )
+
+    elapsed = time.perf_counter() - start
+
+    if verbose:
+        print("JIT warmup completed; reported timings exclude compilation.")
+
+    return elapsed
+
+
+def maybe_get_h5py_version(write_hdf5: bool) -> str:
+    if not write_hdf5:
+        return "disabled"
+
+    try:
+        import h5py
+        return h5py.__version__
+    except Exception:
+        return "unavailable"
 
 
 # ============================================================
-# HOST-SIDE DRIVER
+# SIMULATION DRIVER
 # ============================================================
 
 def run_simulation(
-    cfg: Config,
+    cfg: SimulationConfig,
     h5_file: str,
     csv_file: str,
-    stats_mode: str,
     h5_tile_y: int,
     h5_tile_x: int,
+    write_hdf5: bool,
+    skip_warmup: bool,
 ) -> None:
-    validate_stats_mode(stats_mode)
+    validate_output_every(cfg.output_every)
 
-    if cfg.hasOutputEvery:
-        if cfg.outputEvery is None:
-            raise ValueError("Internal error: hasOutputEvery is true but outputEvery is None")
-        validate_output_every(cfg.outputEvery)
+    ensure_parent_directory_exists(csv_file)
 
-    n = validated_grid_size(cfg.nx, cfg.ny)
+    if write_hdf5:
+        ensure_parent_directory_exists(h5_file)
 
-    x0, y0, dx, dy = build_domain_params(cfg)
-    _, _, _, dgx, dgy, CX, CY = build_cooling_coeffs(dx, dy, 100.0)
-    discrepancy = compute_discrepancy(cfg)
+    total_cells = checked_grid_size(cfg.grid_width, cfg.grid_height)
 
-    # Flat, GPU-friendly arrays.
-    weight = np.empty(n, dtype=np.int32)
-    u_curr = np.empty(n, dtype=np.float64)
-    u_next = np.empty(n, dtype=np.float64)
+    mapping = build_grid_mapping(cfg)
+    coeffs = build_update_coefficients(mapping.dx, mapping.dy, 100.0)
+    mean_discrepancy = compute_mean_discrepancy(cfg)
 
-    # Warm-up before measured work.
-    warmup_numba()
+    weight_field = np.empty(total_cells, dtype=np.int32)
+    current_field = np.empty(total_cells, dtype=np.float64)
+    next_field = np.empty(total_cells, dtype=np.float64)
 
-    total_wall_t0 = time.perf_counter()
+    timings = RunTimings()
 
-    # --------------------------------------------------------
-    # Weight field
-    # --------------------------------------------------------
-    t0 = time.perf_counter()
+    if not skip_warmup:
+        timings.warmup_time = warmup_numba(verbose=True)
+    else:
+        print("Skipping explicit Numba warmup; first-call JIT time may be included in timings.")
 
-    compute_weight_kernel(
-        weight,
-        cfg.nx,
-        cfg.ny,
-        x0,
-        y0,
-        dx,
-        dy,
-        cfg.maxIters,
+    total_wall_start = time.perf_counter()
+
+    weight_start = time.perf_counter()
+    compute_fractal_weights_kernel(
+        weight_field,
+        cfg.grid_width,
+        cfg.grid_height,
+        mapping.x0,
+        mapping.y0,
+        mapping.dx,
+        mapping.dy,
+        cfg.max_fractal_iterations,
     )
+    timings.weight_time = time.perf_counter() - weight_start
 
-    t1 = time.perf_counter()
+    weight_range_start = time.perf_counter()
+    min_weight = int(np.min(weight_field))
+    max_weight = int(np.max(weight_field))
+    timings.weight_range_time = time.perf_counter() - weight_range_start
 
-    wmin = int(np.min(weight))
-    wmax = int(np.max(weight))
-
-    weight_time_s = t1 - t0
-
-    # --------------------------------------------------------
-    # Initialization
-    # --------------------------------------------------------
-    t2 = time.perf_counter()
-
-    initialize_field_kernel(
-        u_curr,
-        weight,
-        cfg.nx,
-        cfg.ny,
-        x0,
-        y0,
-        dx,
-        dy,
-        discrepancy,
-        wmin,
-        wmax,
+    init_start = time.perf_counter()
+    initialize_temperature_field_kernel(
+        current_field,
+        weight_field,
+        cfg.grid_width,
+        cfg.grid_height,
+        mapping.x0,
+        mapping.y0,
+        mapping.dx,
+        mapping.dy,
+        mean_discrepancy,
+        min_weight,
+        max_weight,
     )
+    timings.init_time = time.perf_counter() - init_start
 
-    t3 = time.perf_counter()
-
-    init_time_s = t3 - t2
-
-    # --------------------------------------------------------
-    # Dynamics + output loop
-    # --------------------------------------------------------
-    pure_dynamics_time_s = 0.0
-    output_stats_io_time_s = 0.0
     output_frames = 0
+    final_stats = FieldStatistics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
-    last_written_step: Optional[int] = None
+    output_schedule = build_output_schedule(cfg.time_steps, cfg.output_every)
 
-    loop_t0 = time.perf_counter()
-
-    with open(csv_file, "w", encoding="utf-8") as csvf:
-        write_stats_header(csvf)
-
-        with H5Writer(
+    writer_ctx = (
+        TimeSeriesWriter(
             h5_file,
-            cfg.nx,
-            cfg.ny,
+            cfg.grid_width,
+            cfg.grid_height,
             batch=32,
             tile_y=h5_tile_y,
             tile_x=h5_tile_x,
-        ) as writer:
+        )
+        if write_hdf5
+        else None
+    )
+    
+    loop_start = time.perf_counter()
+
+    try:
+        with open(csv_file, "w", encoding="utf-8") as csvf:
+            csv_start = time.perf_counter()
+            write_statistics_header(csvf)
+            timings.csv_time += time.perf_counter() - csv_start
+
+            writer = writer_ctx
 
             def write_output_frame(step: int) -> None:
-                nonlocal output_frames
-                nonlocal output_stats_io_time_s
-                nonlocal last_written_step
+                nonlocal output_frames, final_stats
 
-                if last_written_step == step:
-                    return
+                stats_start = time.perf_counter()
+                stats = compute_field_statistics(current_field)
+                timings.statistics_time += time.perf_counter() - stats_start
 
-                out_t0 = time.perf_counter()
+                final_stats = stats
 
-                stats = compute_stats(u_curr, stats_mode)
-                write_stats_line(csvf, step, stats)
-                writer.write(step, u_curr)
+                csv_frame_start = time.perf_counter()
+                write_statistics_row(csvf, step, stats)
+                timings.csv_time += time.perf_counter() - csv_frame_start
+
+                if writer is not None:
+                    hdf5_start = time.perf_counter()
+                    writer.write_frame(step, current_field)
+                    timings.hdf5_time += time.perf_counter() - hdf5_start
+
                 output_frames += 1
 
-                out_t1 = time.perf_counter()
-                output_stats_io_time_s += out_t1 - out_t0
+            current_step = 0
 
-                last_written_step = step
+            for target_step in output_schedule:
+                if target_step < current_step or target_step > cfg.time_steps:
+                    raise RuntimeError("Internal error: invalid output schedule")
 
-            # If outputEvery was explicitly specified, keep traditional behavior:
-            # write the initial condition at step 0.
-            #
-            # If outputEvery was not specified, do not write step 0 here.
-            # In that mode, only the final state is written after the loop.
-            if cfg.hasOutputEvery:
-                write_output_frame(0)
+                steps_to_advance = target_step - current_step
 
-            for step in range(1, cfg.steps + 1):
-                dyn_t0 = time.perf_counter()
+                if steps_to_advance > 0:
+                    dyn_start = time.perf_counter()
+                    current_field, next_field = advance_temperature_field_steps(
+                        current_field,
+                        next_field,
+                        steps_to_advance,
+                        cfg.grid_width,
+                        cfg.grid_height,
+                        coeffs,
+                    )
+                    timings.pure_dynamics_time += time.perf_counter() - dyn_start
+                    current_step = target_step
 
-                update_field(
-                    u_curr,
-                    u_next,
-                    cfg.nx,
-                    cfg.ny,
-                    dgx,
-                    dgy,
-                    CX,
-                    CY,
-                )
+                if should_write_step(target_step, cfg.time_steps, cfg.output_every):
+                    write_output_frame(target_step)
 
-                dyn_t1 = time.perf_counter()
-                pure_dynamics_time_s += dyn_t1 - dyn_t0
+            csvf.flush()
 
-                u_curr, u_next = u_next, u_curr
+            if writer is not None:
+                writer.close()
 
-                # Periodic output only when outputEvery was explicitly specified.
-                if cfg.hasOutputEvery:
-                    assert cfg.outputEvery is not None
+    finally:
+        if writer_ctx is not None and not writer_ctx.closed:
+            writer_ctx.close()
 
-                    if (step % cfg.outputEvery) == 0:
-                        write_output_frame(step)
+    timings.loop_wall_time = time.perf_counter() - loop_start
+    timings.total_wall_time = time.perf_counter() - total_wall_start
 
-            # Always write the final state.
-            # If periodic output already wrote it, the duplicate guard skips it.
-            write_output_frame(cfg.steps)
+    updates = (
+        float(cfg.grid_width - 2)
+        * float(cfg.grid_height - 2)
+        * float(cfg.time_steps)
+    )
 
-    loop_t1 = time.perf_counter()
-    total_wall_t1 = time.perf_counter()
+    print(f"Grid:                         {cfg.grid_width} x {cfg.grid_height}")
+    print(f"Measured points:              {len(cfg.measured_points)}")
+    print(f"Max fractal iterations:       {cfg.max_fractal_iterations}")
+    print(f"Time steps:                   {cfg.time_steps}")
 
-    loop_total_time_s = loop_t1 - loop_t0
-    total_wall_time_s = total_wall_t1 - total_wall_t0
-
-    updates = float(cfg.nx - 2) * float(cfg.ny - 2) * float(cfg.steps)
-
-    # --------------------------------------------------------
-    # Reporting
-    # --------------------------------------------------------
-    print(f"Grid:                         {cfg.nx} x {cfg.ny}")
-    print(f"Measured points:              {len(cfg.measured)}")
-    print(f"Max iterations:               {cfg.maxIters}")
-    print(f"Time steps:                   {cfg.steps}")
-
-    if cfg.hasOutputEvery:
-        assert cfg.outputEvery is not None
-        print(f"Snapshot every:               {cfg.outputEvery} step(s)")
+    if cfg.output_every == 0:
+        print("Snapshot/statistics policy:    final step only")
     else:
-        print("Snapshot every:               final step only")
+        print(
+            "Snapshot/statistics policy:    "
+            f"step 0, every {cfg.output_every} step(s), and final step"
+        )
 
     print(f"Output frames:                {output_frames}")
-    print(f"Stats mode:                   {stats_mode}")
+    print(f"Python version:               {platform.python_version()}")
+    print(f"NumPy version:                {np.__version__}")
+    print(f"Numba version:                {numba.__version__}")
+    print(f"h5py version:                 {maybe_get_h5py_version(write_hdf5)}")
     print(f"Numba threads:                {get_num_threads()}")
     print(f"NUMBA_NUM_THREADS env:        {os.environ.get('NUMBA_NUM_THREADS', '(not set)')}")
-    print(f"HDF5 chunk tile:              {min(cfg.ny, h5_tile_y)} x {min(cfg.nx, h5_tile_x)}")
-    print(f"Weight field time:            {weight_time_s:.6f} s")
-    print(f"Init field time:              {init_time_s:.6f} s")
-    print(f"Pure dynamics compute time:   {pure_dynamics_time_s:.6f} s")
-    print(f"Stats + CSV + HDF5 time:      {output_stats_io_time_s:.6f} s")
-    print(f"Dynamics loop total time:     {loop_total_time_s:.6f} s")
-    print(f"Total measured wall time:     {total_wall_time_s:.6f} s")
+    print(f"HDF5 chunk tile:              {min(cfg.grid_height, h5_tile_y)} x {min(cfg.grid_width, h5_tile_x)}")
+    print("Python backend:               Numba CPU multicore")
+    print(f"Numba warmup time:            {timings.warmup_time:.6f} s")
+    print(f"Weight field time:            {timings.weight_time:.6f} s")
+    print(f"Weight range reduction time:  {timings.weight_range_time:.6f} s")
+    print(f"Init field time:              {timings.init_time:.6f} s")
+    print(f"Pure dynamics compute time:   {timings.pure_dynamics_time:.6f} s")
+    print(f"Statistics time:              {timings.statistics_time:.6f} s")
+    print(f"CSV write time:               {timings.csv_time:.6f} s")
+    print(f"HDF5 write time:              {timings.hdf5_time:.6f} s")
+    print(f"Dynamics loop wall time:      {timings.loop_wall_time:.6f} s")
+    print(f"Total measured wall time:     {timings.total_wall_time:.6f} s")
 
-    if cfg.steps > 0 and pure_dynamics_time_s > 0.0:
+    if cfg.time_steps > 0 and timings.pure_dynamics_time > 0.0:
         print(
             f"Pure dynamics performance:    "
-            f"{updates / pure_dynamics_time_s / 1e9:.6f} GLUP/s"
+            f"{updates / timings.pure_dynamics_time / 1e9:.6f} GLUP/s"
         )
 
-    if cfg.steps > 0 and loop_total_time_s > 0.0:
+    if cfg.time_steps > 0 and timings.loop_wall_time > 0.0:
         print(
             f"End-to-end loop performance:  "
-            f"{updates / loop_total_time_s / 1e9:.6f} GLUP/s"
+            f"{updates / timings.loop_wall_time / 1e9:.6f} GLUP/s"
         )
 
-    print(f"Mean discrepancy:             {discrepancy:.15g}")
+    print(f"Mean discrepancy:             {mean_discrepancy:.15g}")
+    print(f"Final min:                    {final_stats.min_value:.15g}")
+    print(f"Final mean:                   {final_stats.mean_value:.15g}")
+    print(f"Final max:                    {final_stats.max_value:.15g}")
+    print(f"Final std.dev.:               {final_stats.std_dev:.15g}")
+    print(f"Final L2 norm:                {final_stats.l2_norm:.15g}")
+    print(f"Final checksum:               {final_stats.checksum:.15g}")
+    print(f"Weight range:                 {min_weight} ... {max_weight}")
     print("Simulation completed successfully.")
 
 
 # ============================================================
-# MAIN
+# COMMAND LINE
 # ============================================================
 
-def main() -> int:
+def parse_command_line(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="CPU-only CUDA-shaped Numba multicore cooling solver"
+        description="CPU-only Numba multicore cooling solver"
     )
 
     parser.add_argument(
         "input",
         nargs="?",
-        default="input/Cooling.in",
+        default="input_final.in",
         help="Input file",
     )
 
     parser.add_argument(
         "h5",
         nargs="?",
-        default="output/Cooling.h5",
-        help="Output HDF5 file",
+        default="none",
+        help="Output HDF5 file, or 'none' to disable HDF5 output",
     )
 
     parser.add_argument(
         "csv",
         nargs="?",
-        default="output/Statistics.csv",
+        default="Statistics.csv",
         help="Output CSV file",
     )
 
@@ -880,7 +1071,7 @@ def main() -> int:
         default=None,
         help=(
             "Optional snapshot cadence override. "
-            "If omitted and absent from input file, only the final state is written."
+            "0 means final-only; >0 means step 0, periodic snapshots, and final."
         ),
     )
 
@@ -892,10 +1083,15 @@ def main() -> int:
     )
 
     parser.add_argument(
-        "--stats",
-        choices=("accurate", "fast"),
-        default="fast",
-        help="Statistics mode: accurate uses longdouble, fast uses NumPy mean/std",
+        "--no-hdf5",
+        action="store_true",
+        help="Disable HDF5 output",
+    )
+
+    parser.add_argument(
+        "--skip-warmup",
+        action="store_true",
+        help="Do not run explicit Numba JIT warmup",
     )
 
     parser.add_argument(
@@ -912,43 +1108,47 @@ def main() -> int:
         help="HDF5 chunk tile size in x",
     )
 
-    args = parser.parse_args()
+    return parser.parse_args(argv)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_command_line(argv)
 
     if args.threads is not None:
         if args.threads <= 0:
             raise ValueError("--threads must be > 0")
-
         set_num_threads(args.threads)
 
     if args.h5_tile_y <= 0 or args.h5_tile_x <= 0:
         raise ValueError("HDF5 tile sizes must be > 0")
 
-    cfg = read_input(args.input)
+    cfg = read_configuration_file(args.input)
 
-    # Command-line outputEvery overrides input-file outputEvery.
-    # If neither specifies outputEvery, only the final state is written.
     if args.outputEvery is not None:
         validate_output_every(args.outputEvery)
-        cfg.outputEvery = args.outputEvery
-        cfg.hasOutputEvery = True
+        cfg.output_every = args.outputEvery
 
-    if cfg.hasOutputEvery:
-        assert cfg.outputEvery is not None
-        validate_output_every(cfg.outputEvery)
+    validate_output_every(cfg.output_every)
 
-    validate_stats_mode(args.stats)
+    write_hdf5 = (not args.no_hdf5) and (not is_no_hdf5_token(args.h5))
 
     print(f"Input file:                   {args.input}")
-    print(f"HDF5 output:                  {args.h5}")
     print(f"CSV output:                   {args.csv}")
+    print(f"HDF5 output:                  {args.h5 if write_hdf5 else 'disabled'}")
+    print(f"Official grading mode:        {'yes' if not write_hdf5 else 'no'}")
 
     run_simulation(
         cfg=cfg,
         h5_file=args.h5,
         csv_file=args.csv,
-        stats_mode=args.stats,
         h5_tile_y=args.h5_tile_y,
         h5_tile_x=args.h5_tile_x,
+        write_hdf5=write_hdf5,
+        skip_warmup=args.skip_warmup,
     )
 
     return 0
@@ -957,8 +1157,7 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except Exception as e:
-        print(f"CRITICAL ERROR: {e}", file=sys.stderr)
+    except Exception as exc:
+        print(f"CRITICAL ERROR: {exc}", file=sys.stderr)
         raise SystemExit(1)
-
 

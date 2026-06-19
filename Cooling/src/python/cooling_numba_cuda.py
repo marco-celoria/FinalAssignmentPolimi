@@ -1,27 +1,62 @@
 #!/usr/bin/env python3
+"""
+Cooling / field-evolution solver - Numba CUDA reference implementation.
+
+GPU-accelerated parts:
+
+  1) fractal weight field
+  2) temperature initialization
+  3) stencil update + boundary kernels
+
+Host-side by design:
+
+  - HDF5 output
+  - CSV output
+  - snapshot statistics and checksum
+  - weight min/max reduction, intentionally simple for this teaching version
+
+Important design choices:
+
+  - HDF5 output is optional and disabled by default.
+  - Statistics are computed on the host after copying requested snapshots.
+  - outputEvery = 0 means final frame/statistics only.
+  - outputEvery > 0 means step 0, every outputEvery steps, and final step.
+  - CSV statistics include L2_norm and a deterministic checksum.
+
+Official performance mode:
+
+  ./cooling_numba_cuda.py input_final.in none Statistics_numba_cuda.csv 0
+
+or with explicit CUDA device selection:
+
+  ./cooling_numba_cuda.py --device 0 input_final.in none Statistics_numba_cuda.csv 0
+
+Command line:
+
+  ./cooling_numba_cuda.py [options] [inputFile] [h5File|none] [csvFile] [outputEvery]
+
+Examples:
+
+  ./cooling_numba_cuda.py --device 0 input_final.in none Statistics_numba_cuda.csv 0
+  ./cooling_numba_cuda.py --device 0 input_medium.in output.h5 Statistics_numba_cuda.csv 50
+  ./cooling_numba_cuda.py --device 0 --no-hdf5 input_final.in none Statistics_numba_cuda.csv 0
+"""
+
+from __future__ import annotations
 
 import argparse
 import math
+import platform
+import re
 import sys
 import time
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from pathlib import Path
+from typing import Any, List, Optional, Sequence, Tuple
 
-import h5py
+import numba
 import numpy as np
 from numba import cuda
-
-
-# ============================================================
-# OPTIONAL CUPY SUPPORT
-# ============================================================
-
-try:
-    import cupy as cp
-    HAVE_CUPY = True
-except ImportError:
-    cp = None
-    HAVE_CUPY = False
 
 
 # ============================================================
@@ -29,91 +64,202 @@ except ImportError:
 # ============================================================
 
 @dataclass
-class MeasuredPoint:
+class SamplePoint:
     x: float
     y: float
-    v: float
+    value: float
 
 
 @dataclass
-class Config:
-    nx: int
-    ny: int
-    Sreal: float
-    Simag: float
-    Dreal: float
-    Dimag: float
-    maxIters: int
-    steps: int
+class SimulationConfig:
+    grid_width: int
+    grid_height: int
 
-    # outputEvery is optional.
-    # If hasOutputEvery is False, only the final state is written.
-    hasOutputEvery: bool
-    outputEvery: Optional[int]
+    domain_start_x: float
+    domain_start_y: float
+    domain_width: float
+    domain_height: float
 
-    measured: List[MeasuredPoint]
+    max_fractal_iterations: int
+    time_steps: int
+    output_every: int
+
+    measured_points: List[SamplePoint]
+
+
+@dataclass
+class GridMapping:
+    x0: float
+    y0: float
+    dx: float
+    dy: float
+
+
+@dataclass
+class UpdateCoefficients:
+    damping: float
+    step_x: float
+    step_y: float
+    laplace_x: float
+    laplace_y: float
+    coeff_x: float
+    coeff_y: float
+    center_x: float
+    center_y: float
+
+
+@dataclass
+class FieldStatistics:
+    min_value: float
+    mean_value: float
+    max_value: float
+    std_dev: float
+    l2_norm: float
+    checksum: float
+
+
+@dataclass
+class RunTimings:
+    warmup_time: float = 0.0
+    weight_kernel_time: float = 0.0
+    weight_copy_time: float = 0.0
+    weight_range_time: float = 0.0
+    init_kernel_time: float = 0.0
+    pure_dynamics_gpu_time: float = 0.0
+    device_to_host_copy_time: float = 0.0
+    statistics_time: float = 0.0
+    csv_time: float = 0.0
+    hdf5_time: float = 0.0
+    loop_wall_time: float = 0.0
+    total_wall_time: float = 0.0
 
 
 # ============================================================
-# VALIDATION HELPERS
+# VALIDATION / UTILITY
 # ============================================================
 
-def validated_grid_size(nx: int, ny: int) -> int:
-    if nx <= 0 or ny <= 0:
+_INTEGER_RE = re.compile(r"^[+-]?[0-9]+$")
+
+
+def parse_strict_int(token: str) -> int:
+    """
+    Strict integer parser aligned with the C++ baseline behavior.
+    Rejects strings such as '1.0' or '1_000'.
+    """
+    if not _INTEGER_RE.match(token):
+        raise RuntimeError(f"Malformed input: invalid integer token '{token}'")
+    return int(token)
+
+
+def checked_grid_size(grid_width: int, grid_height: int) -> int:
+    if grid_width <= 0 or grid_height <= 0:
         raise ValueError("Grid dimensions must be > 0")
 
-    n = nx * ny
+    total_cells = grid_width * grid_height
 
-    if n <= 0:
+    if total_cells <= 0:
         raise ValueError("Invalid total grid size")
 
-    return n
+    return total_cells
 
 
 def validate_output_every(output_every: int) -> None:
-    if output_every <= 0:
-        raise ValueError("outputEvery must be > 0")
-
-
-def is_power_of_two(x: int) -> bool:
-    return x > 0 and (x & (x - 1)) == 0
+    if output_every < 0:
+        raise ValueError("outputEvery must be >= 0; use 0 for final-only output")
 
 
 def validate_block_sizes(block2d: Tuple[int, int], block1d: int) -> None:
-    bx, by = block2d
+    block_x, block_y = block2d
 
-    if bx <= 0 or by <= 0 or block1d <= 0:
-        raise ValueError("CUDA block sizes must be > 0")
+    if block_x <= 0 or block_y <= 0:
+        raise ValueError("CUDA 2D block dimensions must be > 0")
 
-    if bx * by > 1024:
+    if block1d <= 0:
+        raise ValueError("CUDA 1D block size must be > 0")
+
+    if block_x > 1024 or block_y > 1024 or block1d > 1024:
+        raise ValueError("CUDA block dimensions must not exceed 1024")
+
+    threads_2d = int(block_x) * int(block_y)
+
+    if threads_2d > 1024:
         raise ValueError("2D CUDA block size must have at most 1024 threads")
 
-    if block1d > 1024:
-        raise ValueError("1D CUDA block size must be <= 1024")
 
-    if not is_power_of_two(block1d):
-        raise ValueError("block-1d must be a power of two for the reduction kernel")
+def is_no_hdf5_token(text: str) -> bool:
+    return text in {"none", "NONE", "-", "--no-hdf5"}
+
+
+def ensure_parent_directory_exists(file_name: str) -> None:
+    if not file_name or is_no_hdf5_token(file_name):
+        return
+
+    parent = Path(file_name).expanduser().parent
+
+    if str(parent) in {"", "."}:
+        return
+
+    parent.mkdir(parents=True, exist_ok=True)
+
+    if not parent.is_dir():
+        raise RuntimeError(f"Output path parent exists but is not a directory: {parent}")
+
+
+def cuda_device_name() -> str:
+    device = cuda.get_current_device()
+    name = device.name
+    return name.decode("utf-8", errors="replace") if isinstance(name, bytes) else str(name)
+
+
+def build_output_schedule(final_step: int, output_every: int) -> List[int]:
+    validate_output_every(output_every)
+
+    steps: List[int] = []
+
+    if output_every > 0:
+        steps.append(0)
+
+        step = output_every
+        while step < final_step:
+            steps.append(step)
+            step += output_every
+
+    if not steps or steps[-1] != final_step:
+        steps.append(final_step)
+
+    return steps
+
+
+def should_write_step(step: int, final_step: int, output_every: int) -> bool:
+    if step == final_step:
+        return True
+
+    if output_every <= 0:
+        return False
+
+    if step == 0:
+        return True
+
+    return (step % output_every) == 0
 
 
 # ============================================================
 # INPUT PARSER
 # ============================================================
 
-def read_input(fname: str) -> Config:
+def read_configuration_file(file_name: str) -> SimulationConfig:
     tokens: List[str] = []
 
     try:
-        with open(fname, "r", encoding="utf-8") as f:
+        with open(file_name, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.split("#", 1)[0]
-                parts = line.split()
-                if parts:
-                    tokens.extend(parts)
+                tokens.extend(line.split())
     except OSError as e:
-        raise RuntimeError(f"Cannot open input file: {fname}") from e
+        raise RuntimeError(f"Cannot open input file: {file_name}") from e
 
     if not tokens:
-        raise RuntimeError(f"Input file is empty or contains no numeric tokens: {fname}")
+        raise RuntimeError(f"Input file contains no numeric tokens: {file_name}")
 
     pos = 0
 
@@ -123,13 +269,10 @@ def read_input(fname: str) -> Config:
         if pos >= len(tokens):
             raise RuntimeError("Malformed input: missing integer token")
 
-        tok = tokens[pos]
+        token = tokens[pos]
         pos += 1
 
-        try:
-            return int(tok)
-        except Exception as e:
-            raise RuntimeError(f"Malformed input: invalid integer token '{tok}'") from e
+        return parse_strict_int(token)
 
     def next_float() -> float:
         nonlocal pos
@@ -137,502 +280,414 @@ def read_input(fname: str) -> Config:
         if pos >= len(tokens):
             raise RuntimeError("Malformed input: missing floating-point token")
 
-        tok = tokens[pos]
+        token = tokens[pos]
         pos += 1
 
         try:
-            return float(tok)
+            value = float(token)
         except Exception as e:
-            raise RuntimeError(f"Malformed input: invalid floating-point token '{tok}'") from e
+            raise RuntimeError(f"Malformed input: invalid floating-point token '{token}'") from e
 
-    nx = next_int()
-    ny = next_int()
+        if not math.isfinite(value):
+            raise RuntimeError(f"Malformed input: non-finite floating-point token '{token}'")
 
-    if nx < 3 or ny < 3:
+        return value
+
+    grid_width = next_int()
+    grid_height = next_int()
+
+    if grid_width < 3 or grid_height < 3:
         raise RuntimeError("Grid dimensions must be at least 3 x 3")
 
-    n_measured = next_int()
+    measured_count = next_int()
 
-    if n_measured < 0:
+    if measured_count < 0:
         raise RuntimeError("Number of measured points cannot be negative")
 
-    measured: List[MeasuredPoint] = []
+    measured_points: List[SamplePoint] = []
 
-    for _ in range(n_measured):
-        measured.append(
-            MeasuredPoint(
+    for _ in range(measured_count):
+        measured_points.append(
+            SamplePoint(
                 x=next_float(),
                 y=next_float(),
-                v=next_float(),
+                value=next_float(),
             )
         )
 
-    sreal = next_float()
-    simag = next_float()
-    dreal = next_float()
-    dimag = next_float()
-    max_iters = next_int()
-    steps = next_int()
+    domain_start_x = next_float()
+    domain_start_y = next_float()
+    domain_width = next_float()
+    domain_height = next_float()
+    max_fractal_iterations = next_int()
+    time_steps = next_int()
 
-    if max_iters <= 0:
-        raise RuntimeError("maxIters must be > 0")
+    if max_fractal_iterations <= 0:
+        raise RuntimeError("maxFractalIterations must be > 0")
 
-    if steps < 0:
-        raise RuntimeError("steps must be >= 0")
+    if time_steps < 0:
+        raise RuntimeError("timeSteps must be >= 0")
 
-    if dreal <= 0.0 or dimag <= 0.0:
-        raise RuntimeError("Domain extents Dreal and Dimag must be > 0")
+    if domain_width <= 0.0 or domain_height <= 0.0:
+        raise RuntimeError("domainWidth and domainHeight must be > 0")
 
-    has_output_every = False
-    output_every: Optional[int] = None
+    output_every = 0
 
-    # Optional outputEvery.
-    #
-    # Supported input endings:
-    #
-    #   maxIters steps
-    #
-    # or:
-    #
-    #   maxIters steps outputEvery
-    #
-    # If outputEvery is absent, only the final state is written.
     if pos < len(tokens):
         output_every = next_int()
-        has_output_every = True
         validate_output_every(output_every)
 
     if pos != len(tokens):
         raise RuntimeError("Malformed input: unexpected extra tokens at end of file")
 
-    return Config(
-        nx=nx,
-        ny=ny,
-        Sreal=sreal,
-        Simag=simag,
-        Dreal=dreal,
-        Dimag=dimag,
-        maxIters=max_iters,
-        steps=steps,
-        hasOutputEvery=has_output_every,
-        outputEvery=output_every,
-        measured=measured,
+    return SimulationConfig(
+        grid_width=grid_width,
+        grid_height=grid_height,
+        domain_start_x=domain_start_x,
+        domain_start_y=domain_start_y,
+        domain_width=domain_width,
+        domain_height=domain_height,
+        max_fractal_iterations=max_fractal_iterations,
+        time_steps=time_steps,
+        output_every=output_every,
+        measured_points=measured_points,
     )
 
 
 # ============================================================
-# HOST-SIDE PHYSICS HELPERS
+# HOST-SIDE MODEL HELPERS
 # ============================================================
 
-def build_domain_params(cfg: Config) -> Tuple[float, float, float, float]:
-    x0 = cfg.Sreal
-    y0 = cfg.Simag
-    dx = cfg.Dreal / float(cfg.nx - 1)
-    dy = cfg.Dimag / float(cfg.ny - 1)
+def build_grid_mapping(cfg: SimulationConfig) -> GridMapping:
+    return GridMapping(
+        x0=cfg.domain_start_x,
+        y0=cfg.domain_start_y,
+        dx=cfg.domain_width / float(cfg.grid_width - 1),
+        dy=cfg.domain_height / float(cfg.grid_height - 1),
+    )
 
-    return x0, y0, dx, dy
 
-
-def analytical_field(x: float, y: float) -> float:
+def reference_field(x: float, y: float) -> float:
     return (x * x * x + y * y * y) / 6.0
 
 
-def compute_discrepancy(cfg: Config) -> float:
-    if not cfg.measured:
+def compute_mean_discrepancy(cfg: SimulationConfig) -> float:
+    if not cfg.measured_points:
         return 0.0
 
-    acc = np.longdouble(0.0)
+    total = 0.0
 
-    for m in cfg.measured:
-        acc += np.longdouble(m.v - analytical_field(m.x, m.y))
+    for point in cfg.measured_points:
+        total += point.value - reference_field(point.x, point.y)
 
-    return float(acc / np.longdouble(len(cfg.measured)))
+    return total / float(len(cfg.measured_points))
 
 
-def build_cooling_coeffs(dx: float, dy: float, dd: float = 100.0):
+def build_update_coefficients(
+    dx: float,
+    dy: float,
+    damping: float = 100.0,
+) -> UpdateCoefficients:
     if dx <= 0.0 or dy <= 0.0:
-        raise ValueError("build_cooling_coeffs: dx and dy must be > 0")
+        raise ValueError("build_update_coefficients: dx and dy must be > 0")
 
-    if dd <= 0.0:
-        raise ValueError("build_cooling_coeffs: dd must be > 0")
+    if damping <= 0.0:
+        raise ValueError("build_update_coefficients: damping must be > 0")
 
-    hx = dx
-    hy = dy
+    step_x = dx
+    step_y = dy
 
-    dgx = -2.0 * (1.0 + dd * hx / (hx * hx + dd))
-    dgy = -2.0 * (1.0 + dd * hy / (hy * hy + dd))
+    laplace_x = -2.0 * (1.0 + damping * step_x / (step_x * step_x + damping))
+    laplace_y = -2.0 * (1.0 + damping * step_y / (step_y * step_y + damping))
 
-    CX = (hx + dd * math.exp(hx)) / (15.0 * dd + hx)
-    CY = (hy + dd * math.exp(hy)) / (15.0 * dd + hy)
+    coeff_x = (step_x + damping * math.exp(step_x)) / (15.0 * damping + step_x)
+    coeff_y = (step_y + damping * math.exp(step_y)) / (15.0 * damping + step_y)
 
-    return dd, hx, hy, dgx, dgy, CX, CY
+    center_x = laplace_x + 0.5 / coeff_x
+    center_y = laplace_y + 0.5 / coeff_y
+
+    return UpdateCoefficients(
+        damping=damping,
+        step_x=step_x,
+        step_y=step_y,
+        laplace_x=laplace_x,
+        laplace_y=laplace_y,
+        coeff_x=coeff_x,
+        coeff_y=coeff_y,
+        center_x=center_x,
+        center_y=center_y,
+    )
 
 
 # ============================================================
-# CUDA KERNELS
+# NUMBA CUDA KERNELS
 # ============================================================
 
 @cuda.jit
-def compute_weight_kernel(weight, nx, ny, x0, y0, dx, dy, max_iters):
+def compute_fractal_weights_kernel(
+        weight_field, grid_width, grid_height, x0, y0, dx, dy, max_fractal_iterations,
+    ):
     i, j = cuda.grid(2)
-
-    if i >= nx or j >= ny:
+    if i >= grid_width or j >= grid_height:
         return
-
-    p = i + j * nx
-
+    
+    p = i + j * grid_width
     x = x0 + dx * i
     y = y0 + dy * j
-
-    za = 0.0
-    zb = 0.0
-    it = 0
-
-    while it < max_iters:
-        if za * za + zb * zb > 4.0:
+    z_real = 0.0
+    z_imag = 0.0
+    iteration = 0
+    while iteration < max_fractal_iterations:
+        if z_real * z_real + z_imag * z_imag > 4.0:
             break
-
-        tmp = za * za - zb * zb + x
-        zb = 2.0 * za * zb + y
-        za = tmp
-
-        it += 1
-
-    weight[p] = it
-
+        tmp = z_real * z_real - z_imag * z_imag + x
+        z_imag = 2.0 * z_real * z_imag + y
+        z_real = tmp
+        iteration += 1
+    weight_field[p] = iteration
 
 @cuda.jit
-def initialize_field_kernel(u, weight, nx, ny, x0, y0, dx, dy, discrepancy, wmin, wmax):
+def initialize_temperature_field_kernel(
+        temperature, weight_field, grid_width, grid_height, x0, y0, dx, dy, mean_discrepancy, min_weight, max_weight,
+    ):
     i, j = cuda.grid(2)
-
-    if i >= nx or j >= ny:
+    if i >= grid_width or j >= grid_height:
         return
-
-    p = i + j * nx
-
+    p = i + j * grid_width
     x = x0 + dx * i
     y = y0 + dy * j
-
-    denom = float(wmax - wmin) if wmax > wmin else 1.0
-
-    F = (x * x * x + y * y * y) / 6.0
-    wnorm = (weight[p] - wmin) / denom
-
-    u[p] = 293.16 + 80.0 * (discrepancy + F) * wnorm
-
+    denom = 1.0
+    if max_weight > min_weight:
+        denom = float(max_weight - min_weight)
+    field_value = (x * x * x + y * y * y) / 6.0
+    normalized_weight = float(weight_field[p] - min_weight) / denom
+    temperature[p] = (293.16 + 80.0 * (mean_discrepancy + field_value) * normalized_weight)
 
 @cuda.jit
-def update_interior_kernel(u1, u2, nx, ny, dgx, dgy, CX, CY):
+def update_interior_kernel(
+        current_field, next_field, grid_width, grid_height, center_x, center_y, coeff_x, coeff_y,
+    ):
     i, j = cuda.grid(2)
-
-    if i < 1 or i >= nx - 1 or j < 1 or j >= ny - 1:
+    if i < 1 or i >= grid_width - 1 or j < 1 or j >= grid_height - 1:
         return
-
-    p = i + j * nx
-
-    u2[p] = (
-        CX * (
-            u1[p - 1]
-            + u1[p + 1]
-            + (dgx + 0.5 / CX) * u1[p]
-        )
-        + CY * (
-            u1[p - nx]
-            + u1[p + nx]
-            + (dgy + 0.5 / CY) * u1[p]
-        )
+    p = i + j * grid_width
+    next_field[p] = (
+          coeff_x * (current_field[p - 1] + current_field[p + 1] + center_x * current_field[p])
+        + coeff_y * (current_field[p - grid_width] + current_field[p + grid_width] + center_y * current_field[p])
     )
 
 
 @cuda.jit
-def apply_boundary_all_kernel(u, nx, ny):
-    """
-    Applies the same boundary behavior as the original two-kernel sequence:
+def apply_boundary_left_right_kernel(field, grid_width, grid_height):
+    j = cuda.grid(1)
+    if j < 1 or j >= grid_height - 1:
+        return
+    row = j * grid_width
+    field[row] = field[row + 1]
+    field[row + grid_width - 1] = field[row + grid_width - 2]
 
-      1) left/right edges:
-         u[j,0]     = u[j,1]
-         u[j,nx-1]  = u[j,nx-2]
 
-      2) top/bottom edges after that.
-
-    Corners are written explicitly so the result does not rely on
-    cross-block synchronization.
-    """
-    idx = cuda.grid(1)
-
-    # Left/right edges, excluding corners.
-    if idx < ny - 2:
-        j = idx + 1
-        row = j * nx
-
-        u[row] = u[row + 1]
-        u[row + nx - 1] = u[row + nx - 2]
-
-    # Top/bottom edges, including explicit corner behavior.
-    if idx < nx:
-        top = idx
-        bottom = (ny - 1) * nx + idx
-
-        if idx == 0:
-            u[top] = u[nx + 1]
-            u[bottom] = u[(ny - 2) * nx + 1]
-        elif idx == nx - 1:
-            u[top] = u[nx + nx - 2]
-            u[bottom] = u[(ny - 2) * nx + nx - 2]
-        else:
-            u[top] = u[nx + idx]
-            u[bottom] = u[(ny - 2) * nx + idx]
+@cuda.jit
+def apply_boundary_top_bottom_kernel(field, grid_width, grid_height):
+    i = cuda.grid(1)
+    if i >= grid_width:
+        return
+    field[i] = field[grid_width + i]
+    field[(grid_height - 1) * grid_width + i] = field[(grid_height - 2) * grid_width + i]
 
 
 # ============================================================
-# GPU STATS REDUCTION
+# CUDA LAUNCH HELPERS
 # ============================================================
 
-def make_stats_kernel(block_size: int):
-    @cuda.jit
-    def stats_kernel(u, n, block_min, block_max, block_sum, block_sum2):
-        s_min = cuda.shared.array(block_size, dtype=np.float64)
-        s_max = cuda.shared.array(block_size, dtype=np.float64)
-        s_sum = cuda.shared.array(block_size, dtype=np.float64)
-        s_sum2 = cuda.shared.array(block_size, dtype=np.float64)
-
-        tid = cuda.threadIdx.x
-        gid = cuda.grid(1)
-
-        if gid < n:
-            val = u[gid]
-            s_min[tid] = val
-            s_max[tid] = val
-            s_sum[tid] = val
-            s_sum2[tid] = val * val
-        else:
-            s_min[tid] = 1.0e300
-            s_max[tid] = -1.0e300
-            s_sum[tid] = 0.0
-            s_sum2[tid] = 0.0
-
-        cuda.syncthreads()
-
-        s = cuda.blockDim.x // 2
-
-        while s > 0:
-            if tid < s:
-                other_min = s_min[tid + s]
-                other_max = s_max[tid + s]
-
-                if other_min < s_min[tid]:
-                    s_min[tid] = other_min
-
-                if other_max > s_max[tid]:
-                    s_max[tid] = other_max
-
-                s_sum[tid] += s_sum[tid + s]
-                s_sum2[tid] += s_sum2[tid + s]
-
-            cuda.syncthreads()
-            s //= 2
-
-        if tid == 0:
-            b = cuda.blockIdx.x
-
-            block_min[b] = s_min[0]
-            block_max[b] = s_max[0]
-            block_sum[b] = s_sum[0]
-            block_sum2[b] = s_sum2[0]
-
-    return stats_kernel
-
-
-class GpuStatsReducer:
-    def __init__(self, n: int, block_size: int):
-        if n <= 0:
-            raise ValueError("GpuStatsReducer: n must be > 0")
-
-        if not is_power_of_two(block_size):
-            raise ValueError("GpuStatsReducer: block_size must be a power of two")
-
-        if block_size > 1024:
-            raise ValueError("GpuStatsReducer: block_size must be <= 1024")
-
-        self.n = n
-        self.block_size = block_size
-        self.grid_size = (n + block_size - 1) // block_size
-
-        self.kernel = make_stats_kernel(block_size)
-
-        self.d_min = cuda.device_array(self.grid_size, dtype=np.float64)
-        self.d_max = cuda.device_array(self.grid_size, dtype=np.float64)
-        self.d_sum = cuda.device_array(self.grid_size, dtype=np.float64)
-        self.d_sum2 = cuda.device_array(self.grid_size, dtype=np.float64)
-
-        self.h_min = cuda.pinned_array(self.grid_size, dtype=np.float64)
-        self.h_max = cuda.pinned_array(self.grid_size, dtype=np.float64)
-        self.h_sum = cuda.pinned_array(self.grid_size, dtype=np.float64)
-        self.h_sum2 = cuda.pinned_array(self.grid_size, dtype=np.float64)
-
-    def queue(self, d_u, stream) -> None:
-        self.kernel[self.grid_size, self.block_size, stream](
-            d_u,
-            self.n,
-            self.d_min,
-            self.d_max,
-            self.d_sum,
-            self.d_sum2,
-        )
-
-        self.d_min.copy_to_host(self.h_min, stream=stream)
-        self.d_max.copy_to_host(self.h_max, stream=stream)
-        self.d_sum.copy_to_host(self.h_sum, stream=stream)
-        self.d_sum2.copy_to_host(self.h_sum2, stream=stream)
-
-    def finish_host_reduction(self) -> Tuple[float, float, float, float]:
-        mn = float(np.min(self.h_min))
-        mx = float(np.max(self.h_max))
-
-        total_sum = float(np.sum(self.h_sum))
-        total_sum2 = float(np.sum(self.h_sum2))
-
-        mean = total_sum / float(self.n)
-        var = max(0.0, total_sum2 / float(self.n) - mean * mean)
-        std = math.sqrt(var)
-
-        return mn, mean, mx, std
-
-
-# ============================================================
-# KERNEL LAUNCH HELPERS
-# ============================================================
-
-def grid2d_for(nx: int, ny: int, block2d: Tuple[int, int]) -> Tuple[int, int]:
+def grid2d_for(
+    grid_width: int,
+    grid_height: int,
+    block2d: Tuple[int, int],
+) -> Tuple[int, int]:
+    """Calculate the 2D CUDA grid dimensions from problem size and block size."""
     return (
-        (nx + block2d[0] - 1) // block2d[0],
-        (ny + block2d[1] - 1) // block2d[1],
+        (grid_width + block2d[0] - 1) // block2d[0],
+        (grid_height + block2d[1] - 1) // block2d[1],
     )
 
 
-def launch_compute_weight(
-    d_weight,
-    nx: int,
-    ny: int,
-    x0: float,
-    y0: float,
-    dx: float,
-    dy: float,
-    max_iters: int,
+def launch_compute_fractal_weights(
+    d_weight_field: Any,
+    grid_width: int,
+    grid_height: int,
+    mapping: Any,
+    max_fractal_iterations: int,
     block2d: Tuple[int, int],
-    stream,
+    stream: Any,
 ) -> None:
-    compute_weight_kernel[grid2d_for(nx, ny, block2d), block2d, stream](
-        d_weight,
-        nx,
-        ny,
-        x0,
-        y0,
-        dx,
-        dy,
-        max_iters,
+    grid = grid2d_for(grid_width, grid_height, block2d)
+
+    compute_fractal_weights_kernel[grid, block2d, stream](
+        d_weight_field,
+        grid_width,
+        grid_height,
+        mapping.x0,
+        mapping.y0,
+        mapping.dx,
+        mapping.dy,
+        max_fractal_iterations,
     )
 
 
-def launch_initialize_field(
-    d_u,
-    d_weight,
-    nx: int,
-    ny: int,
-    x0: float,
-    y0: float,
-    dx: float,
-    dy: float,
-    discrepancy: float,
-    wmin: int,
-    wmax: int,
+def launch_initialize_temperature_field(
+    d_temperature: Any,
+    d_weight_field: Any,
+    grid_width: int,
+    grid_height: int,
+    mapping: Any,
+    mean_discrepancy: float,
+    min_weight: int,
+    max_weight: int,
     block2d: Tuple[int, int],
-    stream,
+    stream: Any,
 ) -> None:
-    initialize_field_kernel[grid2d_for(nx, ny, block2d), block2d, stream](
-        d_u,
-        d_weight,
-        nx,
-        ny,
-        x0,
-        y0,
-        dx,
-        dy,
-        discrepancy,
-        wmin,
-        wmax,
+    grid = grid2d_for(grid_width, grid_height, block2d)
+
+    initialize_temperature_field_kernel[grid, block2d, stream](
+        d_temperature,
+        d_weight_field,
+        grid_width,
+        grid_height,
+        mapping.x0,
+        mapping.y0,
+        mapping.dx,
+        mapping.dy,
+        mean_discrepancy,
+        min_weight,
+        max_weight,
     )
 
 
-def launch_update_field(
-    d_u1,
-    d_u2,
-    nx: int,
-    ny: int,
-    dgx: float,
-    dgy: float,
-    CX: float,
-    CY: float,
+def launch_advance_temperature_field(
+    d_current_field: Any,
+    d_next_field: Any,
+    grid_width: int,
+    grid_height: int,
+    coeffs: Any,
     block2d: Tuple[int, int],
     block1d: int,
-    stream,
+    stream: Any,
 ) -> None:
-    update_interior_kernel[grid2d_for(nx, ny, block2d), block2d, stream](
-        d_u1,
-        d_u2,
-        nx,
-        ny,
-        dgx,
-        dgy,
-        CX,
-        CY,
+    # 1. Update interior.
+    grid2d = grid2d_for(grid_width, grid_height, block2d)
+
+    update_interior_kernel[grid2d, block2d, stream](
+        d_current_field,
+        d_next_field,
+        grid_width,
+        grid_height,
+        coeffs.center_x,
+        coeffs.center_y,
+        coeffs.coeff_x,
+        coeffs.coeff_y,
     )
 
-    n_boundary_work = max(nx, ny - 2)
-    grid1d = (n_boundary_work + block1d - 1) // block1d
+    # 2. Apply left/right boundaries, excluding corners.
+    grid_y = (grid_height + block1d - 1) // block1d
 
-    apply_boundary_all_kernel[grid1d, block1d, stream](d_u2, nx, ny)
+    apply_boundary_left_right_kernel[grid_y, block1d, stream](
+        d_next_field,
+        grid_width,
+        grid_height,
+    )
+
+    # 3. Apply top/bottom boundaries, including corners.
+    grid_x = (grid_width + block1d - 1) // block1d
+
+    apply_boundary_top_bottom_kernel[grid_x, block1d, stream](
+        d_next_field,
+        grid_width,
+        grid_height,
+    )
+
+
+def advance_temperature_field_steps(
+    d_current_field: Any,
+    d_next_field: Any,
+    number_of_steps: int,
+    grid_width: int,
+    grid_height: int,
+    coeffs: Any,
+    block2d: Tuple[int, int],
+    block1d: int,
+    stream: Any,
+) -> Tuple[Any, Any]:
+    """Run multiple timesteps and return the current/next device buffers."""
+    if number_of_steps < 0:
+        raise ValueError("number_of_steps must be >= 0")
+
+    current = d_current_field
+    nxt = d_next_field
+
+    for _ in range(number_of_steps):
+        launch_advance_temperature_field(
+            current,
+            nxt,
+            grid_width,
+            grid_height,
+            coeffs,
+            block2d,
+            block1d,
+            stream,
+        )
+
+        current, nxt = nxt, current
+
+    return current, nxt
 
 
 # ============================================================
 # HDF5 WRITER
 # ============================================================
 
-class H5Writer:
+class TimeSeriesWriter:
     def __init__(
         self,
-        fname: str,
-        nx: int,
-        ny: int,
+        file_name: str,
+        grid_width: int,
+        grid_height: int,
         batch: int = 32,
         tile_y: int = 256,
         tile_x: int = 256,
     ):
-        if nx <= 0 or ny <= 0:
-            raise ValueError("H5Writer: nx and ny must be > 0")
+        if grid_width <= 0 or grid_height <= 0:
+            raise ValueError("TimeSeriesWriter: grid dimensions must be > 0")
 
         if batch <= 0:
-            raise ValueError("H5Writer: batch must be > 0")
+            raise ValueError("TimeSeriesWriter: batch must be > 0")
 
         if tile_y <= 0 or tile_x <= 0:
-            raise ValueError("H5Writer: tile sizes must be > 0")
+            raise ValueError("TimeSeriesWriter: tile sizes must be > 0")
 
-        self.nx = nx
-        self.ny = ny
+        try:
+            import h5py
+        except ImportError as e:
+            raise RuntimeError(
+                "h5py is required for HDF5 output; use --no-hdf5 to disable it"
+            ) from e
+
+        self.grid_width = grid_width
+        self.grid_height = grid_height
         self.batch = batch
-        self.frame = 0
+        self.frame_count = 0
         self.capacity = batch
         self.closed = False
 
-        chunk_y = min(ny, tile_y)
-        chunk_x = min(nx, tile_x)
+        chunk_y = min(grid_height, tile_y)
+        chunk_x = min(grid_width, tile_x)
 
-        self.file = h5py.File(fname, "w")
+        self.file = h5py.File(file_name, "w")
 
         self.field = self.file.create_dataset(
             "field",
-            shape=(0, ny, nx),
-            maxshape=(None, ny, nx),
+            shape=(0, grid_height, grid_width),
+            maxshape=(None, grid_height, grid_width),
             chunks=(1, chunk_y, chunk_x),
             dtype=np.float64,
         )
@@ -647,434 +702,480 @@ class H5Writer:
 
         self._extend(self.capacity)
 
-    def _extend(self, n: int) -> None:
-        self.field.resize((n, self.ny, self.nx))
-        self.step.resize((n,))
+    def _extend(self, new_size: int) -> None:
+        self.field.resize((new_size, self.grid_height, self.grid_width))
+        self.step.resize((new_size,))
 
-    def write(self, step_number: int, field_1d: np.ndarray) -> None:
+    def write_frame(self, step_number: int, field_1d: np.ndarray) -> None:
         if self.closed:
-            raise RuntimeError("H5Writer: write() called after close()")
+            raise RuntimeError("TimeSeriesWriter: write_frame() called after close()")
 
-        if field_1d.size != self.nx * self.ny:
-            raise RuntimeError("H5Writer: field size mismatch")
+        if field_1d.size != self.grid_width * self.grid_height:
+            raise RuntimeError("TimeSeriesWriter: field size mismatch")
 
-        if self.frame >= self.capacity:
+        if self.frame_count >= self.capacity:
             self.capacity += self.batch
             self._extend(self.capacity)
 
-        self.field[self.frame, :, :] = field_1d.reshape(self.ny, self.nx)
-        self.step[self.frame] = np.int32(step_number)
-        self.frame += 1
+        self.field[self.frame_count, :, :] = field_1d.reshape(
+            self.grid_height,
+            self.grid_width,
+        )
+        self.step[self.frame_count] = np.int32(step_number)
+        self.frame_count += 1
 
     def close(self) -> None:
         if self.closed:
             return
 
-        if self.frame != self.capacity:
-            self._extend(self.frame)
+        if self.frame_count != self.capacity:
+            self._extend(self.frame_count)
 
         self.file.flush()
         self.file.close()
         self.closed = True
 
-    def __enter__(self):
+    def __enter__(self) -> "TimeSeriesWriter":
         return self
 
-    def __exit__(self, exc_type, exc, tb):
+    def __exit__(self, exc_type, exc, tb) -> bool:
         self.close()
         return False
 
 
 # ============================================================
-# CSV STATS WRITER
+# STATISTICS
 # ============================================================
 
-def write_stats_header(f) -> None:
-    f.write("Step;Min;Mean;Max;Std_dev\n")
+def compute_field_statistics(field: np.ndarray) -> FieldStatistics:
+    if field.size == 0:
+        raise RuntimeError("compute_field_statistics: empty field")
+
+    min_value = float(np.min(field))
+    max_value = float(np.max(field))
+
+    sum_value = float(np.sum(field, dtype=np.float64))
+    mean_value = sum_value / float(field.size)
+
+    sum_squares = float(np.sum(field * field, dtype=np.float64))
+    l2_norm = float(np.sqrt(sum_squares))
+
+    checksum_weights = (
+        (np.arange(field.size, dtype=np.uint64) % np.uint64(1009))
+        + np.uint64(1)
+    )
+    checksum = float(
+        np.sum(field * checksum_weights.astype(np.float64), dtype=np.float64)
+    )
+
+    diff = field - mean_value
+    std_dev = float(
+        np.sqrt(np.sum(diff * diff, dtype=np.float64) / float(field.size))
+    )
+
+    return FieldStatistics(
+        min_value=min_value,
+        mean_value=mean_value,
+        max_value=max_value,
+        std_dev=std_dev,
+        l2_norm=l2_norm,
+        checksum=checksum,
+    )
 
 
-def write_stats_line(f, step: int, stats: Tuple[float, float, float, float]) -> None:
-    mn, mean, mx, std = stats
-    f.write(f"{step};{mn:.15g};{mean:.15g};{mx:.15g};{std:.15g}\n")
+def write_statistics_header(f) -> None:
+    f.write("Step;Min;Mean;Max;Std_dev;L2_norm;Checksum\n")
+
+
+def write_statistics_row(f, step: int, stats: FieldStatistics) -> None:
+    f.write(
+        f"{step};"
+        f"{stats.min_value:.15g};"
+        f"{stats.mean_value:.15g};"
+        f"{stats.max_value:.15g};"
+        f"{stats.std_dev:.15g};"
+        f"{stats.l2_norm:.15g};"
+        f"{stats.checksum:.15g}\n"
+    )
 
 
 # ============================================================
-# TIMING HELPERS
+# CUDA TIMING / WARMUP
 # ============================================================
 
-def elapsed_event_seconds(start_evt, stop_evt) -> float:
-    return cuda.event_elapsed_time(start_evt, stop_evt) / 1000.0
+def elapsed_event_seconds(start_event, stop_event) -> float:
+    return cuda.event_elapsed_time(start_event, stop_event) / 1000.0
 
 
-def get_weight_minmax(
-    d_weight,
-    n: int,
-    pinned_fallback: Optional[np.ndarray],
-) -> Tuple[int, int, float, str]:
-    """
-    Returns:
-      wmin, wmax, wall_time_seconds, method_name
-    """
-    t0 = time.perf_counter()
+def time_cuda_segment(callable_fn, stream) -> float:
+    start_event = cuda.event()
+    stop_event = cuda.event()
 
-    if HAVE_CUPY:
-        cp_weight = cp.asarray(d_weight)
-        wmin = int(cp_weight.min().get())
-        wmax = int(cp_weight.max().get())
-        method = "CuPy device reduction"
-    else:
-        if pinned_fallback is None or pinned_fallback.size != n:
-            pinned_fallback = cuda.pinned_array(n, dtype=np.int32)
+    start_event.record(stream)
+    callable_fn()
+    stop_event.record(stream)
+    stop_event.synchronize()
 
-        d_weight.copy_to_host(pinned_fallback)
+    return elapsed_event_seconds(start_event, stop_event)
 
-        wmin = int(np.min(pinned_fallback))
-        wmax = int(np.max(pinned_fallback))
-        method = "host fallback reduction"
 
-    t1 = time.perf_counter()
+def warmup_cuda(
+    block2d: Tuple[int, int],
+    block1d: int,
+    verbose: bool = True,
+) -> float:
+    if verbose:
+        print("Warming up Numba CUDA compiler...")
 
-    return wmin, wmax, t1 - t0, method
+    start = time.perf_counter()
+
+    grid_width = 4
+    grid_height = 4
+    total_cells = grid_width * grid_height
+
+    mapping = GridMapping(0.0, 0.0, 0.1, 0.1)
+    coeffs = build_update_coefficients(mapping.dx, mapping.dy, 100.0)
+
+    d_weight_field = cuda.device_array(total_cells, dtype=np.int32)
+    d_current_field = cuda.device_array(total_cells, dtype=np.float64)
+    d_next_field = cuda.device_array(total_cells, dtype=np.float64)
+
+    stream = cuda.stream()
+
+    launch_compute_fractal_weights(
+        d_weight_field,
+        grid_width,
+        grid_height,
+        mapping,
+        2,
+        block2d,
+        stream,
+    )
+
+    launch_initialize_temperature_field(
+        d_current_field,
+        d_weight_field,
+        grid_width,
+        grid_height,
+        mapping,
+        0.0,
+        0,
+        1,
+        block2d,
+        stream,
+    )
+
+    launch_advance_temperature_field(
+        d_current_field,
+        d_next_field,
+        grid_width,
+        grid_height,
+        coeffs,
+        block2d,
+        block1d,
+        stream,
+    )
+
+    stream.synchronize()
+
+    elapsed = time.perf_counter() - start
+
+    if verbose:
+        print("CUDA warmup completed; reported timings exclude compilation.")
+
+    return elapsed
+
+
+def maybe_get_h5py_version(write_hdf5: bool) -> str:
+    if not write_hdf5:
+        return "disabled"
+
+    try:
+        import h5py
+        return h5py.__version__
+    except Exception:
+        return "unavailable"
 
 
 # ============================================================
-# HOST-SIDE DRIVER
+# SIMULATION DRIVER
 # ============================================================
 
 def run_simulation(
-    cfg: Config,
+    cfg: SimulationConfig,
     h5_file: str,
     csv_file: str,
-    block2d: Tuple[int, int] = (16, 16),
-    block1d: int = 256,
+    h5_tile_y: int,
+    h5_tile_x: int,
+    block2d: Tuple[int, int],
+    block1d: int,
+    write_hdf5: bool,
+    skip_warmup: bool,
 ) -> None:
     if not cuda.is_available():
         raise RuntimeError("CUDA is not available")
 
     validate_block_sizes(block2d, block1d)
+    validate_output_every(cfg.output_every)
 
-    if cfg.hasOutputEvery:
-        if cfg.outputEvery is None:
-            raise ValueError("Internal error: hasOutputEvery is true but outputEvery is None")
-        validate_output_every(cfg.outputEvery)
+    ensure_parent_directory_exists(csv_file)
 
-    n = validated_grid_size(cfg.nx, cfg.ny)
+    if write_hdf5:
+        ensure_parent_directory_exists(h5_file)
 
-    x0, y0, dx, dy = build_domain_params(cfg)
-    _, _, _, dgx, dgy, CX, CY = build_cooling_coeffs(dx, dy, 100.0)
-    discrepancy = compute_discrepancy(cfg)
+    total_cells = checked_grid_size(cfg.grid_width, cfg.grid_height)
+
+    mapping = build_grid_mapping(cfg)
+    coeffs = build_update_coefficients(mapping.dx, mapping.dy, 100.0)
+    mean_discrepancy = compute_mean_discrepancy(cfg)
 
     stream = cuda.stream()
 
-    d_weight = cuda.device_array(n, dtype=np.int32)
-    d_u_curr = cuda.device_array(n, dtype=np.float64)
-    d_u_next = cuda.device_array(n, dtype=np.float64)
+    d_weight_field = cuda.device_array(total_cells, dtype=np.int32)
+    d_current_field = cuda.device_array(total_cells, dtype=np.float64)
+    d_next_field = cuda.device_array(total_cells, dtype=np.float64)
 
-    u_host_pinned = cuda.pinned_array(n, dtype=np.float64)
-    weight_host_pinned = None if HAVE_CUPY else cuda.pinned_array(n, dtype=np.int32)
+    host_field = cuda.pinned_array(total_cells, dtype=np.float64)
+    host_weight_field = cuda.pinned_array(total_cells, dtype=np.int32)
 
-    stats_reducer = GpuStatsReducer(n=n, block_size=block1d)
+    timings = RunTimings()
 
-    # --------------------------------------------------------
-    # Warm-up / JIT compilation
-    # --------------------------------------------------------
-    print("Warming up CUDA compiler...")
+    if not skip_warmup:
+        timings.warmup_time = warmup_cuda(block2d, block1d, verbose=True)
+    else:
+        print("Skipping explicit CUDA warmup; first-call compilation time may be included in timings.")
 
-    launch_compute_weight(
-        d_weight=d_weight,
-        nx=3,
-        ny=3,
-        x0=x0,
-        y0=y0,
-        dx=dx,
-        dy=dy,
-        max_iters=2,
-        block2d=block2d,
-        stream=stream,
+    total_wall_start = time.perf_counter()
+
+    timings.weight_kernel_time = time_cuda_segment(
+        lambda: launch_compute_fractal_weights(
+            d_weight_field,
+            cfg.grid_width,
+            cfg.grid_height,
+            mapping,
+            cfg.max_fractal_iterations,
+            block2d,
+            stream,
+        ),
+        stream,
     )
 
-    launch_initialize_field(
-        d_u=d_u_curr,
-        d_weight=d_weight,
-        nx=3,
-        ny=3,
-        x0=x0,
-        y0=y0,
-        dx=dx,
-        dy=dy,
-        discrepancy=0.0,
-        wmin=0,
-        wmax=1,
-        block2d=block2d,
-        stream=stream,
+    copy_start = time.perf_counter()
+    d_weight_field.copy_to_host(host_weight_field, stream=stream)
+    stream.synchronize()
+    timings.weight_copy_time = time.perf_counter() - copy_start
+
+    range_start = time.perf_counter()
+    min_weight = int(np.min(host_weight_field))
+    max_weight = int(np.max(host_weight_field))
+    timings.weight_range_time = time.perf_counter() - range_start
+
+    timings.init_kernel_time = time_cuda_segment(
+        lambda: launch_initialize_temperature_field(
+            d_current_field,
+            d_weight_field,
+            cfg.grid_width,
+            cfg.grid_height,
+            mapping,
+            mean_discrepancy,
+            min_weight,
+            max_weight,
+            block2d,
+            stream,
+        ),
+        stream,
     )
 
-    launch_update_field(
-        d_u1=d_u_curr,
-        d_u2=d_u_next,
-        nx=3,
-        ny=3,
-        dgx=dgx,
-        dgy=dgy,
-        CX=CX,
-        CY=CY,
-        block2d=block2d,
-        block1d=block1d,
-        stream=stream,
+    output_schedule = build_output_schedule(cfg.time_steps, cfg.output_every)
+
+    output_frames = 0
+    final_stats = FieldStatistics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    writer_ctx = (
+        TimeSeriesWriter(
+            h5_file,
+            cfg.grid_width,
+            cfg.grid_height,
+            32,
+            h5_tile_y,
+            h5_tile_x,
+        )
+        if write_hdf5
+        else None
     )
+    
+    loop_start = time.perf_counter()
+
+    try:
+        with open(csv_file, "w", encoding="utf-8") as csvf:
+            csv_start = time.perf_counter()
+            write_statistics_header(csvf)
+            timings.csv_time += time.perf_counter() - csv_start
+
+            writer = writer_ctx
+
+            def write_output_frame(step: int) -> None:
+                nonlocal output_frames, final_stats, d_current_field
+
+                copy_start2 = time.perf_counter()
+                d_current_field.copy_to_host(host_field, stream=stream)
+                stream.synchronize()
+                timings.device_to_host_copy_time += time.perf_counter() - copy_start2
+
+                stats_start = time.perf_counter()
+                stats = compute_field_statistics(host_field)
+                timings.statistics_time += time.perf_counter() - stats_start
+
+                final_stats = stats
+
+                csv_frame_start = time.perf_counter()
+                write_statistics_row(csvf, step, stats)
+                timings.csv_time += time.perf_counter() - csv_frame_start
+
+                if writer is not None:
+                    hdf5_start = time.perf_counter()
+                    writer.write_frame(step, host_field)
+                    timings.hdf5_time += time.perf_counter() - hdf5_start
+
+                output_frames += 1
+
+            current_step = 0
+
+            for target_step in output_schedule:
+                if target_step < current_step or target_step > cfg.time_steps:
+                    raise RuntimeError("Internal error: invalid output schedule")
+
+                steps_to_advance = target_step - current_step
+
+                if steps_to_advance > 0:
+                    def do_steps() -> None:
+                        nonlocal d_current_field, d_next_field
+
+                        d_current_field, d_next_field = advance_temperature_field_steps(
+                            d_current_field,
+                            d_next_field,
+                            steps_to_advance,
+                            cfg.grid_width,
+                            cfg.grid_height,
+                            coeffs,
+                            block2d,
+                            block1d,
+                            stream,
+                        )
+
+                    timings.pure_dynamics_gpu_time += time_cuda_segment(do_steps, stream)
+                    current_step = target_step
+
+                if should_write_step(target_step, cfg.time_steps, cfg.output_every):
+                    write_output_frame(target_step)
+
+            csvf.flush()
+
+            if writer is not None:
+                writer.close()
+
+    finally:
+        if writer_ctx is not None and not writer_ctx.closed:
+            writer_ctx.close()
 
     stream.synchronize()
 
-    # --------------------------------------------------------
-    # Main timed execution
-    # --------------------------------------------------------
-    total_wall_t0 = time.perf_counter()
+    timings.loop_wall_time = time.perf_counter() - loop_start
+    timings.total_wall_time = time.perf_counter() - total_wall_start
 
-    # -----------------------------
-    # Weight field
-    # -----------------------------
-    weight_start = cuda.event()
-    weight_stop = cuda.event()
-
-    weight_start.record(stream)
-
-    launch_compute_weight(
-        d_weight=d_weight,
-        nx=cfg.nx,
-        ny=cfg.ny,
-        x0=x0,
-        y0=y0,
-        dx=dx,
-        dy=dy,
-        max_iters=cfg.maxIters,
-        block2d=block2d,
-        stream=stream,
+    updates = (
+        float(cfg.grid_width - 2)
+        * float(cfg.grid_height - 2)
+        * float(cfg.time_steps)
     )
 
-    weight_stop.record(stream)
-    weight_stop.synchronize()
+    print(f"Grid:                         {cfg.grid_width} x {cfg.grid_height}")
+    print(f"Measured points:              {len(cfg.measured_points)}")
+    print(f"Max fractal iterations:       {cfg.max_fractal_iterations}")
+    print(f"Time steps:                   {cfg.time_steps}")
 
-    weight_gpu_s = elapsed_event_seconds(weight_start, weight_stop)
-
-    wmin, wmax, minmax_wall_s, minmax_method = get_weight_minmax(
-        d_weight=d_weight,
-        n=n,
-        pinned_fallback=weight_host_pinned,
-    )
-
-    # -----------------------------
-    # Initialization field
-    # -----------------------------
-    init_start = cuda.event()
-    init_stop = cuda.event()
-
-    init_start.record(stream)
-
-    launch_initialize_field(
-        d_u=d_u_curr,
-        d_weight=d_weight,
-        nx=cfg.nx,
-        ny=cfg.ny,
-        x0=x0,
-        y0=y0,
-        dx=dx,
-        dy=dy,
-        discrepancy=discrepancy,
-        wmin=wmin,
-        wmax=wmax,
-        block2d=block2d,
-        stream=stream,
-    )
-
-    init_stop.record(stream)
-    init_stop.synchronize()
-
-    init_gpu_s = elapsed_event_seconds(init_start, init_stop)
-
-    # -----------------------------
-    # Output/timestep pipeline
-    # -----------------------------
-    pipeline_gpu_ms = 0.0
-    output_frames = 0
-    last_written_step: Optional[int] = None
-
-    segment_start = cuda.event()
-    segment_stop = cuda.event()
-    segment_running = False
-
-    def start_gpu_segment() -> None:
-        nonlocal segment_running
-
-        if not segment_running:
-            segment_start.record(stream)
-            segment_running = True
-
-    def stop_gpu_segment_and_sync() -> float:
-        nonlocal segment_running
-
-        if not segment_running:
-            return 0.0
-
-        segment_stop.record(stream)
-        segment_stop.synchronize()
-
-        segment_running = False
-
-        return cuda.event_elapsed_time(segment_start, segment_stop)
-
-    loop_wall_t0 = time.perf_counter()
-
-    with open(csv_file, "w", encoding="utf-8") as csvf:
-        write_stats_header(csvf)
-
-        with H5Writer(h5_file, cfg.nx, cfg.ny, batch=32) as writer:
-
-            def write_output_frame(step: int) -> None:
-                nonlocal pipeline_gpu_ms
-                nonlocal output_frames
-                nonlocal last_written_step
-
-                if last_written_step == step:
-                    return
-
-                # Queue stats reduction and device-to-host copy in the same stream.
-                stats_reducer.queue(d_u_curr, stream=stream)
-                d_u_curr.copy_to_host(u_host_pinned, stream=stream)
-
-                # Stop and synchronize the active GPU segment so host-side
-                # reduction/HDF5/CSV see valid data.
-                pipeline_gpu_ms += stop_gpu_segment_and_sync()
-
-                stats = stats_reducer.finish_host_reduction()
-                write_stats_line(csvf, step, stats)
-                writer.write(step, u_host_pinned)
-
-                last_written_step = step
-                output_frames += 1
-
-            # If outputEvery was explicitly specified, write initial condition.
-            # If absent, do not output step 0; only final state is written later.
-            start_gpu_segment()
-
-            if cfg.hasOutputEvery:
-                write_output_frame(0)
-
-                # Start a fresh timing segment for subsequent dynamics.
-                start_gpu_segment()
-
-            for step in range(1, cfg.steps + 1):
-                launch_update_field(
-                    d_u1=d_u_curr,
-                    d_u2=d_u_next,
-                    nx=cfg.nx,
-                    ny=cfg.ny,
-                    dgx=dgx,
-                    dgy=dgy,
-                    CX=CX,
-                    CY=CY,
-                    block2d=block2d,
-                    block1d=block1d,
-                    stream=stream,
-                )
-
-                d_u_curr, d_u_next = d_u_next, d_u_curr
-
-                # Periodic output only when outputEvery was explicitly specified.
-                if cfg.hasOutputEvery:
-                    assert cfg.outputEvery is not None
-
-                    if (step % cfg.outputEvery) == 0:
-                        write_output_frame(step)
-
-                        # Continue timing subsequent GPU work, unless this was
-                        # the last step and the final write would be duplicate.
-                        if step < cfg.steps:
-                            start_gpu_segment()
-
-            # Always write final state.
-            # If it was already written by periodic output, this skips it.
-            write_output_frame(cfg.steps)
-
-            # If no output occurred inside the loop before final output, the final
-            # write already stopped/synchronized the segment. If the final write was
-            # skipped as duplicate, there should be no active segment unless one was
-            # intentionally restarted, but this guard is harmless and avoids leaving
-            # pending work unsynchronized.
-            pipeline_gpu_ms += stop_gpu_segment_and_sync()
-
-    loop_wall_s = time.perf_counter() - loop_wall_t0
-    total_wall_s = time.perf_counter() - total_wall_t0
-
-    pipeline_gpu_s = pipeline_gpu_ms / 1000.0
-
-    updates = float(cfg.nx - 2) * float(cfg.ny - 2) * float(cfg.steps)
-
-    # --------------------------------------------------------
-    # Reporting
-    # --------------------------------------------------------
-    print(f"Grid:                         {cfg.nx} x {cfg.ny}")
-    print(f"Measured points:              {len(cfg.measured)}")
-    print(f"Max iterations:               {cfg.maxIters}")
-    print(f"Time steps:                   {cfg.steps}")
-
-    if cfg.hasOutputEvery:
-        assert cfg.outputEvery is not None
-        print(f"Snapshot every:               {cfg.outputEvery} step(s)")
+    if cfg.output_every == 0:
+        print("Snapshot/statistics policy:    final step only")
     else:
-        print("Snapshot every:               final step only")
+        print(
+            "Snapshot/statistics policy:    "
+            f"step 0, every {cfg.output_every} step(s), and final step"
+        )
 
     print(f"Output frames:                {output_frames}")
+    print(f"Python version:               {platform.python_version()}")
+    print(f"NumPy version:                {np.__version__}")
+    print(f"Numba version:                {numba.__version__}")
+    print(f"h5py version:                 {maybe_get_h5py_version(write_hdf5)}")
+    print(f"CUDA available:               {cuda.is_available()}")
+    print(f"CUDA device:                  {cuda_device_name()}")
+    print(f"HDF5 chunk tile:              {min(cfg.grid_height, h5_tile_y)} x {min(cfg.grid_width, h5_tile_x)}")
     print(f"CUDA block2d:                 {block2d}")
     print(f"CUDA block1d:                 {block1d}")
-    print(f"CuPy available:               {HAVE_CUPY}")
-    print(f"Weight min/max method:        {minmax_method}")
-    print(f"Weight kernel GPU time:       {weight_gpu_s:.6f} s")
-    print(f"Weight min/max wall time:     {minmax_wall_s:.6f} s")
-    print(f"Init field GPU time:          {init_gpu_s:.6f} s")
-    print(f"Pipeline GPU time:            {pipeline_gpu_s:.6f} s")
-    print(f"Loop wall time incl. I/O:     {loop_wall_s:.6f} s")
-    print(f"Total wall time:              {total_wall_s:.6f} s")
+    print("CUDA backend:                 Numba CUDA")
+    print(f"CUDA warmup time:             {timings.warmup_time:.6f} s")
+    print(f"Weight field GPU time:        {timings.weight_kernel_time:.6f} s")
+    print(f"Weight D2H copy time:         {timings.weight_copy_time:.6f} s")
+    print(f"Weight range reduction time:  {timings.weight_range_time:.6f} s")
+    print(f"Init kernel GPU time:         {timings.init_kernel_time:.6f} s")
+    print(f"Pure dynamics GPU time:       {timings.pure_dynamics_gpu_time:.6f} s")
+    print(f"Device-to-host copy time:     {timings.device_to_host_copy_time:.6f} s")
+    print(f"Statistics time:              {timings.statistics_time:.6f} s")
+    print(f"CSV write time:               {timings.csv_time:.6f} s")
+    print(f"HDF5 write time:              {timings.hdf5_time:.6f} s")
+    print(f"Dynamics loop wall time:      {timings.loop_wall_time:.6f} s")
+    print(f"Total measured wall time:     {timings.total_wall_time:.6f} s")
 
-    if cfg.steps > 0 and pipeline_gpu_s > 0.0:
-        print(f"GPU pipeline performance:     {updates / pipeline_gpu_s / 1e9:.6f} GLUP/s")
+    if cfg.time_steps > 0 and timings.pure_dynamics_gpu_time > 0.0:
+        print(
+            f"Pure dynamics performance:    "
+            f"{updates / timings.pure_dynamics_gpu_time / 1e9:.6f} GLUP/s"
+        )
 
-    if cfg.steps > 0 and loop_wall_s > 0.0:
-        print(f"End-to-end loop performance:  {updates / loop_wall_s / 1e9:.6f} GLUP/s")
+    if cfg.time_steps > 0 and timings.loop_wall_time > 0.0:
+        print(
+            f"End-to-end loop performance:  "
+            f"{updates / timings.loop_wall_time / 1e9:.6f} GLUP/s"
+        )
 
-    print(f"Mean discrepancy:             {discrepancy:.15g}")
+    print(f"Mean discrepancy:             {mean_discrepancy:.15g}")
+    print(f"Final min:                    {final_stats.min_value:.15g}")
+    print(f"Final mean:                   {final_stats.mean_value:.15g}")
+    print(f"Final max:                    {final_stats.max_value:.15g}")
+    print(f"Final std.dev.:               {final_stats.std_dev:.15g}")
+    print(f"Final L2 norm:                {final_stats.l2_norm:.15g}")
+    print(f"Final checksum:               {final_stats.checksum:.15g}")
+    print(f"Weight range:                 {min_weight} ... {max_weight}")
     print("Simulation completed successfully.")
 
 
 # ============================================================
-# MAIN
+# COMMAND LINE
 # ============================================================
 
-def main() -> int:
+def parse_command_line(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Numba CUDA cooling solver with robust timing, pinned buffers, "
-            "optional CuPy reductions, and optional output cadence"
-        )
+        description="Numba CUDA cooling solver"
     )
 
     parser.add_argument(
         "input",
         nargs="?",
-        default="input/Cooling.in",
+        default="input_final.in",
         help="Input file",
     )
 
     parser.add_argument(
         "h5",
         nargs="?",
-        default="output/Cooling.h5",
-        help="Output HDF5 file",
+        default="none",
+        help="Output HDF5 file, or 'none' to disable HDF5 output",
     )
 
     parser.add_argument(
         "csv",
         nargs="?",
-        default="output/Statistics.csv",
+        default="Statistics.csv",
         help="Output CSV file",
     )
 
@@ -1085,8 +1186,15 @@ def main() -> int:
         default=None,
         help=(
             "Optional snapshot cadence override. "
-            "If omitted and absent from input file, only the final state is written."
+            "0 means final-only; >0 means step 0, periodic snapshots, and final."
         ),
+    )
+
+    parser.add_argument(
+        "--device",
+        type=int,
+        default=0,
+        help="CUDA device index",
     )
 
     parser.add_argument(
@@ -1104,42 +1212,88 @@ def main() -> int:
     )
 
     parser.add_argument(
+        "--block1d",
         "--block-1d",
+        dest="block1d",
         type=int,
         default=256,
-        help="CUDA block size for 1D kernels and reductions. Must be a power of two.",
+        help="CUDA block size for 1D boundary kernels",
     )
 
-    args = parser.parse_args()
+    parser.add_argument(
+        "--no-hdf5",
+        action="store_true",
+        help="Disable HDF5 output",
+    )
 
-    cfg = read_input(args.input)
+    parser.add_argument(
+        "--skip-warmup",
+        action="store_true",
+        help="Do not run explicit Numba CUDA warmup",
+    )
 
-    # Command-line outputEvery overrides input-file outputEvery.
-    # If neither specifies outputEvery, only the final state is written.
-    if args.outputEvery is not None:
-        validate_output_every(args.outputEvery)
-        cfg.outputEvery = args.outputEvery
-        cfg.hasOutputEvery = True
+    parser.add_argument(
+        "--h5-tile-y",
+        type=int,
+        default=256,
+        help="HDF5 chunk tile size in y",
+    )
 
-    if cfg.hasOutputEvery:
-        assert cfg.outputEvery is not None
-        validate_output_every(cfg.outputEvery)
+    parser.add_argument(
+        "--h5-tile-x",
+        type=int,
+        default=256,
+        help="HDF5 chunk tile size in x",
+    )
+
+    return parser.parse_args(argv)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_command_line(argv)
+
+    if args.h5_tile_y <= 0 or args.h5_tile_x <= 0:
+        raise ValueError("HDF5 tile sizes must be > 0")
 
     block2d = (args.block_x, args.block_y)
-    block1d = args.block_1d
+    block1d = args.block1d
 
     validate_block_sizes(block2d, block1d)
 
+    if not cuda.is_available():
+        raise RuntimeError("CUDA is not available")
+
+    cuda.select_device(args.device)
+
+    cfg = read_configuration_file(args.input)
+
+    if args.outputEvery is not None:
+        validate_output_every(args.outputEvery)
+        cfg.output_every = args.outputEvery
+
+    validate_output_every(cfg.output_every)
+
+    write_hdf5 = (not args.no_hdf5) and (not is_no_hdf5_token(args.h5))
+
     print(f"Input file:                   {args.input}")
-    print(f"HDF5 output:                  {args.h5}")
     print(f"CSV output:                   {args.csv}")
+    print(f"HDF5 output:                  {args.h5 if write_hdf5 else 'disabled'}")
+    print(f"Official grading mode:        {'yes' if not write_hdf5 else 'no'}")
 
     run_simulation(
         cfg=cfg,
         h5_file=args.h5,
         csv_file=args.csv,
+        h5_tile_y=args.h5_tile_y,
+        h5_tile_x=args.h5_tile_x,
         block2d=block2d,
         block1d=block1d,
+        write_hdf5=write_hdf5,
+        skip_warmup=args.skip_warmup,
     )
 
     return 0
@@ -1148,6 +1302,8 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except Exception as e:
-        print(f"CRITICAL ERROR: {e}", file=sys.stderr)
+    except Exception as exc:
+        print(f"CRITICAL ERROR: {exc}", file=sys.stderr)
         raise SystemExit(1)
+
+

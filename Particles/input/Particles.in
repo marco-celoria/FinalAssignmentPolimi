@@ -1,6 +1,6 @@
 # Extension of field grid in X, Y directions
-2400
-2000
+1200
+1000
 # X interval for particle generating field: 0,02373046
 0.42773438
 0.45146484
@@ -19,8 +19,8 @@
 # iterations for particle generation
 3000
 # iterations for particle dynamics
-1000
+200
 # bit of time for particle dynamics
 0.001
 # output frequency
-10
+20

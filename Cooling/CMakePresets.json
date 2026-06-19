@@ -2,7 +2,7 @@
   "version": 6,
   "cmakeMinimumRequired": {
     "major": 3,
-    "minor": 18,
+    "minor": 25,
     "patch": 0
   },
   "configurePresets": [
@@ -14,6 +14,7 @@
       "cacheVariables": {
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "CMAKE_INSTALL_PREFIX": "${sourceDir}/install",
+        "COOLING_BUILD_HDF5": "AUTO",
         "COOLING_NATIVE_ARCH": "OFF",
         "COOLING_FAST_MATH_CUDA": "OFF"
       }
@@ -41,9 +42,10 @@
     {
       "name": "macos-arm64",
       "inherits": "base",
-      "displayName": "macOS Apple Silicon, serial + optional OpenMP",
+      "displayName": "macOS Apple Silicon, serial + optional OpenMP + optional HDF5",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
+        "COOLING_BUILD_HDF5": "AUTO",
         "COOLING_BUILD_OPENMP": "AUTO",
         "COOLING_BUILD_CUDA": "OFF",
         "CMAKE_OSX_ARCHITECTURES": "arm64"
@@ -52,9 +54,10 @@
     {
       "name": "leonardo-a100",
       "inherits": "base",
-      "displayName": "Leonardo A100, OpenMP + CUDA",
+      "displayName": "Leonardo A100, OpenMP + CUDA + HDF5",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
+        "COOLING_BUILD_HDF5": "ON",
         "COOLING_BUILD_OPENMP": "ON",
         "COOLING_BUILD_CUDA": "ON",
         "COOLING_STRICT_CUDA": "ON",

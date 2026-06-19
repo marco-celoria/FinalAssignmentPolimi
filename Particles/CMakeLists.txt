@@ -1,17 +1,22 @@
-cmake_minimum_required(VERSION 3.18...3.30)
-
+cmake_minimum_required(VERSION 3.25...3.30)
 project(ParticlesSimulation LANGUAGES CXX)
 
 # ============================================================
 # Options
 # ============================================================
 
+set(PARTICLES_BUILD_HDF5 "AUTO" CACHE STRING
+    "Build HDF5 support: OFF, ON, or AUTO"
+)
+
 set(PARTICLES_BUILD_OPENMP "OFF" CACHE STRING
     "Build OpenMP executable: OFF, ON, or AUTO"
 )
+
 set(PARTICLES_BUILD_CUDA "OFF" CACHE STRING
     "Build CUDA executable: OFF, ON, or AUTO"
 )
+
 set(PARTICLES_CUDA_ARCHITECTURES "AUTO" CACHE STRING
     "CUDA architectures: AUTO, native, 80, 90, or list like 70;80;90"
 )
@@ -31,12 +36,17 @@ option(PARTICLES_STRICT_CUDA
     OFF
 )
 
+set_property(CACHE PARTICLES_BUILD_HDF5 PROPERTY STRINGS OFF ON AUTO)
 set_property(CACHE PARTICLES_BUILD_OPENMP PROPERTY STRINGS OFF ON AUTO)
 set_property(CACHE PARTICLES_BUILD_CUDA PROPERTY STRINGS OFF ON AUTO)
 
 # ============================================================
 # Validate options
 # ============================================================
+
+if(NOT PARTICLES_BUILD_HDF5 MATCHES "^(OFF|ON|AUTO)$")
+    message(FATAL_ERROR "PARTICLES_BUILD_HDF5 must be OFF, ON, or AUTO")
+endif()
 
 if(NOT PARTICLES_BUILD_OPENMP MATCHES "^(OFF|ON|AUTO)$")
     message(FATAL_ERROR "PARTICLES_BUILD_OPENMP must be OFF, ON, or AUTO")
@@ -67,15 +77,37 @@ if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
 endif()
 
 # ============================================================
-# Dependencies
+# Optional HDF5
 # ============================================================
 
-find_package(HDF5 REQUIRED COMPONENTS C CXX)
+set(PARTICLES_HDF5_AVAILABLE OFF)
 
+if(NOT PARTICLES_BUILD_HDF5 STREQUAL "OFF")
+    find_package(HDF5 QUIET COMPONENTS C CXX)
+
+    if(HDF5_FOUND)
+        set(PARTICLES_HDF5_AVAILABLE ON)
+    elseif(PARTICLES_BUILD_HDF5 STREQUAL "ON")
+        message(FATAL_ERROR
+            "HDF5 support was requested with PARTICLES_BUILD_HDF5=ON, "
+            "but HDF5 was not found."
+        )
+    else()
+        message(WARNING
+            "HDF5 not found. Building without HDF5 support."
+        )
+    endif()
+endif()
+
+# ============================================================
 # Optional OpenMP
+# ============================================================
+
 set(PARTICLES_OPENMP_AVAILABLE OFF)
+
 if(NOT PARTICLES_BUILD_OPENMP STREQUAL "OFF")
     find_package(OpenMP QUIET COMPONENTS CXX)
+
     if(OpenMP_CXX_FOUND)
         set(PARTICLES_OPENMP_AVAILABLE ON)
     elseif(PARTICLES_BUILD_OPENMP STREQUAL "ON")
@@ -89,8 +121,12 @@ if(NOT PARTICLES_BUILD_OPENMP STREQUAL "OFF")
     endif()
 endif()
 
+# ============================================================
 # Optional CUDA
+# ============================================================
+
 set(PARTICLES_CUDA_AVAILABLE OFF)
+
 if(NOT PARTICLES_BUILD_CUDA STREQUAL "OFF")
     include(CheckLanguage)
     check_language(CUDA)
@@ -136,11 +172,20 @@ endif()
 # ============================================================
 
 function(particles_apply_hdf5 target_name)
+    if(NOT PARTICLES_HDF5_AVAILABLE)
+        return()
+    endif()
+
+    target_compile_definitions(${target_name} PRIVATE USE_HDF5=1)
+
     if(TARGET hdf5::hdf5_cpp)
         target_link_libraries(${target_name} PRIVATE hdf5::hdf5_cpp)
+
         if(TARGET hdf5::hdf5)
             target_link_libraries(${target_name} PRIVATE hdf5::hdf5)
         endif()
+    elseif(TARGET HDF5::HDF5)
+        target_link_libraries(${target_name} PRIVATE HDF5::HDF5)
     elseif(TARGET hdf5::hdf5)
         target_link_libraries(${target_name} PRIVATE hdf5::hdf5)
     else()
@@ -219,7 +264,13 @@ target_compile_definitions(particles_serial PRIVATE PARTICLES_SERIAL=1)
 
 # OpenMP target: optional
 if(PARTICLES_OPENMP_AVAILABLE)
-    particles_optional_source(particles_omp "${PARTICLES_OMP_SRC}" "${PARTICLES_BUILD_OPENMP}" "OpenMP")
+    particles_optional_source(
+        particles_omp
+        "${PARTICLES_OMP_SRC}"
+        "${PARTICLES_BUILD_OPENMP}"
+        "OpenMP"
+    )
+
     if(TARGET particles_omp)
         target_link_libraries(particles_omp PRIVATE OpenMP::OpenMP_CXX)
         target_compile_definitions(particles_omp PRIVATE PARTICLES_OPENMP=1)
@@ -228,7 +279,13 @@ endif()
 
 # CUDA target: optional
 if(PARTICLES_CUDA_AVAILABLE)
-    particles_optional_source(particles_cuda "${PARTICLES_CUDA_SRC}" "${PARTICLES_BUILD_CUDA}" "CUDA")
+    particles_optional_source(
+        particles_cuda
+        "${PARTICLES_CUDA_SRC}"
+        "${PARTICLES_BUILD_CUDA}"
+        "CUDA"
+    )
+
     if(TARGET particles_cuda)
         set_target_properties(particles_cuda PROPERTIES
             CUDA_SEPARABLE_COMPILATION ON
@@ -263,22 +320,42 @@ endif()
 # Summary
 # ============================================================
 
-message(STATUS "")
-message(STATUS "ParticlesSimulation configuration")
-message(STATUS "  System:                   ${CMAKE_SYSTEM_NAME}")
-message(STATUS "  Processor:                ${CMAKE_SYSTEM_PROCESSOR}")
-message(STATUS "  C++ compiler:             ${CMAKE_CXX_COMPILER}")
-message(STATUS "  Build type:               ${CMAKE_BUILD_TYPE}")
-message(STATUS "  Serial target:            ON")
-message(STATUS "  OpenMP requested:         ${PARTICLES_BUILD_OPENMP}")
-message(STATUS "  OpenMP available:         ${PARTICLES_OPENMP_AVAILABLE}")
-message(STATUS "  CUDA requested:           ${PARTICLES_BUILD_CUDA}")
-message(STATUS "  CUDA available:           ${PARTICLES_CUDA_AVAILABLE}")
-message(STATUS "  Native host architecture: ${PARTICLES_NATIVE_ARCH}")
+if(TARGET particles_omp)
+    set(PARTICLES_OMP_TARGET_BUILT ON)
+else()
+    set(PARTICLES_OMP_TARGET_BUILT OFF)
+endif()
+
+if(TARGET particles_cuda)
+    set(PARTICLES_CUDA_TARGET_BUILT ON)
+else()
+    set(PARTICLES_CUDA_TARGET_BUILT OFF)
+endif()
+
 if(DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(PARTICLES_CUDA_ARCH_SUMMARY "${CMAKE_CUDA_ARCHITECTURES}")
 else()
     set(PARTICLES_CUDA_ARCH_SUMMARY "not set")
 endif()
+
+message(STATUS "")
+message(STATUS "ParticlesSimulation configuration")
+message(STATUS "  System:                   ${CMAKE_SYSTEM_NAME}")
+message(STATUS "  Processor:                ${CMAKE_SYSTEM_PROCESSOR}")
+message(STATUS "  C++ compiler:             ${CMAKE_CXX_COMPILER}")
+if(PARTICLES_CUDA_AVAILABLE)
+    message(STATUS "  CUDA compiler:            ${CMAKE_CUDA_COMPILER}")
+endif()
+message(STATUS "  Build type:               ${CMAKE_BUILD_TYPE}")
+message(STATUS "  Serial target built:      ON")
+message(STATUS "  HDF5 requested:           ${PARTICLES_BUILD_HDF5}")
+message(STATUS "  HDF5 available:           ${PARTICLES_HDF5_AVAILABLE}")
+message(STATUS "  OpenMP requested:         ${PARTICLES_BUILD_OPENMP}")
+message(STATUS "  OpenMP available:         ${PARTICLES_OPENMP_AVAILABLE}")
+message(STATUS "  OpenMP target built:      ${PARTICLES_OMP_TARGET_BUILT}")
+message(STATUS "  CUDA requested:           ${PARTICLES_BUILD_CUDA}")
+message(STATUS "  CUDA available:           ${PARTICLES_CUDA_AVAILABLE}")
+message(STATUS "  CUDA target built:        ${PARTICLES_CUDA_TARGET_BUILT}")
+message(STATUS "  Native host architecture: ${PARTICLES_NATIVE_ARCH}")
 message(STATUS "  CUDA architectures:       ${PARTICLES_CUDA_ARCH_SUMMARY}")
 message(STATUS "")

@@ -1,21 +1,94 @@
+/*
+================================================================================
+Cooling Field Solver - CUDA Reference Implementation
+================================================================================
+
+Instructor/reference CUDA implementation of the serial C++17 baseline.
+
+The numerical model, input format, CSV statistics, and
+HDF5 behavior are intentionally kept aligned with the serial baseline.
+
+This version offloads the main computational kernels to CUDA. HDF5 output
+remains serial and optional. Snapshot statistics are computed on the host after
+copying the requested output frame from device to host. This keeps the CSV
+validation format directly comparable with the serial and OpenMP versions.
+
+Official performance mode:
+
+  ./cooling_cuda input_final.in none output_final_cuda.csv 0
+
+or with explicit CUDA device selection:
+
+  ./cooling_cuda --device 0 input_final.in none output_final_cuda.csv 0
+
+Compile without HDF5:
+
+  nvcc -O3 -std=c++17 cooling.cu -o cooling_cuda
+
+Compile with HDF5:
+
+  nvcc -O3 -std=c++17 -DUSE_HDF5 cooling.cu -o cooling_cuda \
+      -lhdf5_cpp -lhdf5
+
+Depending on the cluster configuration, students may need an HDF5 compiler
+wrapper, modules, or explicit include/library paths.
+
+Input file format, after removing comments beginning with '#':
+
+  gridWidth
+  gridHeight
+  numberOfMeasuredPoints
+  x y value        repeated numberOfMeasuredPoints times
+  domainStartX
+  domainStartY
+  domainWidth
+  domainHeight
+  maxFractalIterations
+  timeSteps
+  outputEvery      optional; 0 means final step only
+
+Command line:
+
+  ./cooling_cuda [options] [inputFile] [h5File|none|--no-hdf5] [csvFile] [outputEvery]
+
+Options:
+
+  --device N       Select CUDA device, default 0
+  --block-x N      CUDA 2D block x dimension, default 16
+  --block-y N      CUDA 2D block y dimension, default 16
+  --block1d N      CUDA 1D block size for boundary kernels, default 256
+  --no-hdf5        Disable HDF5 output
+  --help, -h       Print usage
+
+Examples:
+
+  ./cooling_cuda --device 0 input_final.in none Statistics_cuda.csv 0
+  ./cooling_cuda --device 0 input_medium.in output.h5 Statistics_cuda.csv 50
+
+================================================================================
+*/
+
+#ifdef USE_HDF5
 #include <H5Cpp.h>
+#endif
+
 #include <cuda_runtime.h>
 
 #include <thrust/device_ptr.h>
 #include <thrust/extrema.h>
-#include <thrust/reduce.h>
-#include <thrust/transform_reduce.h>
-#include <thrust/functional.h>
 
 #include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -23,10 +96,7 @@
 #include <utility>
 #include <vector>
 
-
-// ============================================================
-// CUDA ERROR HANDLING
-// ============================================================
+namespace fs = std::filesystem;
 
 #define CUDA_CHECK(call)                                                         \
     do {                                                                         \
@@ -34,7 +104,7 @@
         if (err__ != cudaSuccess) {                                              \
             std::ostringstream oss__;                                            \
             oss__ << "CUDA ERROR: " << cudaGetErrorString(err__)                 \
-                  << " at " << __FILE__ << ":" << __LINE__;                      \
+                  << " at " << __FILE__ << ":" << __LINE__;                     \
             throw std::runtime_error(oss__.str());                               \
         }                                                                        \
     } while (0)
@@ -46,15 +116,130 @@
             std::ostringstream oss__;                                            \
             oss__ << "CUDA KERNEL LAUNCH ERROR: "                                \
                   << cudaGetErrorString(err__)                                   \
-                  << " at " << __FILE__ << ":" << __LINE__;                      \
+                  << " at " << __FILE__ << ":" << __LINE__;                     \
             throw std::runtime_error(oss__.str());                               \
         }                                                                        \
     } while (0)
 
+struct SamplePoint {
+    double x{};
+    double y{};
+    double value{};
+};
 
-// ============================================================
-// RAII HELPERS
-// ============================================================
+struct SimulationConfig {
+    std::size_t gridWidth{};
+    std::size_t gridHeight{};
+    double domainStartX{};
+    double domainStartY{};
+    double domainWidth{};
+    double domainHeight{};
+    int maxFractalIterations{};
+    int timeSteps{};
+    int outputEvery{0};
+    std::vector<SamplePoint> measuredPoints;
+};
+
+struct GridMapping {
+    double x0{};
+    double y0{};
+    double dx{};
+    double dy{};
+};
+
+struct UpdateCoefficients {
+    double damping{};
+    double stepX{};
+    double stepY{};
+    double coeffX{};
+    double coeffY{};
+    double laplaceX{};
+    double laplaceY{};
+};
+
+struct FieldStatistics {
+    double minValue{};
+    double meanValue{};
+    double maxValue{};
+    double stdDev{};
+    double l2Norm{};
+    double checksum{};
+};
+
+struct CommandLineOptions {
+    std::string inputFile{"input_final.in"};
+    std::string h5File{"none"};
+    std::string csvFile{"Statistics.csv"};
+
+    bool writeHdf5{false};
+    bool overrideOutputEvery{false};
+    int outputEvery{0};
+
+    int deviceId{0};
+    int blockX{16};
+    int blockY{16};
+    int block1d{256};
+};
+
+struct ScopedTimer {
+    using clock = std::chrono::steady_clock;
+    clock::time_point start{clock::now()};
+
+    double elapsedSeconds() const {
+        return std::chrono::duration<double>(clock::now() - start).count();
+    }
+};
+
+class CudaEvent {
+public:
+    CudaEvent() {
+        CUDA_CHECK(cudaEventCreate(&event_));
+    }
+
+    ~CudaEvent() {
+        if (event_) {
+            cudaEventDestroy(event_);
+        }
+    }
+
+    CudaEvent(const CudaEvent&) = delete;
+    CudaEvent& operator=(const CudaEvent&) = delete;
+
+    cudaEvent_t get() const noexcept {
+        return event_;
+    }
+
+private:
+    cudaEvent_t event_{nullptr};
+};
+
+class CudaEventTimer {
+public:
+    void start() {
+        CUDA_CHECK(cudaEventRecord(start_.get()));
+        running_ = true;
+    }
+
+    double stopSeconds() {
+        if (!running_) {
+            return 0.0;
+        }
+
+        CUDA_CHECK(cudaEventRecord(stop_.get()));
+        CUDA_CHECK(cudaEventSynchronize(stop_.get()));
+
+        float milliseconds = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start_.get(), stop_.get()));
+
+        running_ = false;
+        return static_cast<double>(milliseconds) / 1.0e3;
+    }
+
+private:
+    CudaEvent start_;
+    CudaEvent stop_;
+    bool running_{false};
+};
 
 template <typename T>
 class DeviceBuffer {
@@ -62,13 +247,14 @@ public:
     DeviceBuffer() = default;
 
     explicit DeviceBuffer(std::size_t count)
-        : ptr_(nullptr), count_(count)
+        : count_(count)
     {
         if (count_ > 0) {
-            CUDA_CHECK(cudaMalloc(
-                reinterpret_cast<void**>(&ptr_),
-                count_ * sizeof(T)
-            ));
+            if (count_ > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+                throw std::overflow_error("DeviceBuffer allocation size overflow");
+            }
+
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ptr_), count_ * sizeof(T)));
         }
     }
 
@@ -109,16 +295,22 @@ public:
         std::swap(a.count_, b.count_);
     }
 
-    T* get() noexcept { return ptr_; }
-    const T* get() const noexcept { return ptr_; }
+    T* get() noexcept {
+        return ptr_;
+    }
 
-    std::size_t size() const noexcept { return count_; }
+    const T* get() const noexcept {
+        return ptr_;
+    }
+
+    std::size_t size() const noexcept {
+        return count_;
+    }
 
 private:
     T* ptr_{nullptr};
     std::size_t count_{0};
 };
-
 
 template <typename T>
 class PinnedHostBuffer {
@@ -126,9 +318,13 @@ public:
     PinnedHostBuffer() = default;
 
     explicit PinnedHostBuffer(std::size_t count)
-        : ptr_(nullptr), count_(count)
+        : count_(count)
     {
         if (count_ > 0) {
+            if (count_ > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+                throw std::overflow_error("PinnedHostBuffer allocation size overflow");
+            }
+
             CUDA_CHECK(cudaHostAlloc(
                 reinterpret_cast<void**>(&ptr_),
                 count_ * sizeof(T),
@@ -169,159 +365,149 @@ public:
         return *this;
     }
 
-    T* data() noexcept { return ptr_; }
-    const T* data() const noexcept { return ptr_; }
+    T* data() noexcept {
+        return ptr_;
+    }
 
-    std::size_t size() const noexcept { return count_; }
+    const T* data() const noexcept {
+        return ptr_;
+    }
+
+    std::size_t size() const noexcept {
+        return count_;
+    }
 
 private:
     T* ptr_{nullptr};
     std::size_t count_{0};
 };
 
-
-class CudaEvent {
-public:
-    CudaEvent() {
-        CUDA_CHECK(cudaEventCreate(&ev_));
-    }
-
-    ~CudaEvent() {
-        if (ev_) {
-            cudaEventDestroy(ev_);
-        }
-    }
-
-    CudaEvent(const CudaEvent&) = delete;
-    CudaEvent& operator=(const CudaEvent&) = delete;
-
-    cudaEvent_t get() const noexcept { return ev_; }
-
-private:
-    cudaEvent_t ev_{nullptr};
-};
-
-
-// ============================================================
-// DATA STRUCTURES
-// ============================================================
-
-struct MeasuredPoint {
-    double x{};
-    double y{};
-    double v{};
-};
-
-struct Config {
-    std::size_t nx{};
-    std::size_t ny{};
-
-    double Sreal{};
-    double Simag{};
-    double Dreal{};
-    double Dimag{};
-
-    int maxIters{};
-    int steps{};
-
-    // Optional output frequency.
-    // If hasOutputEvery == false, only the final state is written.
-    bool hasOutputEvery{false};
-    int outputEvery{0};
-
-    std::vector<MeasuredPoint> measured;
-};
-
-struct DomainMap {
-    double x0{};
-    double y0{};
-    double dx{};
-    double dy{};
-};
-
-struct CoolingCoeffs {
-    double dd{};
-    double hx{};
-    double hy{};
-    double dgx{};
-    double dgy{};
-    double CX{};
-    double CY{};
-};
-
-struct Stats {
-    double minv{};
-    double mean{};
-    double maxv{};
-    double stddev{};
-};
-
-
-// ============================================================
-// UTILITY
-// ============================================================
-
-inline std::size_t idx2D(std::size_t i, std::size_t j, std::size_t nx) noexcept {
-    return i + j * nx;
+inline std::size_t linearIndex(std::size_t i, std::size_t j, std::size_t width) noexcept {
+    return i + j * width;
 }
 
 __host__ __device__
-inline int idx2D_dev(int i, int j, int nx) noexcept {
-    return i + j * nx;
+inline int linearIndexDev(int i, int j, int width) noexcept {
+    return i + j * width;
 }
 
-std::size_t safeGridSize(std::size_t nx, std::size_t ny) {
-    if (nx == 0 || ny == 0) {
-        throw std::invalid_argument("Grid dimensions must be > 0");
+std::size_t checkedGridSize(std::size_t width, std::size_t height) {
+    if (width == 0 || height == 0) {
+        throw std::invalid_argument("Grid dimensions must be greater than zero");
     }
 
-    if (nx > std::numeric_limits<std::size_t>::max() / ny) {
-        throw std::overflow_error("Grid size overflow: nx * ny exceeds size_t range");
+    if (width > std::numeric_limits<std::size_t>::max() / height) {
+        throw std::overflow_error("Grid size overflow");
     }
 
-    return nx * ny;
+    return width * height;
 }
 
-int parseStrictInt(const std::string& s, const std::string& what) {
-    int v = 0;
+int parseStrictInt(const std::string& text, const std::string& what) {
+    int value = 0;
 
-    auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+    const char* begin = text.data();
+    const char* end = text.data() + text.size();
 
-    if (ec != std::errc{} || ptr != s.data() + s.size()) {
-        throw std::runtime_error("Invalid " + what + ": '" + s + "'");
+    const auto [ptr, ec] = std::from_chars(begin, end, value);
+
+    if (ec != std::errc{} || ptr != end) {
+        throw std::runtime_error("Invalid " + what + ": '" + text + "'");
     }
 
-    return v;
+    return value;
+}
+
+int parseStrictPositiveInt(const std::string& text, const std::string& what) {
+    const int value = parseStrictInt(text, what);
+
+    if (value <= 0) {
+        throw std::runtime_error(what + " must be positive");
+    }
+
+    return value;
+}
+
+bool beginsWithDoubleDash(const std::string& text) {
+    return text.rfind("--", 0) == 0;
+}
+
+bool isNoHdf5Token(const std::string& text) {
+    return text == "none" || text == "NONE" || text == "-" || text == "--no-hdf5";
+}
+
+void ensureParentDirectoryExists(const std::string& fileName) {
+    if (fileName.empty() || isNoHdf5Token(fileName)) {
+        return;
+    }
+
+    const fs::path path(fileName);
+    const fs::path parent = path.parent_path();
+
+    if (parent.empty()) {
+        return;
+    }
+
+    std::error_code ec;
+
+    if (fs::exists(parent, ec)) {
+        if (!fs::is_directory(parent, ec)) {
+            throw std::runtime_error("Output parent exists but is not a directory: " + parent.string());
+        }
+
+        return;
+    }
+
+    if (!fs::create_directories(parent, ec) && ec) {
+        throw std::runtime_error("Cannot create output directory '" + parent.string() + "': " + ec.message());
+    }
+}
+
+void selectCudaDevice(int deviceId) {
+    int deviceCount = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
+
+    if (deviceCount <= 0) {
+        throw std::runtime_error("No CUDA-capable devices found");
+    }
+
+    if (deviceId < 0 || deviceId >= deviceCount) {
+        throw std::runtime_error(
+            "Invalid CUDA device id " + std::to_string(deviceId) +
+            "; available devices: 0.." + std::to_string(deviceCount - 1)
+        );
+    }
+
+    CUDA_CHECK(cudaSetDevice(deviceId));
 }
 
 void validateCudaLaunchConfig(dim3 block2d, int block1d) {
     const unsigned threads2d = block2d.x * block2d.y * block2d.z;
 
     if (threads2d == 0 || threads2d > 1024) {
-        throw std::runtime_error("Invalid 2D CUDA block size");
+        throw std::runtime_error("Invalid CUDA 2D block size: total threads must be in [1, 1024]");
+    }
+
+    if (block2d.x == 0 || block2d.y == 0 || block2d.z == 0) {
+        throw std::runtime_error("Invalid CUDA 2D block size: dimensions must be positive");
     }
 
     if (block1d <= 0 || block1d > 1024) {
-        throw std::runtime_error("Invalid 1D CUDA block size");
+        throw std::runtime_error("Invalid CUDA 1D block size: must be in [1, 1024]");
     }
 }
 
+SimulationConfig readConfigurationFile(const std::string& fileName) {
+    std::ifstream input(fileName);
 
-// ============================================================
-// INPUT PARSER
-// ============================================================
-
-Config readInput(const std::string& fname) {
-    std::ifstream in(fname);
-
-    if (!in) {
-        throw std::runtime_error("Cannot open input file: " + fname);
+    if (!input) {
+        throw std::runtime_error("Cannot open input file: " + fileName);
     }
 
     std::vector<std::string> tokens;
     std::string line;
 
-    while (std::getline(in, line)) {
+    while (std::getline(input, line)) {
         const auto commentPos = line.find('#');
 
         if (commentPos != std::string::npos) {
@@ -329,17 +515,15 @@ Config readInput(const std::string& fname) {
         }
 
         std::istringstream iss(line);
-        std::string tok;
+        std::string token;
 
-        while (iss >> tok) {
-            tokens.push_back(tok);
+        while (iss >> token) {
+            tokens.push_back(token);
         }
     }
 
     if (tokens.empty()) {
-        throw std::runtime_error(
-            "Input file is empty or contains no numeric tokens: " + fname
-        );
+        throw std::runtime_error("Input file contains no tokens: " + fileName);
     }
 
     std::size_t pos = 0;
@@ -349,22 +533,7 @@ Config readInput(const std::string& fname) {
             throw std::runtime_error("Malformed input: missing integer token");
         }
 
-        const std::string& s = tokens.at(pos++);
-
-        try {
-            std::size_t used = 0;
-            int v = std::stoi(s, &used);
-
-            if (used != s.size()) {
-                throw std::runtime_error("not a pure integer");
-            }
-
-            return v;
-        } catch (...) {
-            throw std::runtime_error(
-                "Malformed input: invalid integer token '" + s + "'"
-            );
-        }
+        return parseStrictInt(tokens[pos++], "integer token");
     };
 
     auto nextDouble = [&]() -> double {
@@ -372,88 +541,77 @@ Config readInput(const std::string& fname) {
             throw std::runtime_error("Malformed input: missing floating-point token");
         }
 
-        const std::string& s = tokens.at(pos++);
+        const std::string token = tokens[pos++];
 
         try {
             std::size_t used = 0;
-            double v = std::stod(s, &used);
+            const double value = std::stod(token, &used);
 
-            if (used != s.size()) {
-                throw std::runtime_error("not a pure floating-point number");
+            if (used != token.size()) {
+                throw std::runtime_error("invalid trailing characters");
             }
 
-            return v;
+            if (!std::isfinite(value)) {
+                throw std::runtime_error("non-finite value");
+            }
+
+            return value;
         } catch (...) {
-            throw std::runtime_error(
-                "Malformed input: invalid floating-point token '" + s + "'"
-            );
+            throw std::runtime_error("Malformed input: invalid floating-point token '" + token + "'");
         }
     };
 
-    Config cfg{};
+    SimulationConfig cfg{};
 
-    const int rawNx = nextInt();
-    const int rawNy = nextInt();
+    const int rawWidth = nextInt();
+    const int rawHeight = nextInt();
 
-    if (rawNx < 3 || rawNy < 3) {
+    if (rawWidth < 3 || rawHeight < 3) {
         throw std::runtime_error("Grid dimensions must be at least 3 x 3");
     }
 
-    cfg.nx = static_cast<std::size_t>(rawNx);
-    cfg.ny = static_cast<std::size_t>(rawNy);
+    cfg.gridWidth = static_cast<std::size_t>(rawWidth);
+    cfg.gridHeight = static_cast<std::size_t>(rawHeight);
 
-    const int nMeasured = nextInt();
+    const int measuredCount = nextInt();
 
-    if (nMeasured < 0) {
+    if (measuredCount < 0) {
         throw std::runtime_error("Number of measured points cannot be negative");
     }
 
-    cfg.measured.resize(static_cast<std::size_t>(nMeasured));
+    cfg.measuredPoints.resize(static_cast<std::size_t>(measuredCount));
 
-    for (int i = 0; i < nMeasured; ++i) {
-        auto& m = cfg.measured[static_cast<std::size_t>(i)];
-        m.x = nextDouble();
-        m.y = nextDouble();
-        m.v = nextDouble();
+    for (int i = 0; i < measuredCount; ++i) {
+        auto& p = cfg.measuredPoints[static_cast<std::size_t>(i)];
+        p.x = nextDouble();
+        p.y = nextDouble();
+        p.value = nextDouble();
     }
 
-    cfg.Sreal = nextDouble();
-    cfg.Simag = nextDouble();
-    cfg.Dreal = nextDouble();
-    cfg.Dimag = nextDouble();
+    cfg.domainStartX = nextDouble();
+    cfg.domainStartY = nextDouble();
+    cfg.domainWidth = nextDouble();
+    cfg.domainHeight = nextDouble();
+    cfg.maxFractalIterations = nextInt();
+    cfg.timeSteps = nextInt();
 
-    cfg.maxIters = nextInt();
-    cfg.steps = nextInt();
-
-    if (cfg.maxIters <= 0) {
-        throw std::runtime_error("maxIters must be > 0");
+    if (cfg.domainWidth <= 0.0 || cfg.domainHeight <= 0.0) {
+        throw std::runtime_error("domainWidth and domainHeight must be positive");
     }
 
-    if (cfg.steps < 0) {
-        throw std::runtime_error("steps must be >= 0");
+    if (cfg.maxFractalIterations <= 0) {
+        throw std::runtime_error("maxFractalIterations must be positive");
     }
 
-    if (cfg.Dreal <= 0.0 || cfg.Dimag <= 0.0) {
-        throw std::runtime_error("Domain extents Dreal and Dimag must be > 0");
+    if (cfg.timeSteps < 0) {
+        throw std::runtime_error("timeSteps must be non-negative");
     }
 
-    // Optional outputEvery.
-    //
-    // Supported input endings:
-    //
-    //   maxIters steps
-    //
-    // or:
-    //
-    //   maxIters steps outputEvery
-    //
-    // If outputEvery is absent, only the final state is written.
     if (pos < tokens.size()) {
         cfg.outputEvery = nextInt();
-        cfg.hasOutputEvery = true;
 
-        if (cfg.outputEvery <= 0) {
-            throw std::runtime_error("outputEvery must be > 0");
+        if (cfg.outputEvery < 0) {
+            throw std::runtime_error("outputEvery must be non-negative");
         }
     }
 
@@ -464,218 +622,180 @@ Config readInput(const std::string& fname) {
     return cfg;
 }
 
-
-// ============================================================
-// PHYSICS HELPERS
-// ============================================================
-
-DomainMap buildDomainMap(const Config& cfg) {
-    DomainMap map{};
-
-    map.x0 = cfg.Sreal;
-    map.y0 = cfg.Simag;
-    map.dx = cfg.Dreal / static_cast<double>(cfg.nx - 1);
-    map.dy = cfg.Dimag / static_cast<double>(cfg.ny - 1);
-
-    return map;
+GridMapping buildGridMapping(const SimulationConfig& cfg) {
+    GridMapping mapping{};
+    mapping.x0 = cfg.domainStartX;
+    mapping.y0 = cfg.domainStartY;
+    mapping.dx = cfg.domainWidth / static_cast<double>(cfg.gridWidth - 1);
+    mapping.dy = cfg.domainHeight / static_cast<double>(cfg.gridHeight - 1);
+    return mapping;
 }
 
-inline double analyticalField(double x, double y) noexcept {
+inline double analyticalReferenceField(double x, double y) noexcept {
     return (x * x * x + y * y * y) / 6.0;
 }
 
-double computeDiscrepancy(const Config& cfg) {
-    if (cfg.measured.empty()) {
+double computeMeanDiscrepancy(const SimulationConfig& cfg) {
+    if (cfg.measuredPoints.empty()) {
         return 0.0;
     }
 
-    long double sum = 0.0L;
+    double sum = 0.0;
 
-    for (const auto& m : cfg.measured) {
-        sum += static_cast<long double>(m.v - analyticalField(m.x, m.y));
+    for (const auto& p : cfg.measuredPoints) {
+        sum += p.value - analyticalReferenceField(p.x, p.y);
     }
 
-    return static_cast<double>(
-        sum / static_cast<long double>(cfg.measured.size())
-    );
+    return sum / static_cast<double>(cfg.measuredPoints.size());
 }
 
-CoolingCoeffs buildCoolingCoeffs(double dx, double dy, double dd = 100.0) {
+UpdateCoefficients buildUpdateCoefficients(double dx, double dy, double damping = 100.0) {
     if (dx <= 0.0 || dy <= 0.0) {
-        throw std::invalid_argument("buildCoolingCoeffs: dx and dy must be > 0");
+        throw std::invalid_argument("Grid spacing must be positive");
     }
 
-    if (dd <= 0.0) {
-        throw std::invalid_argument("buildCoolingCoeffs: dd must be > 0");
+    if (damping <= 0.0) {
+        throw std::invalid_argument("Damping parameter must be positive");
     }
 
-    CoolingCoeffs c{};
-
-    c.dd = dd;
-    c.hx = dx;
-    c.hy = dy;
-
-    const double hx2 = c.hx * c.hx;
-    const double hy2 = c.hy * c.hy;
-
-    c.dgx = -2.0 * (1.0 + c.dd * c.hx / (hx2 + c.dd));
-    c.dgy = -2.0 * (1.0 + c.dd * c.hy / (hy2 + c.dd));
-
-    c.CX = (c.hx + c.dd * std::exp(c.hx)) / (15.0 * c.dd + c.hx);
-    c.CY = (c.hy + c.dd * std::exp(c.hy)) / (15.0 * c.dd + c.hy);
-
+    UpdateCoefficients c{};
+    c.damping = damping;
+    c.stepX = dx;
+    c.stepY = dy;
+    c.laplaceX = -2.0 * (1.0 + c.damping * c.stepX / (c.stepX * c.stepX + c.damping));
+    c.laplaceY = -2.0 * (1.0 + c.damping * c.stepY / (c.stepY * c.stepY + c.damping));
+    c.coeffX = (c.stepX + c.damping * std::exp(c.stepX)) / (15.0 * c.damping + c.stepX);
+    c.coeffY = (c.stepY + c.damping * std::exp(c.stepY)) / (15.0 * c.damping + c.stepY);
     return c;
 }
 
+#ifdef USE_HDF5
 
-// ============================================================
-// HDF5 WRITER
-// ============================================================
-
-class H5Writer {
+class TimeSeriesWriter {
 public:
-    H5Writer(
-        const std::string& fname,
-        std::size_t nx,
-        std::size_t ny,
+    TimeSeriesWriter(
+        const std::string& fileName,
+        std::size_t width,
+        std::size_t height,
         std::size_t batch = 32,
         std::size_t tileY = 256,
         std::size_t tileX = 256
     )
-        : file_(fname, H5F_ACC_TRUNC),
-          nx_(nx),
-          ny_(ny),
+        : file_(fileName, H5F_ACC_TRUNC),
+          width_(width),
+          height_(height),
           batch_(batch),
-          frame_(0),
+          frameCount_(0),
           capacity_(batch),
           closed_(false)
     {
-        if (nx_ == 0 || ny_ == 0) {
-            throw std::invalid_argument("H5Writer: nx and ny must be > 0");
+        if (width_ == 0 || height_ == 0) {
+            throw std::invalid_argument("TimeSeriesWriter: invalid dimensions");
         }
 
         if (batch_ == 0) {
-            throw std::invalid_argument("H5Writer: batch must be > 0");
+            throw std::invalid_argument("TimeSeriesWriter: batch must be positive");
         }
 
         if (tileY == 0 || tileX == 0) {
-            throw std::invalid_argument("H5Writer: tile sizes must be > 0");
+            throw std::invalid_argument("TimeSeriesWriter: tile sizes must be positive");
         }
 
-        const hsize_t chunkY =
-            static_cast<hsize_t>(std::min<std::size_t>(ny_, tileY));
+        const hsize_t chunkY = static_cast<hsize_t>(std::min<std::size_t>(height_, tileY));
+        const hsize_t chunkX = static_cast<hsize_t>(std::min<std::size_t>(width_, tileX));
 
-        const hsize_t chunkX =
-            static_cast<hsize_t>(std::min<std::size_t>(nx_, tileX));
-
-        // /field dataset: [frame, y, x]
         {
             hsize_t dims[3] = {
                 0,
-                static_cast<hsize_t>(ny_),
-                static_cast<hsize_t>(nx_)
+                static_cast<hsize_t>(height_),
+                static_cast<hsize_t>(width_)
             };
 
             hsize_t maxdims[3] = {
                 H5S_UNLIMITED,
-                static_cast<hsize_t>(ny_),
-                static_cast<hsize_t>(nx_)
+                static_cast<hsize_t>(height_),
+                static_cast<hsize_t>(width_)
             };
 
             H5::DataSpace space(3, dims, maxdims);
-            H5::DSetCreatPropList prop;
+            H5::DSetCreatPropList props;
 
-            hsize_t chunks[3] = {
-                1,
-                chunkY,
-                chunkX
-            };
+            hsize_t chunks[3] = {1, chunkY, chunkX};
+            props.setChunk(3, chunks);
 
-            prop.setChunk(3, chunks);
-
-            field_ = file_.createDataSet(
+            fieldDataset_ = file_.createDataSet(
                 "/field",
                 H5::PredType::NATIVE_DOUBLE,
                 space,
-                prop
+                props
             );
         }
 
-        // /step dataset: [frame]
         {
             hsize_t dims[1] = {0};
             hsize_t maxdims[1] = {H5S_UNLIMITED};
 
             H5::DataSpace space(1, dims, maxdims);
-            H5::DSetCreatPropList prop;
+            H5::DSetCreatPropList props;
 
-            hsize_t chunks[1] = {
-                static_cast<hsize_t>(batch_)
-            };
+            hsize_t chunks[1] = {static_cast<hsize_t>(batch_)};
+            props.setChunk(1, chunks);
 
-            prop.setChunk(1, chunks);
-
-            step_ = file_.createDataSet(
+            stepDataset_ = file_.createDataSet(
                 "/step",
                 H5::PredType::NATIVE_INT,
                 space,
-                prop
+                props
             );
         }
 
         extend(capacity_);
     }
 
-    ~H5Writer() {
+    ~TimeSeriesWriter() {
         try {
             close();
         } catch (...) {
-            // Never throw from destructor.
         }
     }
 
-    H5Writer(const H5Writer&) = delete;
-    H5Writer& operator=(const H5Writer&) = delete;
+    TimeSeriesWriter(const TimeSeriesWriter&) = delete;
+    TimeSeriesWriter& operator=(const TimeSeriesWriter&) = delete;
 
-    void write(int stepNumber, const double* field, std::size_t count) {
+    void writeFrame(int stepNumber, const double* field) {
         if (closed_) {
-            throw std::runtime_error("H5Writer: write() called after close()");
+            throw std::runtime_error("TimeSeriesWriter: write after close");
         }
 
         if (!field) {
-            throw std::runtime_error("H5Writer: null field pointer");
+            throw std::runtime_error("TimeSeriesWriter: null field pointer");
         }
 
-        if (count != safeGridSize(nx_, ny_)) {
-            throw std::runtime_error("H5Writer: field size mismatch");
-        }
-
-        if (frame_ >= capacity_) {
+        if (frameCount_ >= capacity_) {
             capacity_ += batch_;
             extend(capacity_);
         }
 
-        // Write /field[frame,:,:]
         {
-            H5::DataSpace filespace = field_.getSpace();
+            H5::DataSpace filespace = fieldDataset_.getSpace();
 
             hsize_t start[3] = {
-                static_cast<hsize_t>(frame_),
+                static_cast<hsize_t>(frameCount_),
                 0,
                 0
             };
 
-            hsize_t count3[3] = {
+            hsize_t count[3] = {
                 1,
-                static_cast<hsize_t>(ny_),
-                static_cast<hsize_t>(nx_)
+                static_cast<hsize_t>(height_),
+                static_cast<hsize_t>(width_)
             };
 
-            filespace.selectHyperslab(H5S_SELECT_SET, count3, start);
+            filespace.selectHyperslab(H5S_SELECT_SET, count, start);
 
-            H5::DataSpace memspace(3, count3);
+            H5::DataSpace memspace(3, count);
 
-            field_.write(
+            fieldDataset_.write(
                 field,
                 H5::PredType::NATIVE_DOUBLE,
                 memspace,
@@ -683,23 +803,22 @@ public:
             );
         }
 
-        // Write /step[frame]
         {
-            H5::DataSpace filespace = step_.getSpace();
+            H5::DataSpace filespace = stepDataset_.getSpace();
 
             hsize_t start[1] = {
-                static_cast<hsize_t>(frame_)
+                static_cast<hsize_t>(frameCount_)
             };
 
-            hsize_t count1[1] = {1};
+            hsize_t count[1] = {1};
 
-            filespace.selectHyperslab(H5S_SELECT_SET, count1, start);
+            filespace.selectHyperslab(H5S_SELECT_SET, count, start);
 
-            H5::DataSpace memspace(1, count1);
+            H5::DataSpace memspace(1, count);
 
             int value = stepNumber;
 
-            step_.write(
+            stepDataset_.write(
                 &value,
                 H5::PredType::NATIVE_INT,
                 memspace,
@@ -707,7 +826,7 @@ public:
             );
         }
 
-        ++frame_;
+        ++frameCount_;
     }
 
     void close() {
@@ -715,58 +834,72 @@ public:
             return;
         }
 
-        if (frame_ != capacity_) {
-            extend(frame_);
+        if (frameCount_ != capacity_) {
+            extend(frameCount_);
         }
 
         file_.flush(H5F_SCOPE_GLOBAL);
-
-        field_.close();
-        step_.close();
+        fieldDataset_.close();
+        stepDataset_.close();
         file_.close();
 
         closed_ = true;
     }
 
 private:
-    void extend(std::size_t n) {
-        {
-            hsize_t dims[3] = {
-                static_cast<hsize_t>(n),
-                static_cast<hsize_t>(ny_),
-                static_cast<hsize_t>(nx_)
-            };
+    void extend(std::size_t newSize) {
+        hsize_t fieldDims[3] = {
+            static_cast<hsize_t>(newSize),
+            static_cast<hsize_t>(height_),
+            static_cast<hsize_t>(width_)
+        };
 
-            field_.extend(dims);
-        }
+        fieldDataset_.extend(fieldDims);
 
-        {
-            hsize_t dims[1] = {
-                static_cast<hsize_t>(n)
-            };
+        hsize_t stepDims[1] = {
+            static_cast<hsize_t>(newSize)
+        };
 
-            step_.extend(dims);
-        }
+        stepDataset_.extend(stepDims);
     }
 
-private:
     H5::H5File file_;
-    H5::DataSet field_;
-    H5::DataSet step_;
+    H5::DataSet fieldDataset_;
+    H5::DataSet stepDataset_;
 
-    std::size_t nx_{};
-    std::size_t ny_{};
+    std::size_t width_{};
+    std::size_t height_{};
     std::size_t batch_{};
-    std::size_t frame_{};
+    std::size_t frameCount_{};
     std::size_t capacity_{};
 
     bool closed_{false};
 };
 
+#else
 
-// ============================================================
-// CUDA KERNELS
-// ============================================================
+class TimeSeriesWriter {
+public:
+    TimeSeriesWriter(
+        const std::string&,
+        std::size_t,
+        std::size_t,
+        std::size_t = 32,
+        std::size_t = 256,
+        std::size_t = 256
+    )
+    {
+        throw std::runtime_error(
+            "This executable was built without HDF5 support. "
+            "Recompile with -DUSE_HDF5 to enable HDF5 output."
+        );
+    }
+
+    void writeFrame(int, const double*) {}
+    void close() {}
+};
+
+#endif
 
 __global__
 void computeWeightKernel(
@@ -786,33 +919,32 @@ void computeWeightKernel(
         return;
     }
 
-    const int p = idx2D_dev(i, j, nx);
+    const int p = linearIndexDev(i, j, nx);
 
-    const double ca = x0 + dx * static_cast<double>(i);
-    const double cb = y0 + dy * static_cast<double>(j);
+    const double cReal = x0 + dx * static_cast<double>(i);
+    const double cImag = y0 + dy * static_cast<double>(j);
 
-    double za = 0.0;
-    double zb = 0.0;
+    double zReal = 0.0;
+    double zImag = 0.0;
 
-    int it = 0;
+    int iter = 0;
 
-    for (; it < maxIters; ++it) {
-        if (za * za + zb * zb > 4.0) {
+    for (; iter < maxIters; ++iter) {
+        if (zReal * zReal + zImag * zImag > 4.0) {
             break;
         }
 
-        const double tmp = za * za - zb * zb + ca;
-        zb = 2.0 * za * zb + cb;
-        za = tmp;
+        const double tmp = zReal * zReal - zImag * zImag + cReal;
+        zImag = 2.0 * zReal * zImag + cImag;
+        zReal = tmp;
     }
 
-    weight[p] = it;
+    weight[p] = iter;
 }
-
 
 __global__
 void initializeFieldKernel(
-    double* u,
+    double* field,
     const int* weight,
     int nx,
     int ny,
@@ -820,9 +952,9 @@ void initializeFieldKernel(
     double y0,
     double dx,
     double dy,
-    double discrepancy,
-    int wmin,
-    int wmax
+    double meanDiscrepancy,
+    int minWeight,
+    int maxWeight
 ) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -831,31 +963,36 @@ void initializeFieldKernel(
         return;
     }
 
-    const int p = idx2D_dev(i, j, nx);
+    const int p = linearIndexDev(i, j, nx);
 
     const double x = x0 + dx * static_cast<double>(i);
     const double y = y0 + dy * static_cast<double>(j);
 
-    const double denom =
-        (wmax > wmin) ? static_cast<double>(wmax - wmin) : 1.0;
+    const double denom = (maxWeight > minWeight)
+        ? static_cast<double>(maxWeight - minWeight)
+        : 1.0;
 
-    const double F = (x * x * x + y * y * y) / 6.0;
-    const double wnorm = static_cast<double>(weight[p] - wmin) / denom;
+    const double reference = (x * x * x + y * y * y) / 6.0;
+    const double normalizedWeight =
+        static_cast<double>(weight[p] - minWeight) / denom;
 
-    u[p] = 293.16 + 80.0 * (discrepancy + F) * wnorm;
+    field[p] =
+        293.16 +
+        80.0 *
+        (meanDiscrepancy + reference) *
+        normalizedWeight;
 }
-
 
 __global__
 void updateInteriorKernel(
-    const double* __restrict__ u1,
-    double* __restrict__ u2,
+    const double* __restrict__ current,
+    double* __restrict__ next,
     int nx,
     int ny,
-    double dgx,
-    double dgy,
-    double CX,
-    double CY
+    double laplaceX,
+    double laplaceY,
+    double coeffX,
+    double coeffY
 ) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -864,26 +1001,26 @@ void updateInteriorKernel(
         return;
     }
 
-    const int p = idx2D_dev(i, j, nx);
+    const int p = linearIndexDev(i, j, nx);
 
-    u2[p] =
-        CX * (
-            u1[p - 1]
-            + u1[p + 1]
-            + (dgx + 0.5 / CX) * u1[p]
+    next[p] =
+        coeffX *
+        (
+            current[p - 1] +
+            current[p + 1] +
+            (laplaceX + 0.5 / coeffX) * current[p]
         )
-        + CY * (
-            u1[p - nx]
-            + u1[p + nx]
-            + (dgy + 0.5 / CY) * u1[p]
+        +
+        coeffY *
+        (
+            current[p - nx] +
+            current[p + nx] +
+            (laplaceY + 0.5 / coeffY) * current[p]
         );
 }
 
-
-// Left/right edges are updated first.
-// Top/bottom then copies from already-updated edge-adjacent values.
 __global__
-void applyBoundaryLRKernel(double* u, int nx, int ny) {
+void applyBoundaryLeftRightKernel(double* field, int nx, int ny) {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (j < 1 || j >= ny - 1) {
@@ -892,136 +1029,105 @@ void applyBoundaryLRKernel(double* u, int nx, int ny) {
 
     const int row = j * nx;
 
-    u[row] = u[row + 1];
-    u[row + nx - 1] = u[row + nx - 2];
+    field[row] = field[row + 1];
+    field[row + nx - 1] = field[row + nx - 2];
 }
 
-
 __global__
-void applyBoundaryTBKernel(double* u, int nx, int ny) {
+void applyBoundaryTopBottomKernel(double* field, int nx, int ny) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (i >= nx) {
         return;
     }
 
-    u[i] = u[nx + i];
-    u[(ny - 1) * nx + i] = u[(ny - 2) * nx + i];
+    field[i] = field[nx + i];
+    field[(ny - 1) * nx + i] = field[(ny - 2) * nx + i];
 }
 
+dim3 gridFor2D(int nx, int ny, dim3 block2d) {
+    return dim3(
+        static_cast<unsigned>((nx + static_cast<int>(block2d.x) - 1) / static_cast<int>(block2d.x)),
+        static_cast<unsigned>((ny + static_cast<int>(block2d.y) - 1) / static_cast<int>(block2d.y))
+    );
+}
 
-// ============================================================
-// CUDA LAUNCH HELPERS
-// ============================================================
-
-void launchComputeWeight(
+void launchComputeWeights(
     int* d_weight,
     int nx,
     int ny,
-    double x0,
-    double y0,
-    double dx,
-    double dy,
+    const GridMapping& mapping,
     int maxIters,
     dim3 block2d
 ) {
-    const dim3 grid2d(
-        static_cast<unsigned>((nx + static_cast<int>(block2d.x) - 1)
-                              / static_cast<int>(block2d.x)),
-        static_cast<unsigned>((ny + static_cast<int>(block2d.y) - 1)
-                              / static_cast<int>(block2d.y))
-    );
-
-    computeWeightKernel<<<grid2d, block2d>>>(
+    computeWeightKernel<<<gridFor2D(nx, ny, block2d), block2d>>>(
         d_weight,
         nx,
         ny,
-        x0,
-        y0,
-        dx,
-        dy,
+        mapping.x0,
+        mapping.y0,
+        mapping.dx,
+        mapping.dy,
         maxIters
     );
 
     CUDA_CHECK_LAST();
 }
 
-
 void launchInitializeField(
-    double* d_u,
+    double* d_field,
     const int* d_weight,
     int nx,
     int ny,
-    double x0,
-    double y0,
-    double dx,
-    double dy,
-    double discrepancy,
-    int wmin,
-    int wmax,
+    const GridMapping& mapping,
+    double meanDiscrepancy,
+    int minWeight,
+    int maxWeight,
     dim3 block2d
 ) {
-    const dim3 grid2d(
-        static_cast<unsigned>((nx + static_cast<int>(block2d.x) - 1)
-                              / static_cast<int>(block2d.x)),
-        static_cast<unsigned>((ny + static_cast<int>(block2d.y) - 1)
-                              / static_cast<int>(block2d.y))
-    );
-
-    initializeFieldKernel<<<grid2d, block2d>>>(
-        d_u,
+    initializeFieldKernel<<<gridFor2D(nx, ny, block2d), block2d>>>(
+        d_field,
         d_weight,
         nx,
         ny,
-        x0,
-        y0,
-        dx,
-        dy,
-        discrepancy,
-        wmin,
-        wmax
+        mapping.x0,
+        mapping.y0,
+        mapping.dx,
+        mapping.dy,
+        meanDiscrepancy,
+        minWeight,
+        maxWeight
     );
 
     CUDA_CHECK_LAST();
 }
 
-
-void launchUpdateField(
-    const double* d_u1,
-    double* d_u2,
+void launchAdvanceOneStep(
+    const double* d_current,
+    double* d_next,
     int nx,
     int ny,
-    double dgx,
-    double dgy,
-    double CX,
-    double CY,
+    const UpdateCoefficients& coeffs,
     dim3 block2d,
     int block1d
 ) {
-    const dim3 grid2d(
-        static_cast<unsigned>((nx + static_cast<int>(block2d.x) - 1)
-                              / static_cast<int>(block2d.x)),
-        static_cast<unsigned>((ny + static_cast<int>(block2d.y) - 1)
-                              / static_cast<int>(block2d.y))
-    );
-
-    updateInteriorKernel<<<grid2d, block2d>>>(
-        d_u1,
-        d_u2,
+    updateInteriorKernel<<<gridFor2D(nx, ny, block2d), block2d>>>(
+        d_current,
+        d_next,
         nx,
         ny,
-        dgx,
-        dgy,
-        CX,
-        CY
+        coeffs.laplaceX,
+        coeffs.laplaceY,
+        coeffs.coeffX,
+        coeffs.coeffY
     );
 
     CUDA_CHECK_LAST();
 
     const int gridY = (ny + block1d - 1) / block1d;
 
-    applyBoundaryLRKernel<<<gridY, block1d>>>(
-        d_u2,
+    applyBoundaryLeftRightKernel<<<gridY, block1d>>>(
+        d_next,
         nx,
         ny
     );
@@ -1030,8 +1136,8 @@ void launchUpdateField(
 
     const int gridX = (nx + block1d - 1) / block1d;
 
-    applyBoundaryTBKernel<<<gridX, block1d>>>(
-        d_u2,
+    applyBoundaryTopBottomKernel<<<gridX, block1d>>>(
+        d_next,
         nx,
         ny
     );
@@ -1039,443 +1145,562 @@ void launchUpdateField(
     CUDA_CHECK_LAST();
 }
 
+void advanceTemperatureFieldSteps(
+    DeviceBuffer<double>& currentField,
+    DeviceBuffer<double>& nextField,
+    int numberOfSteps,
+    int nx,
+    int ny,
+    const UpdateCoefficients& coeffs,
+    dim3 block2d,
+    int block1d
+) {
+    for (int step = 0; step < numberOfSteps; ++step) {
+        launchAdvanceOneStep(
+            currentField.get(),
+            nextField.get(),
+            nx,
+            ny,
+            coeffs,
+            block2d,
+            block1d
+        );
 
-// ============================================================
-// STATISTICS
-// ============================================================
-
-Stats computeStatsCPUReference(const double* u, std::size_t N) {
-    if (!u || N == 0) {
-        throw std::runtime_error("computeStatsCPUReference: empty field");
+        swap(currentField, nextField);
     }
-
-    const auto minmax = std::minmax_element(u, u + N);
-
-    long double sum = 0.0L;
-
-    for (std::size_t i = 0; i < N; ++i) {
-        sum += static_cast<long double>(u[i]);
-    }
-
-    const long double mean = sum / static_cast<long double>(N);
-
-    long double ssd = 0.0L;
-
-    for (std::size_t i = 0; i < N; ++i) {
-        const long double d = static_cast<long double>(u[i]) - mean;
-        ssd += d * d;
-    }
-
-    Stats s{};
-
-    s.minv = *minmax.first;
-    s.maxv = *minmax.second;
-    s.mean = static_cast<double>(mean);
-    s.stddev = static_cast<double>(
-        std::sqrt(ssd / static_cast<long double>(N))
-    );
-
-    return s;
 }
 
-
-struct SquareDeviationFunctor {
-    double mean;
-
-    __host__ __device__
-    explicit SquareDeviationFunctor(double m)
-        : mean(m)
-    {}
-
-    __host__ __device__
-    double operator()(const double& x) const {
-        const double delta = x - mean;
-        return delta * delta;
-    }
-};
-
-
-Stats computeStatsGPU(double* d_ptr, std::size_t N) {
-    if (!d_ptr || N == 0) {
-        throw std::runtime_error("computeStatsGPU: empty field");
+std::pair<int, int> computeWeightRangeOnDevice(int* d_weight, std::size_t count) {
+    if (!d_weight || count == 0) {
+        throw std::runtime_error("computeWeightRangeOnDevice: empty device field");
     }
 
-    thrust::device_ptr<double> t_ptr(d_ptr);
+    thrust::device_ptr<int> first(d_weight);
+    thrust::device_ptr<int> last = first + count;
 
-    Stats s{};
+    const auto minmaxPair = thrust::minmax_element(first, last);
 
-    auto minmax_pair = thrust::minmax_element(t_ptr, t_ptr + N);
+    const int minWeight = *minmaxPair.first;
+    const int maxWeight = *minmaxPair.second;
 
-    s.minv = *minmax_pair.first;
-    s.maxv = *minmax_pair.second;
-
-    const double sum = thrust::reduce(
-        t_ptr,
-        t_ptr + N,
-        0.0,
-        thrust::plus<double>()
-    );
-
-    s.mean = sum / static_cast<double>(N);
-
-    const double sum_squared_diff = thrust::transform_reduce(
-        t_ptr,
-        t_ptr + N,
-        SquareDeviationFunctor(s.mean),
-        0.0,
-        thrust::plus<double>()
-    );
-
-    s.stddev = std::sqrt(sum_squared_diff / static_cast<double>(N));
-
-    return s;
+    return {minWeight, maxWeight};
 }
 
+FieldStatistics computeFieldStatistics(const double* field, std::size_t count) {
+    if (!field || count == 0) {
+        throw std::runtime_error("computeFieldStatistics: empty field");
+    }
 
-void writeStatsHeader(std::ostream& os) {
-    os << "Step;Min;Mean;Max;Std_dev\n";
+    double minValue = std::numeric_limits<double>::infinity();
+    double maxValue = -std::numeric_limits<double>::infinity();
+    double sum = 0.0;
+    double sumSquares = 0.0;
+    double checksum = 0.0;
+
+    for (std::size_t i = 0; i < count; ++i) {
+        const double value = field[i];
+
+        minValue = std::min(minValue, value);
+        maxValue = std::max(maxValue, value);
+        sum += value;
+        sumSquares += value * value;
+        checksum += value * static_cast<double>((i % 1009U) + 1U);
+    }
+
+    const double mean = sum / static_cast<double>(count);
+
+    double sumSquaredDiff = 0.0;
+
+    for (std::size_t i = 0; i < count; ++i) {
+        const double diff = field[i] - mean;
+        sumSquaredDiff += diff * diff;
+    }
+
+    FieldStatistics stats{};
+    stats.minValue = minValue;
+    stats.meanValue = mean;
+    stats.maxValue = maxValue;
+    stats.stdDev = std::sqrt(sumSquaredDiff / static_cast<double>(count));
+    stats.l2Norm = std::sqrt(sumSquares);
+    stats.checksum = checksum;
+
+    return stats;
 }
 
-
-void writeStatsLine(std::ostream& os, int step, const Stats& s) {
-    os << step << ';'
-       << std::setprecision(15) << s.minv << ';'
-       << std::setprecision(15) << s.mean << ';'
-       << std::setprecision(15) << s.maxv << ';'
-       << std::setprecision(15) << s.stddev << '\n';
+void writeStatisticsHeader(std::ostream& out) {
+    out << "Step;Min;Mean;Max;Std_dev;L2_norm;Checksum\n";
 }
 
+void writeStatisticsRow(std::ostream& out, int step, const FieldStatistics& stats) {
+    out
+        << step << ';'
+        << std::setprecision(15) << stats.minValue << ';'
+        << std::setprecision(15) << stats.meanValue << ';'
+        << std::setprecision(15) << stats.maxValue << ';'
+        << std::setprecision(15) << stats.stdDev << ';'
+        << std::setprecision(15) << stats.l2Norm << ';'
+        << std::setprecision(15) << stats.checksum << '\n';
+}
 
-// ============================================================
-// MAIN
-// ============================================================
+CommandLineOptions parseCommandLineArguments(int argc, char** argv) {
+    CommandLineOptions options{};
+    std::vector<std::string> positional;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--device") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--device requires a value");
+            }
+            options.deviceId = parseStrictInt(argv[++i], "device");
+            continue;
+        }
+         
+        if (arg == "--block-x") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--block-x requires a value");
+            }
+            options.blockX = parseStrictPositiveInt(argv[++i], "block-x");
+            continue;
+        }
+         
+        if (arg == "--block-y") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--block-y requires a value");
+            }
+            options.blockY = parseStrictPositiveInt(argv[++i], "block-y");
+            continue;
+        }
+          
+        if (arg == "--block1d") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--block1d requires a value");
+            }
+            options.block1d = parseStrictPositiveInt(argv[++i], "block1d");
+            continue;
+        }
+        
+        if (arg == "--no-hdf5") {
+            options.writeHdf5 = false;
+            options.h5File = "none";
+            continue;
+        }
+        
+        if (arg == "--help" || arg == "-h") {
+            std::cout
+                << "Usage:\n"
+                << "  " << argv[0]
+                << " [options] [inputFile] [h5File|none|--no-hdf5] [csvFile] [outputEvery]\n\n"
+                << "Options:\n"
+                << "  --device N       Select CUDA device, default 0\n"
+                << "  --block-x N      CUDA 2D block x dimension, default 16\n"
+                << "  --block-y N      CUDA 2D block y dimension, default 16\n"
+                << "  --block1d N      CUDA 1D block size, default 256\n"
+                << "  --no-hdf5        Disable HDF5 output\n"
+                << "  --help, -h       Print this help message\n\n"
+                << "Examples:\n"
+                << "  " << argv[0] << " --device 0 input_final.in none Statistics_cuda.csv 0\n"
+                << "  " << argv[0] << " --device 0 input_medium.in output.h5 Statistics_cuda.csv 50\n\n"
+                << "Default official grading mode disables HDF5.\n";
+
+            std::exit(0);
+        }
+
+        if (beginsWithDoubleDash(arg)) {
+            throw std::runtime_error("Unknown option: " + arg);
+        }
+
+        positional.push_back(arg);
+    }
+
+    if (positional.size() > 4) {
+        throw std::runtime_error("Too many positional arguments");
+    }
+
+    if (positional.size() >= 1) {
+        options.inputFile = positional[0];
+    }
+
+    if (positional.size() >= 2) {
+        options.h5File = positional[1];
+        options.writeHdf5 = !isNoHdf5Token(options.h5File);
+    }
+
+    if (positional.size() >= 3) {
+        options.csvFile = positional[2];
+    }
+
+    if (positional.size() >= 4) {
+        options.outputEvery = parseStrictInt(positional[3], "outputEvery");
+        options.overrideOutputEvery = true;
+
+        if (options.outputEvery < 0) {
+            throw std::runtime_error("outputEvery must be non-negative");
+        }
+    }
+
+    return options;
+}
+
+bool shouldWriteStep(int step, int finalStep, int outputEvery) {
+    if (step == finalStep) {
+        return true;
+    }
+
+    if (outputEvery <= 0) {
+        return false;
+    }
+
+    if (step == 0) {
+        return true;
+    }
+
+    return (step % outputEvery) == 0;
+}
+
+std::vector<int> buildOutputSchedule(int finalStep, int outputEvery) {
+    std::vector<int> steps;
+
+    if (outputEvery > 0) {
+        steps.push_back(0);
+
+        for (int step = outputEvery; step < finalStep; step += outputEvery) {
+            steps.push_back(step);
+        }
+    }
+
+    if (steps.empty() || steps.back() != finalStep) {
+        steps.push_back(finalStep);
+    }
+
+    return steps;
+}
+
+void printRunHeader(
+    const CommandLineOptions& cli,
+    const SimulationConfig& cfg,
+    bool hdf5Compiled,
+    const cudaDeviceProp& prop,
+    dim3 block2d
+) {
+    std::cout << "Input file:                    " << cli.inputFile << '\n';
+    std::cout << "CSV output:                    " << cli.csvFile << '\n';
+    std::cout << "HDF5 compiled:                 " << (hdf5Compiled ? "yes" : "no") << '\n';
+    std::cout << "HDF5 output:                   " << (cli.writeHdf5 ? cli.h5File : "disabled") << '\n';
+    std::cout << "Official grading mode:         " << (!cli.writeHdf5 ? "yes" : "no") << '\n';
+    std::cout << "Grid:                          " << cfg.gridWidth << " x " << cfg.gridHeight << '\n';
+    std::cout << "Measured points:               " << cfg.measuredPoints.size() << '\n';
+    std::cout << "Max fractal iterations:        " << cfg.maxFractalIterations << '\n';
+    std::cout << "Time steps:                    " << cfg.timeSteps << '\n';
+
+    if (cfg.outputEvery == 0) {
+        std::cout << "Snapshot/statistics policy:     final step only\n";
+    } else {
+        std::cout << "Snapshot/statistics policy:     step 0, every "
+                  << cfg.outputEvery << " step(s), and final step\n";
+    }
+
+    std::cout << "CUDA device:                    " << cli.deviceId << " - " << prop.name << '\n';
+    std::cout << "CUDA compute capability:        " << prop.major << '.' << prop.minor << '\n';
+    std::cout << "CUDA global memory:             "
+              << static_cast<double>(prop.totalGlobalMem) / (1024.0 * 1024.0 * 1024.0)
+              << " GiB\n";
+    std::cout << "CUDA block2d:                   " << block2d.x << " x " << block2d.y << '\n';
+    std::cout << "CUDA block1d:                   " << cli.block1d << '\n';
+    std::cout << '\n';
+}
 
 int main(int argc, char** argv) {
+#ifdef USE_HDF5
     H5::Exception::dontPrint();
+#endif
 
     try {
-        if (argc > 5) {
+        const CommandLineOptions cli = parseCommandLineArguments(argc, argv);
+
+        selectCudaDevice(cli.deviceId);
+
+        cudaDeviceProp prop{};
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, cli.deviceId));
+
+        const dim3 block2d(
+            static_cast<unsigned>(cli.blockX),
+            static_cast<unsigned>(cli.blockY),
+            1
+        );
+
+        validateCudaLaunchConfig(block2d, cli.block1d);
+
+        SimulationConfig cfg = readConfigurationFile(cli.inputFile);
+
+        if (cli.overrideOutputEvery) {
+            cfg.outputEvery = cli.outputEvery;
+        }
+
+#ifndef USE_HDF5
+        if (cli.writeHdf5) {
             throw std::runtime_error(
-                "Too many positional arguments. Expected: input h5 csv outputEvery"
+                "HDF5 output requested, but executable was built without HDF5 support. "
+                "Use 'none' for the HDF5 argument or rebuild with -DUSE_HDF5."
             );
         }
+#endif
 
-        const std::string inputFile = (argc > 1) ? argv[1] : "inout/Cooling.in";
-        const std::string h5File = (argc > 2) ? argv[2] : "output/Cooling.h5";
-        const std::string csvFile = (argc > 3) ? argv[3] : "output/Statistics.csv";
+        ensureParentDirectoryExists(cli.csvFile);
 
-        Config cfg = readInput(inputFile);
-
-        // Command-line outputEvery overrides input-file outputEvery.
-        // If neither specifies outputEvery, only the final state is written.
-        if (argc > 4) {
-            cfg.outputEvery = parseStrictInt(argv[4], "outputEvery");
-            cfg.hasOutputEvery = true;
-
-            if (cfg.outputEvery <= 0) {
-                throw std::invalid_argument("outputEvery must be > 0");
-            }
+        if (cli.writeHdf5) {
+            ensureParentDirectoryExists(cli.h5File);
         }
 
-        if (cfg.hasOutputEvery && cfg.outputEvery <= 0) {
-            throw std::invalid_argument("outputEvery must be > 0");
+        const std::size_t totalCells = checkedGridSize(cfg.gridWidth, cfg.gridHeight);
+
+        if (cfg.gridWidth > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+            cfg.gridHeight > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+            totalCells > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+            throw std::runtime_error("Grid exceeds 32-bit CUDA indexing range used by this implementation");
         }
 
-        const std::size_t N = safeGridSize(cfg.nx, cfg.ny);
+        const int nx = static_cast<int>(cfg.gridWidth);
+        const int ny = static_cast<int>(cfg.gridHeight);
 
-        if (cfg.nx > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
-            cfg.ny > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
-            N > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-            throw std::runtime_error(
-                "Grid exceeds 32-bit CUDA indexing range used by this implementation"
-            );
-        }
+        const GridMapping mapping = buildGridMapping(cfg);
+        const UpdateCoefficients coeffs = buildUpdateCoefficients(mapping.dx, mapping.dy, 100.0);
+        const double meanDiscrepancy = computeMeanDiscrepancy(cfg);
 
-        const int nx_i = static_cast<int>(cfg.nx);
-        const int ny_i = static_cast<int>(cfg.ny);
+#ifdef USE_HDF5
+        constexpr bool hdf5Compiled = true;
+#else
+        constexpr bool hdf5Compiled = false;
+#endif
 
-        const DomainMap map = buildDomainMap(cfg);
-        const CoolingCoeffs cooling = buildCoolingCoeffs(map.dx, map.dy, 100.0);
-        const double discrepancy = computeDiscrepancy(cfg);
+        printRunHeader(cli, cfg, hdf5Compiled, prop, block2d);
 
-        const dim3 block2d(16, 16);
-        constexpr int block1d = 256;
-
-        validateCudaLaunchConfig(block2d, block1d);
-
-        DeviceBuffer<int> d_weight(N);
-        DeviceBuffer<double> d_uCurr(N);
-        DeviceBuffer<double> d_uNext(N);
-
-        PinnedHostBuffer<double> uHost(N);
-
-        std::ofstream csv(csvFile);
+        std::ofstream csv(cli.csvFile);
 
         if (!csv) {
-            throw std::runtime_error("Cannot open CSV output file: " + csvFile);
+            throw std::runtime_error("Cannot open CSV output file: " + cli.csvFile);
         }
 
-        writeStatsHeader(csv);
+        writeStatisticsHeader(csv);
 
-        std::cout << "Input file:                   " << inputFile << '\n';
-        std::cout << "HDF5 output:                  " << h5File << '\n';
-        std::cout << "CSV output:                   " << csvFile << '\n';
-        std::cout << "Grid:                         " << cfg.nx << " x " << cfg.ny << '\n';
-        std::cout << "Measured points:              " << cfg.measured.size() << '\n';
-        std::cout << "Max iterations:               " << cfg.maxIters << '\n';
-        std::cout << "Time steps:                   " << cfg.steps << '\n';
+        DeviceBuffer<int> d_weight(totalCells);
+        DeviceBuffer<double> d_currentField(totalCells);
+        DeviceBuffer<double> d_nextField(totalCells);
+        PinnedHostBuffer<double> hostField(totalCells);
+        
+	ScopedTimer totalTimer;
 
-        if (cfg.hasOutputEvery) {
-            std::cout << "Snapshot every:               "
-                      << cfg.outputEvery << " step(s)\n";
-        } else {
-            std::cout << "Snapshot every:               final step only\n";
-        }
+        CudaEventTimer gpuTimer;
 
-        std::cout << "CUDA block2d:                 "
-                  << block2d.x << " x " << block2d.y << '\n';
-        std::cout << "CUDA block1d:                 " << block1d << "\n\n";
-
-        CudaEvent weightStart;
-        CudaEvent weightStop;
-
-        CudaEvent initStart;
-        CudaEvent initStop;
-
-        CudaEvent dynBatchStart;
-        CudaEvent dynBatchStop;
-
-        float tWeightMs = 0.0f;
-        float tInitMs = 0.0f;
-        float tDynUpdateKernelMsAccum = 0.0f;
-
-        // ----------------------------------------------------
-        // Stage 1: weight field
-        // ----------------------------------------------------
-        CUDA_CHECK(cudaEventRecord(weightStart.get()));
-
-        launchComputeWeight(
+        gpuTimer.start();
+        launchComputeWeights(
             d_weight.get(),
-            nx_i,
-            ny_i,
-            map.x0,
-            map.y0,
-            map.dx,
-            map.dy,
-            cfg.maxIters,
+            nx,
+            ny,
+            mapping,
+            cfg.maxFractalIterations,
             block2d
         );
+        const double weightKernelTime = gpuTimer.stopSeconds();
 
-        CUDA_CHECK(cudaEventRecord(weightStop.get()));
-        CUDA_CHECK(cudaEventSynchronize(weightStop.get()));
-        CUDA_CHECK(cudaEventElapsedTime(
-            &tWeightMs,
-            weightStart.get(),
-            weightStop.get()
-        ));
+        ScopedTimer weightRangeTimer;
+        const auto [minWeight, maxWeight] = computeWeightRangeOnDevice(
+            d_weight.get(),
+            totalCells
+        );
+        CUDA_CHECK(cudaDeviceSynchronize());
+        const double weightRangeTime = weightRangeTimer.elapsedSeconds();
 
-        thrust::device_ptr<int> w_ptr(d_weight.get());
-
-        auto minmax_pair = thrust::minmax_element(w_ptr, w_ptr + N);
-
-        const int wmin = *minmax_pair.first;
-        const int wmax = *minmax_pair.second;
-
-        // ----------------------------------------------------
-        // Stage 2: initialization
-        // ----------------------------------------------------
-        CUDA_CHECK(cudaEventRecord(initStart.get()));
-
+        gpuTimer.start();
         launchInitializeField(
-            d_uCurr.get(),
+            d_currentField.get(),
             d_weight.get(),
-            nx_i,
-            ny_i,
-            map.x0,
-            map.y0,
-            map.dx,
-            map.dy,
-            discrepancy,
-            wmin,
-            wmax,
+            nx,
+            ny,
+            mapping,
+            meanDiscrepancy,
+            minWeight,
+            maxWeight,
             block2d
         );
+        const double initKernelTime = gpuTimer.stopSeconds();
 
-        CUDA_CHECK(cudaEventRecord(initStop.get()));
-        CUDA_CHECK(cudaEventSynchronize(initStop.get()));
-        CUDA_CHECK(cudaEventElapsedTime(
-            &tInitMs,
-            initStart.get(),
-            initStop.get()
-        ));
+        std::unique_ptr<TimeSeriesWriter> writer;
 
-        // ----------------------------------------------------
-        // Stage 3: dynamics + output
-        // ----------------------------------------------------
-        auto dynWallStart = std::chrono::steady_clock::now();
+        if (cli.writeHdf5) {
+            writer = std::make_unique<TimeSeriesWriter>(
+                cli.h5File,
+                cfg.gridWidth,
+                cfg.gridHeight,
+                32,
+                256,
+                256
+            );
+        }
 
-        H5Writer writer(h5File, cfg.nx, cfg.ny, 32);
+        double pureDynamicsKernelTime = 0.0;
+        double deviceToHostCopyTime = 0.0;
+        double statisticsTime = 0.0;
+        double csvTime = 0.0;
+        double hdf5Time = 0.0;
 
         int outputFrames = 0;
-        bool hasLastWrittenStep = false;
-        int lastWrittenStep = -1;
 
-        auto writeOutputFrame = [&](int step) {
-            if (hasLastWrittenStep && step == lastWrittenStep) {
-                return;
-            }
+        FieldStatistics finalStats{};
+
+        auto copyCurrentFieldToHost = [&]() {
+            ScopedTimer copyTimer;
 
             CUDA_CHECK(cudaMemcpy(
-                uHost.data(),
-                d_uCurr.get(),
-                N * sizeof(double),
+                hostField.data(),
+                d_currentField.get(),
+                totalCells * sizeof(double),
                 cudaMemcpyDeviceToHost
             ));
 
-            writer.write(step, uHost.data(), N);
+            deviceToHostCopyTime += copyTimer.elapsedSeconds();
+        };
 
-            Stats s = computeStatsGPU(d_uCurr.get(), N);
-            writeStatsLine(csv, step, s);
+        auto writeOutputFrame = [&](int step) {
+            copyCurrentFieldToHost();
 
-            hasLastWrittenStep = true;
-            lastWrittenStep = step;
+            ScopedTimer statsTimer;
+            const FieldStatistics stats = computeFieldStatistics(
+                hostField.data(),
+                totalCells
+            );
+            statisticsTime += statsTimer.elapsedSeconds();
+
+            finalStats = stats;
+
+            ScopedTimer csvTimer;
+            writeStatisticsRow(csv, step, stats);
+            csvTime += csvTimer.elapsedSeconds();
+
+            if (writer) {
+                ScopedTimer hdf5Timer;
+                writer->writeFrame(step, hostField.data());
+                hdf5Time += hdf5Timer.elapsedSeconds();
+            }
+
             ++outputFrames;
         };
 
-        bool dynTimerRunning = false;
+        const std::vector<int> outputSchedule =
+            buildOutputSchedule(cfg.timeSteps, cfg.outputEvery);
 
-        auto startDynTimer = [&]() {
-            if (!dynTimerRunning && cfg.steps > 0) {
-                CUDA_CHECK(cudaEventRecord(dynBatchStart.get()));
-                dynTimerRunning = true;
+        ScopedTimer loopTimer;
+
+        int currentStep = 0;
+
+        for (const int targetStep : outputSchedule) {
+            if (targetStep < currentStep || targetStep > cfg.timeSteps) {
+                throw std::runtime_error("Internal error: invalid output schedule");
             }
-        };
 
-        auto stopDynTimerAndAccumulate = [&]() {
-            if (dynTimerRunning) {
-                CUDA_CHECK(cudaEventRecord(dynBatchStop.get()));
-                CUDA_CHECK(cudaEventSynchronize(dynBatchStop.get()));
+            const int stepsToAdvance = targetStep - currentStep;
 
-                float batchMs = 0.0f;
+            if (stepsToAdvance > 0) {
+                gpuTimer.start();
 
-                CUDA_CHECK(cudaEventElapsedTime(
-                    &batchMs,
-                    dynBatchStart.get(),
-                    dynBatchStop.get()
-                ));
+                advanceTemperatureFieldSteps(
+                    d_currentField,
+                    d_nextField,
+                    stepsToAdvance,
+                    nx,
+                    ny,
+                    coeffs,
+                    block2d,
+                    cli.block1d
+                );
 
-                tDynUpdateKernelMsAccum += batchMs;
-                dynTimerRunning = false;
+                pureDynamicsKernelTime += gpuTimer.stopSeconds();
+                currentStep = targetStep;
             }
-        };
 
-        // If outputEvery was explicitly specified, write the initial condition.
-        // If not specified, do not write step 0 here.
-        if (cfg.hasOutputEvery) {
-            writeOutputFrame(0);
-        }
-
-        startDynTimer();
-
-        for (int step = 1; step <= cfg.steps; ++step) {
-            launchUpdateField(
-                d_uCurr.get(),
-                d_uNext.get(),
-                nx_i,
-                ny_i,
-                cooling.dgx,
-                cooling.dgy,
-                cooling.CX,
-                cooling.CY,
-                block2d,
-                block1d
-            );
-
-            swap(d_uCurr, d_uNext);
-
-            // Intermediate output only when outputEvery was explicitly specified.
-            if (cfg.hasOutputEvery && (step % cfg.outputEvery) == 0) {
-                stopDynTimerAndAccumulate();
-
-                writeOutputFrame(step);
-
-                if (step < cfg.steps) {
-                    startDynTimer();
-                }
+            if (shouldWriteStep(targetStep, cfg.timeSteps, cfg.outputEvery)) {
+                writeOutputFrame(targetStep);
             }
         }
-
-        // If no periodic output happened at the final step, stop the kernel timer
-        // before final host copy/stats/HDF5 output.
-        stopDynTimerAndAccumulate();
-
-        // Always write the final state.
-        // If it was already written by periodic output, the duplicate guard skips it.
-        writeOutputFrame(cfg.steps);
 
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        writer.close();
-
-        auto dynWallStop = std::chrono::steady_clock::now();
-
-        const double tDynWall =
-            std::chrono::duration<double>(dynWallStop - dynWallStart).count();
-
-        std::cout << "Weight field GPU kernel time:       "
-                  << (tWeightMs / 1e3f) << " s\n";
-
-        std::cout << "Init field GPU kernel time:         "
-                  << (tInitMs / 1e3f) << " s\n";
-
-        std::cout << "Dynamics update kernels only:       "
-                  << (tDynUpdateKernelMsAccum / 1e3f) << " s\n";
-
-        std::cout << "Dynamics loop wall incl. copy/stats/I/O: "
-                  << tDynWall << " s\n";
-
-        std::cout << "Output frames:                      "
-                  << outputFrames << '\n';
-
-        if (cfg.steps > 0) {
-            const double updates =
-                static_cast<double>(cfg.nx - 2)
-                * static_cast<double>(cfg.ny - 2)
-                * static_cast<double>(cfg.steps);
-
-            if (tDynUpdateKernelMsAccum > 0.0f) {
-                const double gpuKernelSeconds =
-                    static_cast<double>(tDynUpdateKernelMsAccum) / 1e3;
-
-                std::cout << "Performance, update kernels only:   "
-                          << updates / gpuKernelSeconds / 1e9
-                          << " GLUP/s\n";
-            }
-
-            if (tDynWall > 0.0) {
-                std::cout << "Performance, end-to-end loop:       "
-                          << updates / tDynWall / 1e9
-                          << " GLUP/s\n";
-            }
+        if (writer) {
+            writer->close();
         }
 
-        std::cout << "Mean discrepancy:                   "
-                  << std::setprecision(15) << discrepancy << '\n';
+        csv.flush();
+
+        const double loopWallTime = loopTimer.elapsedSeconds();
+        const double totalWallTime = totalTimer.elapsedSeconds();
+
+        const double updates =
+            static_cast<double>(cfg.gridWidth - 2) *
+            static_cast<double>(cfg.gridHeight - 2) *
+            static_cast<double>(cfg.timeSteps);
+
+        std::cout << "Weight field GPU kernel time:       " << weightKernelTime << " s\n";
+        std::cout << "Weight range reduction time:         " << weightRangeTime << " s\n";
+        std::cout << "Initialization GPU kernel time:      " << initKernelTime << " s\n";
+        std::cout << "Dynamics update kernels only:        " << pureDynamicsKernelTime << " s\n";
+        std::cout << "Device-to-host copy time:            " << deviceToHostCopyTime << " s\n";
+        std::cout << "Statistics time:                     " << statisticsTime << " s\n";
+        std::cout << "CSV write time:                      " << csvTime << " s\n";
+        std::cout << "HDF5 write time:                     " << hdf5Time << " s\n";
+        std::cout << "Dynamics loop wall incl. copy/I/O:   " << loopWallTime << " s\n";
+        std::cout << "Total measured wall time:            " << totalWallTime << " s\n";
+        std::cout << "Output frames:                       " << outputFrames << '\n';
+
+        if (cfg.timeSteps > 0 && pureDynamicsKernelTime > 0.0) {
+            std::cout << "Performance, update kernels only:    "
+                      << updates / pureDynamicsKernelTime / 1.0e9
+                      << " GLUP/s\n";
+        }
+
+        if (cfg.timeSteps > 0 && loopWallTime > 0.0) {
+            std::cout << "Performance, end-to-end loop:        "
+                      << updates / loopWallTime / 1.0e9
+                      << " GLUP/s\n";
+        }
+
+        std::cout << "Mean discrepancy:                    "
+                  << std::setprecision(15) << meanDiscrepancy << '\n';
+
+        std::cout << "Final min:                           "
+                  << std::setprecision(15) << finalStats.minValue << '\n';
+
+        std::cout << "Final mean:                          "
+                  << std::setprecision(15) << finalStats.meanValue << '\n';
+
+        std::cout << "Final max:                           "
+                  << std::setprecision(15) << finalStats.maxValue << '\n';
+
+        std::cout << "Final std.dev.:                      "
+                  << std::setprecision(15) << finalStats.stdDev << '\n';
+
+        std::cout << "Final L2 norm:                       "
+                  << std::setprecision(15) << finalStats.l2Norm << '\n';
+
+        std::cout << "Final checksum:                      "
+                  << std::setprecision(15) << finalStats.checksum << '\n';
+
+        std::cout << "Weight range:                        "
+                  << minWeight << " ... " << maxWeight << '\n';
 
         std::cout << "\nSimulation completed successfully.\n";
 
         return 0;
-    }
-    catch (const H5::Exception& e) {
+
+#ifdef USE_HDF5
+    } catch (const H5::Exception& e) {
         std::cerr << "HDF5 ERROR: " << e.getDetailMsg() << '\n';
         return 1;
-    }
-    catch (const std::exception& e) {
+#endif
+    } catch (const std::exception& e) {
         std::cerr << "CRITICAL ERROR: " << e.what() << '\n';
         return 1;
-    }
-    catch (...) {
-        std::cerr << "CRITICAL ERROR: Unknown failure\n";
+    } catch (...) {
+        std::cerr << "CRITICAL ERROR: unknown failure\n";
         return 1;
     }
 }

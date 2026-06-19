@@ -1,17 +1,22 @@
-cmake_minimum_required(VERSION 3.18...3.30)
-
+cmake_minimum_required(VERSION 3.25...3.30)
 project(CoolingSimulation LANGUAGES CXX)
 
 # ============================================================
 # Options
 # ============================================================
 
+set(COOLING_BUILD_HDF5 "AUTO" CACHE STRING
+    "Build HDF5 support: OFF, ON, or AUTO"
+)
+
 set(COOLING_BUILD_OPENMP "OFF" CACHE STRING
     "Build OpenMP executable: OFF, ON, or AUTO"
 )
+
 set(COOLING_BUILD_CUDA "OFF" CACHE STRING
     "Build CUDA executable: OFF, ON, or AUTO"
 )
+
 set(COOLING_CUDA_ARCHITECTURES "AUTO" CACHE STRING
     "CUDA architectures: AUTO, native, 80, 90, or list like 70;80;90"
 )
@@ -31,12 +36,17 @@ option(COOLING_STRICT_CUDA
     OFF
 )
 
+set_property(CACHE COOLING_BUILD_HDF5 PROPERTY STRINGS OFF ON AUTO)
 set_property(CACHE COOLING_BUILD_OPENMP PROPERTY STRINGS OFF ON AUTO)
 set_property(CACHE COOLING_BUILD_CUDA PROPERTY STRINGS OFF ON AUTO)
 
 # ============================================================
 # Validate options
 # ============================================================
+
+if(NOT COOLING_BUILD_HDF5 MATCHES "^(OFF|ON|AUTO)$")
+    message(FATAL_ERROR "COOLING_BUILD_HDF5 must be OFF, ON, or AUTO")
+endif()
 
 if(NOT COOLING_BUILD_OPENMP MATCHES "^(OFF|ON|AUTO)$")
     message(FATAL_ERROR "COOLING_BUILD_OPENMP must be OFF, ON, or AUTO")
@@ -67,15 +77,37 @@ if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
 endif()
 
 # ============================================================
-# Dependencies
+# Optional HDF5
 # ============================================================
 
-find_package(HDF5 REQUIRED COMPONENTS C CXX)
+set(COOLING_HDF5_AVAILABLE OFF)
 
+if(NOT COOLING_BUILD_HDF5 STREQUAL "OFF")
+    find_package(HDF5 QUIET COMPONENTS C CXX)
+
+    if(HDF5_FOUND)
+        set(COOLING_HDF5_AVAILABLE ON)
+    elseif(COOLING_BUILD_HDF5 STREQUAL "ON")
+        message(FATAL_ERROR
+            "HDF5 support was requested with COOLING_BUILD_HDF5=ON, "
+            "but HDF5 was not found."
+        )
+    else()
+        message(WARNING
+            "HDF5 not found. Building without HDF5 support."
+        )
+    endif()
+endif()
+
+# ============================================================
 # Optional OpenMP
+# ============================================================
+
 set(COOLING_OPENMP_AVAILABLE OFF)
+
 if(NOT COOLING_BUILD_OPENMP STREQUAL "OFF")
     find_package(OpenMP QUIET COMPONENTS CXX)
+
     if(OpenMP_CXX_FOUND)
         set(COOLING_OPENMP_AVAILABLE ON)
     elseif(COOLING_BUILD_OPENMP STREQUAL "ON")
@@ -89,8 +121,12 @@ if(NOT COOLING_BUILD_OPENMP STREQUAL "OFF")
     endif()
 endif()
 
+# ============================================================
 # Optional CUDA
+# ============================================================
+
 set(COOLING_CUDA_AVAILABLE OFF)
+
 if(NOT COOLING_BUILD_CUDA STREQUAL "OFF")
     include(CheckLanguage)
     check_language(CUDA)
@@ -135,12 +171,22 @@ endif()
 # Helper functions
 # ============================================================
 
+
 function(cooling_apply_hdf5 target_name)
+	if(NOT COOLING_HDF5_AVAILABLE)
+        return()
+    endif()
+
+    target_compile_definitions(${target_name} PRIVATE USE_HDF5=1)
+
     if(TARGET hdf5::hdf5_cpp)
         target_link_libraries(${target_name} PRIVATE hdf5::hdf5_cpp)
+
         if(TARGET hdf5::hdf5)
             target_link_libraries(${target_name} PRIVATE hdf5::hdf5)
         endif()
+    elseif(TARGET HDF5::HDF5)
+        target_link_libraries(${target_name} PRIVATE HDF5::HDF5)
     elseif(TARGET hdf5::hdf5)
         target_link_libraries(${target_name} PRIVATE hdf5::hdf5)
     else()
@@ -219,7 +265,13 @@ target_compile_definitions(cooling_serial PRIVATE COOLING_SERIAL=1)
 
 # OpenMP target: optional
 if(COOLING_OPENMP_AVAILABLE)
-    cooling_optional_source(cooling_omp "${COOLING_OMP_SRC}" "${COOLING_BUILD_OPENMP}" "OpenMP")
+    cooling_optional_source(
+        cooling_omp
+        "${COOLING_OMP_SRC}"
+        "${COOLING_BUILD_OPENMP}"
+        "OpenMP"
+    )
+
     if(TARGET cooling_omp)
         target_link_libraries(cooling_omp PRIVATE OpenMP::OpenMP_CXX)
         target_compile_definitions(cooling_omp PRIVATE COOLING_OPENMP=1)
@@ -228,7 +280,13 @@ endif()
 
 # CUDA target: optional
 if(COOLING_CUDA_AVAILABLE)
-    cooling_optional_source(cooling_cuda "${COOLING_CUDA_SRC}" "${COOLING_BUILD_CUDA}" "CUDA")
+    cooling_optional_source(
+        cooling_cuda
+        "${COOLING_CUDA_SRC}"
+        "${COOLING_BUILD_CUDA}"
+        "CUDA"
+    )
+
     if(TARGET cooling_cuda)
         set_target_properties(cooling_cuda PROPERTIES
             CUDA_SEPARABLE_COMPILATION ON
@@ -263,22 +321,42 @@ endif()
 # Summary
 # ============================================================
 
-message(STATUS "")
-message(STATUS "CoolingSimulation configuration")
-message(STATUS "  System:                   ${CMAKE_SYSTEM_NAME}")
-message(STATUS "  Processor:                ${CMAKE_SYSTEM_PROCESSOR}")
-message(STATUS "  C++ compiler:             ${CMAKE_CXX_COMPILER}")
-message(STATUS "  Build type:               ${CMAKE_BUILD_TYPE}")
-message(STATUS "  Serial target:            ON")
-message(STATUS "  OpenMP requested:         ${COOLING_BUILD_OPENMP}")
-message(STATUS "  OpenMP available:         ${COOLING_OPENMP_AVAILABLE}")
-message(STATUS "  CUDA requested:           ${COOLING_BUILD_CUDA}")
-message(STATUS "  CUDA available:           ${COOLING_CUDA_AVAILABLE}")
-message(STATUS "  Native host architecture: ${COOLING_NATIVE_ARCH}")
+if(TARGET cooling_omp)
+    set(COOLING_OMP_TARGET_BUILT ON)
+else()
+    set(COOLING_OMP_TARGET_BUILT OFF)
+endif()
+
+if(TARGET cooling_cuda)
+    set(COOLING_CUDA_TARGET_BUILT ON)
+else()
+    set(COOLING_CUDA_TARGET_BUILT OFF)
+endif()
+
 if(DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(COOLING_CUDA_ARCH_SUMMARY "${CMAKE_CUDA_ARCHITECTURES}")
 else()
     set(COOLING_CUDA_ARCH_SUMMARY "not set")
 endif()
+
+message(STATUS "")
+message(STATUS "CoolingSimulation configuration")
+message(STATUS "  System:                   ${CMAKE_SYSTEM_NAME}")
+message(STATUS "  Processor:                ${CMAKE_SYSTEM_PROCESSOR}")
+message(STATUS "  C++ compiler:             ${CMAKE_CXX_COMPILER}")
+if(COOLING_CUDA_AVAILABLE)
+    message(STATUS "  CUDA compiler:            ${CMAKE_CUDA_COMPILER}")
+endif()
+message(STATUS "  Build type:               ${CMAKE_BUILD_TYPE}")
+message(STATUS "  Serial target built:      ON")
+message(STATUS "  HDF5 requested:           ${COOLING_BUILD_HDF5}")
+message(STATUS "  HDF5 available:           ${COOLING_HDF5_AVAILABLE}")
+message(STATUS "  OpenMP requested:         ${COOLING_BUILD_OPENMP}")
+message(STATUS "  OpenMP available:         ${COOLING_OPENMP_AVAILABLE}")
+message(STATUS "  OpenMP target built:      ${COOLING_OMP_TARGET_BUILT}")
+message(STATUS "  CUDA requested:           ${COOLING_BUILD_CUDA}")
+message(STATUS "  CUDA available:           ${COOLING_CUDA_AVAILABLE}")
+message(STATUS "  CUDA target built:        ${COOLING_CUDA_TARGET_BUILT}")
+message(STATUS "  Native host architecture: ${COOLING_NATIVE_ARCH}")
 message(STATUS "  CUDA architectures:       ${COOLING_CUDA_ARCH_SUMMARY}")
 message(STATUS "")

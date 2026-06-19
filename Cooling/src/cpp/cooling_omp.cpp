@@ -1,14 +1,80 @@
+/*
+================================================================================
+Cooling Field Solver - OpenMP Reference Implementation
+================================================================================
+
+Instructor/reference OpenMP implementation of the serial C++17 baseline.
+
+The numerical model, input format, CSV statistics, and
+HDF5 behavior are intentionally kept aligned with the serial baseline.
+
+This version parallelizes the independent grid loops, stencil update, and
+global reductions using OpenMP. HDF5 output remains serial and optional.
+
+Official performance mode:
+
+  ./cooling_omp input_final.in none output_final_omp.csv 0
+
+or with an explicit thread count:
+
+  ./cooling_omp --threads 16 input_final.in none output_final_omp.csv 0
+
+Compile without HDF5:
+
+  g++ -O3 -std=c++17 -Wall -Wextra -pedantic -fopenmp \
+      cooling_omp.cpp -o cooling_omp
+
+Compile with HDF5:
+
+  g++ -O3 -std=c++17 -Wall -Wextra -pedantic -fopenmp -DUSE_HDF5 \
+      cooling_omp.cpp -o cooling_omp \
+      -lhdf5_cpp -lhdf5
+
+Depending on the cluster configuration, students may need an HDF5 compiler
+wrapper, modules, or explicit include/library paths.
+
+Input file format, after removing comments beginning with '#':
+
+  gridWidth
+  gridHeight
+  numberOfMeasuredPoints
+  x y value        repeated numberOfMeasuredPoints times
+  domainStartX
+  domainStartY
+  domainWidth
+  domainHeight
+  maxFractalIterations
+  timeSteps
+  outputEvery      optional; 0 means final step only
+
+Command line:
+
+  ./cooling_omp [--threads N] [inputFile] [h5File|none|--no-hdf5] [csvFile] [outputEvery]
+
+Examples:
+
+  ./cooling_omp --threads 16 input_final.in none Statistics_omp.csv 0
+  ./cooling_omp --threads 16 input_medium.in output.h5 Statistics_omp.csv 50
+
+================================================================================
+*/
+
+#ifdef USE_HDF5
 #include <H5Cpp.h>
+#endif
 
 #include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -20,11 +86,6 @@
 #include <omp.h>
 #endif
 
-
-// ============================================================
-// PORTABILITY HELPERS
-// ============================================================
-
 #if defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER)
 #define RESTRICT __restrict
 #else
@@ -32,128 +93,150 @@
 #endif
 
 using index_t = std::ptrdiff_t;
+namespace fs = std::filesystem;
 
-
-// ============================================================
-// DATA STRUCTURES
-// ============================================================
-
-struct MeasuredPoint {
+struct SamplePoint {
     double x{};
     double y{};
-    double v{};
+    double value{};
 };
 
-struct Config {
-    std::size_t nx{};
-    std::size_t ny{};
-
-    double Sreal{};
-    double Simag{};
-    double Dreal{};
-    double Dimag{};
-
-    int maxIters{};
-    int steps{};
-
-    // outputEvery is intentionally optional.
-    // If hasOutputEvery == false, only the final state is written.
-    bool hasOutputEvery{false};
+struct SimulationConfig {
+    std::size_t gridWidth{};
+    std::size_t gridHeight{};
+    double domainStartX{};
+    double domainStartY{};
+    double domainWidth{};
+    double domainHeight{};
+    int maxFractalIterations{};
+    int timeSteps{};
     int outputEvery{0};
-
-    std::vector<MeasuredPoint> measured;
+    std::vector<SamplePoint> measuredPoints;
 };
 
-struct DomainMap {
+struct GridMapping {
     double x0{};
     double y0{};
     double dx{};
     double dy{};
 };
 
-struct CoolingCoeffs {
-    double dd{};
-    double hx{};
-    double hy{};
-    double dgx{};
-    double dgy{};
-    double CX{};
-    double CY{};
+struct UpdateCoefficients {
+    double damping{};
+    double stepX{};
+    double stepY{};
+    double coeffX{};
+    double coeffY{};
+    double laplaceX{};
+    double laplaceY{};
 };
 
-struct Stats {
-    double minv{};
-    double mean{};
-    double maxv{};
-    double stddev{};
+struct FieldStatistics {
+    double minValue{};
+    double meanValue{};
+    double maxValue{};
+    double stdDev{};
+    double l2Norm{};
+    double checksum{};
 };
 
+struct CommandLineOptions {
+    std::string inputFile{"input_final.in"};
+    std::string h5File{"none"};
+    std::string csvFile{"Statistics.csv"};
 
-// ============================================================
-// UTILITIES
-// ============================================================
+    bool writeHdf5{false};
+    bool overrideOutputEvery{false};
+    int outputEvery{0};
 
-inline std::size_t idx2D(std::size_t i, std::size_t j, std::size_t nx) noexcept {
-    return i + j * nx;
+    int threads{0}; // 0 means use OMP_NUM_THREADS or OpenMP runtime default
+};
+
+struct ScopedTimer {
+    using clock = std::chrono::steady_clock;
+    clock::time_point start{clock::now()};
+
+    double elapsedSeconds() const {
+        return std::chrono::duration<double>(clock::now() - start).count();
+    }
+};
+
+inline std::size_t linearIndex(std::size_t i, std::size_t j, std::size_t width) noexcept {
+    return i + j * width;
 }
 
-std::size_t safeGridSize(std::size_t nx, std::size_t ny) {
-    if (nx == 0 || ny == 0) {
-        throw std::invalid_argument("Grid dimensions must be > 0");
+std::size_t checkedGridSize(std::size_t width, std::size_t height) {
+    if (width == 0 || height == 0) {
+        throw std::invalid_argument("Grid dimensions must be greater than zero");
     }
 
-    if (nx > std::numeric_limits<std::size_t>::max() / ny) {
-        throw std::overflow_error("Grid size overflow: nx * ny exceeds size_t range");
+    if (width > std::numeric_limits<std::size_t>::max() / height) {
+        throw std::overflow_error("Grid size overflow");
     }
 
-    return nx * ny;
+    return width * height;
 }
 
-int parseStrictInt(const std::string& s, const std::string& what) {
+int parseStrictInt(const std::string& text, const std::string& what) {
     int value = 0;
 
-    const auto* begin = s.data();
-    const auto* end = s.data() + s.size();
+    const char* begin = text.data();
+    const char* end = text.data() + text.size();
 
-    auto [ptr, ec] = std::from_chars(begin, end, value);
+    const auto [ptr, ec] = std::from_chars(begin, end, value);
 
     if (ec != std::errc{} || ptr != end) {
-        throw std::runtime_error("Invalid " + what + ": '" + s + "'");
+        throw std::runtime_error("Invalid " + what + ": '" + text + "'");
     }
 
     return value;
 }
 
-std::size_t parseStrictPositiveSize(const std::string& s, const std::string& what) {
-    const int v = parseStrictInt(s, what);
+bool beginsWithDoubleDash(const std::string& text) {
+    return text.rfind("--", 0) == 0;
+}
 
-    if (v <= 0) {
-        throw std::runtime_error(what + " must be > 0");
+bool isNoHdf5Token(const std::string& text) {
+    return text == "none" || text == "NONE" || text == "-" || text == "--no-hdf5";
+}
+
+void ensureParentDirectoryExists(const std::string& fileName) {
+    if (fileName.empty() || isNoHdf5Token(fileName)) {
+        return;
     }
 
-    return static_cast<std::size_t>(v);
+    const fs::path path(fileName);
+    const fs::path parent = path.parent_path();
+
+    if (parent.empty()) {
+        return;
+    }
+
+    std::error_code ec;
+
+    if (fs::exists(parent, ec)) {
+        if (!fs::is_directory(parent, ec)) {
+            throw std::runtime_error("Output parent exists but is not a directory: " + parent.string());
+        }
+        return;
+    }
+
+    if (!fs::create_directories(parent, ec) && ec) {
+        throw std::runtime_error("Cannot create output directory '" + parent.string() + "': " + ec.message());
+    }
 }
 
-bool startsWithDashDash(const std::string& s) {
-    return s.rfind("--", 0) == 0;
-}
+SimulationConfig readConfigurationFile(const std::string& fileName) {
+    std::ifstream input(fileName);
 
-
-// ============================================================
-// INPUT PARSER
-// ============================================================
-
-Config readInput(const std::string& fname) {
-    std::ifstream in(fname);
-
-    if (!in) {
-        throw std::runtime_error("Cannot open input file: " + fname);
+    if (!input) {
+        throw std::runtime_error("Cannot open input file: " + fileName);
     }
 
     std::vector<std::string> tokens;
     std::string line;
 
-    while (std::getline(in, line)) {
+    while (std::getline(input, line)) {
         const auto commentPos = line.find('#');
 
         if (commentPos != std::string::npos) {
@@ -161,17 +244,15 @@ Config readInput(const std::string& fname) {
         }
 
         std::istringstream iss(line);
-        std::string tok;
+        std::string token;
 
-        while (iss >> tok) {
-            tokens.push_back(tok);
+        while (iss >> token) {
+            tokens.push_back(token);
         }
     }
 
     if (tokens.empty()) {
-        throw std::runtime_error(
-            "Input file is empty or contains no numeric tokens: " + fname
-        );
+        throw std::runtime_error("Input file contains no tokens: " + fileName);
     }
 
     std::size_t pos = 0;
@@ -181,22 +262,7 @@ Config readInput(const std::string& fname) {
             throw std::runtime_error("Malformed input: missing integer token");
         }
 
-        const std::string& s = tokens.at(pos++);
-
-        try {
-            std::size_t used = 0;
-            const int v = std::stoi(s, &used);
-
-            if (used != s.size()) {
-                throw std::runtime_error("not a pure integer");
-            }
-
-            return v;
-        } catch (...) {
-            throw std::runtime_error(
-                "Malformed input: invalid integer token '" + s + "'"
-            );
-        }
+        return parseStrictInt(tokens[pos++], "integer token");
     };
 
     auto nextDouble = [&]() -> double {
@@ -204,87 +270,77 @@ Config readInput(const std::string& fname) {
             throw std::runtime_error("Malformed input: missing floating-point token");
         }
 
-        const std::string& s = tokens.at(pos++);
+        const std::string token = tokens[pos++];
 
         try {
             std::size_t used = 0;
-            const double v = std::stod(s, &used);
+            const double value = std::stod(token, &used);
 
-            if (used != s.size()) {
-                throw std::runtime_error("not a pure floating-point number");
+            if (used != token.size()) {
+                throw std::runtime_error("invalid trailing characters");
             }
 
-            return v;
+            if (!std::isfinite(value)) {
+                throw std::runtime_error("non-finite value");
+            }
+
+            return value;
         } catch (...) {
-            throw std::runtime_error(
-                "Malformed input: invalid floating-point token '" + s + "'"
-            );
+            throw std::runtime_error("Malformed input: invalid floating-point token '" + token + "'");
         }
     };
 
-    Config cfg{};
+    SimulationConfig cfg{};
 
-    const int rawNx = nextInt();
-    const int rawNy = nextInt();
+    const int rawWidth = nextInt();
+    const int rawHeight = nextInt();
 
-    if (rawNx < 3 || rawNy < 3) {
+    if (rawWidth < 3 || rawHeight < 3) {
         throw std::runtime_error("Grid dimensions must be at least 3 x 3");
     }
 
-    cfg.nx = static_cast<std::size_t>(rawNx);
-    cfg.ny = static_cast<std::size_t>(rawNy);
+    cfg.gridWidth = static_cast<std::size_t>(rawWidth);
+    cfg.gridHeight = static_cast<std::size_t>(rawHeight);
 
-    const int nMeasured = nextInt();
+    const int measuredCount = nextInt();
 
-    if (nMeasured < 0) {
+    if (measuredCount < 0) {
         throw std::runtime_error("Number of measured points cannot be negative");
     }
 
-    cfg.measured.resize(static_cast<std::size_t>(nMeasured));
+    cfg.measuredPoints.resize(static_cast<std::size_t>(measuredCount));
 
-    for (int i = 0; i < nMeasured; ++i) {
-        auto& m = cfg.measured[static_cast<std::size_t>(i)];
-
-        m.x = nextDouble();
-        m.y = nextDouble();
-        m.v = nextDouble();
+    for (int i = 0; i < measuredCount; ++i) {
+        auto& p = cfg.measuredPoints[static_cast<std::size_t>(i)];
+        p.x = nextDouble();
+        p.y = nextDouble();
+        p.value = nextDouble();
     }
 
-    cfg.Sreal = nextDouble();
-    cfg.Simag = nextDouble();
-    cfg.Dreal = nextDouble();
-    cfg.Dimag = nextDouble();
+    cfg.domainStartX = nextDouble();
+    cfg.domainStartY = nextDouble();
+    cfg.domainWidth = nextDouble();
+    cfg.domainHeight = nextDouble();
+    cfg.maxFractalIterations = nextInt();
+    cfg.timeSteps = nextInt();
 
-    cfg.maxIters = nextInt();
-    cfg.steps = nextInt();
-
-    if (cfg.maxIters <= 0) {
-        throw std::runtime_error("maxIters must be > 0");
+    if (cfg.domainWidth <= 0.0 || cfg.domainHeight <= 0.0) {
+        throw std::runtime_error("domainWidth and domainHeight must be positive");
     }
 
-    if (cfg.steps < 0) {
-        throw std::runtime_error("steps must be >= 0");
+    if (cfg.maxFractalIterations <= 0) {
+        throw std::runtime_error("maxFractalIterations must be positive");
     }
 
-    if (cfg.Dreal <= 0.0 || cfg.Dimag <= 0.0) {
-        throw std::runtime_error("Domain extents Dreal and Dimag must be > 0");
+    if (cfg.timeSteps < 0) {
+        throw std::runtime_error("timeSteps must be non-negative");
     }
 
-    // Optional outputEvery.
-    //
-    // Old format:
-    //   ... maxIters steps outputEvery
-    //
-    // New allowed format:
-    //   ... maxIters steps
-    //
-    // If outputEvery is absent, the simulation writes only the final state.
     if (pos < tokens.size()) {
         cfg.outputEvery = nextInt();
-        cfg.hasOutputEvery = true;
 
-        if (cfg.outputEvery <= 0) {
-            throw std::runtime_error("outputEvery must be > 0");
+        if (cfg.outputEvery < 0) {
+            throw std::runtime_error("outputEvery must be non-negative");
         }
     }
 
@@ -295,213 +351,180 @@ Config readInput(const std::string& fname) {
     return cfg;
 }
 
-
-// ============================================================
-// PHYSICS HELPERS
-// ============================================================
-
-DomainMap buildDomainMap(const Config& cfg) {
-    DomainMap map{};
-
-    map.x0 = cfg.Sreal;
-    map.y0 = cfg.Simag;
-    map.dx = cfg.Dreal / static_cast<double>(cfg.nx - 1);
-    map.dy = cfg.Dimag / static_cast<double>(cfg.ny - 1);
-
-    return map;
+GridMapping buildGridMapping(const SimulationConfig& cfg) {
+    GridMapping mapping{};
+    mapping.x0 = cfg.domainStartX;
+    mapping.y0 = cfg.domainStartY;
+    mapping.dx = cfg.domainWidth / static_cast<double>(cfg.gridWidth - 1);
+    mapping.dy = cfg.domainHeight / static_cast<double>(cfg.gridHeight - 1);
+    return mapping;
 }
 
-inline double analyticalField(double x, double y) noexcept {
+inline double analyticalReferenceField(double x, double y) noexcept {
     return (x * x * x + y * y * y) / 6.0;
 }
 
-double computeDiscrepancy(const Config& cfg) {
-    if (cfg.measured.empty()) {
+double computeMeanDiscrepancy(const SimulationConfig& cfg) {
+    if (cfg.measuredPoints.empty()) {
         return 0.0;
     }
 
-    long double sum = 0.0L;
+    double sum = 0.0;
 
-    for (const auto& m : cfg.measured) {
-        sum += static_cast<long double>(
-            m.v - analyticalField(m.x, m.y)
-        );
+    for (const auto& p : cfg.measuredPoints) {
+        sum += p.value - analyticalReferenceField(p.x, p.y);
     }
 
-    return static_cast<double>(
-        sum / static_cast<long double>(cfg.measured.size())
-    );
+    return sum / static_cast<double>(cfg.measuredPoints.size());
 }
 
-CoolingCoeffs buildCoolingCoeffs(double dx, double dy, double dd = 100.0) {
+UpdateCoefficients buildUpdateCoefficients(double dx, double dy, double damping = 100.0) {
     if (dx <= 0.0 || dy <= 0.0) {
-        throw std::invalid_argument("buildCoolingCoeffs: dx and dy must be > 0");
+        throw std::invalid_argument("Grid spacing must be positive");
     }
 
-    if (dd <= 0.0) {
-        throw std::invalid_argument("buildCoolingCoeffs: dd must be > 0");
+    if (damping <= 0.0) {
+        throw std::invalid_argument("Damping parameter must be positive");
     }
 
-    CoolingCoeffs c{};
-
-    c.dd = dd;
-    c.hx = dx;
-    c.hy = dy;
-
-    c.dgx = -2.0 * (1.0 + c.dd * c.hx / (c.hx * c.hx + c.dd));
-    c.dgy = -2.0 * (1.0 + c.dd * c.hy / (c.hy * c.hy + c.dd));
-
-    c.CX = (c.hx + c.dd * std::exp(c.hx)) / (15.0 * c.dd + c.hx);
-    c.CY = (c.hy + c.dd * std::exp(c.hy)) / (15.0 * c.dd + c.hy);
-
+    UpdateCoefficients c{};
+    c.damping = damping;
+    c.stepX = dx;
+    c.stepY = dy;
+    c.laplaceX = -2.0 * (1.0 + c.damping * c.stepX / (c.stepX * c.stepX + c.damping));
+    c.laplaceY = -2.0 * (1.0 + c.damping * c.stepY / (c.stepY * c.stepY + c.damping));
+    c.coeffX = (c.stepX + c.damping * std::exp(c.stepX)) / (15.0 * c.damping + c.stepX);
+    c.coeffY = (c.stepY + c.damping * std::exp(c.stepY)) / (15.0 * c.damping + c.stepY);
     return c;
 }
 
+#ifdef USE_HDF5
 
-// ============================================================
-// HDF5 WRITER
-// ============================================================
-
-class H5Writer {
+class TimeSeriesWriter {
 public:
-    H5Writer(
-        const std::string& fname,
-        std::size_t nx,
-        std::size_t ny,
+    TimeSeriesWriter(
+        const std::string& fileName,
+        std::size_t width,
+        std::size_t height,
         std::size_t batch = 32,
         std::size_t tileY = 256,
         std::size_t tileX = 256
     )
-        : file_(fname, H5F_ACC_TRUNC),
-          nx_(nx),
-          ny_(ny),
+        : file_(fileName, H5F_ACC_TRUNC),
+          width_(width),
+          height_(height),
           batch_(batch),
-          frame_(0),
+          frameCount_(0),
           capacity_(batch),
           closed_(false)
     {
-        if (nx_ == 0 || ny_ == 0) {
-            throw std::invalid_argument("H5Writer: nx and ny must be > 0");
+        if (width_ == 0 || height_ == 0) {
+            throw std::invalid_argument("TimeSeriesWriter: invalid dimensions");
         }
 
         if (batch_ == 0) {
-            throw std::invalid_argument("H5Writer: batch must be > 0");
+            throw std::invalid_argument("TimeSeriesWriter: batch must be positive");
         }
 
         if (tileY == 0 || tileX == 0) {
-            throw std::invalid_argument("H5Writer: tile sizes must be > 0");
+            throw std::invalid_argument("TimeSeriesWriter: tile sizes must be positive");
         }
 
-        const hsize_t chunkY =
-            static_cast<hsize_t>(std::min<std::size_t>(ny_, tileY));
+        const hsize_t chunkY = static_cast<hsize_t>(std::min<std::size_t>(height_, tileY));
+        const hsize_t chunkX = static_cast<hsize_t>(std::min<std::size_t>(width_, tileX));
 
-        const hsize_t chunkX =
-            static_cast<hsize_t>(std::min<std::size_t>(nx_, tileX));
-
-        // /field dataset: [frame, y, x]
         {
             hsize_t dims[3] = {
                 0,
-                static_cast<hsize_t>(ny_),
-                static_cast<hsize_t>(nx_)
+                static_cast<hsize_t>(height_),
+                static_cast<hsize_t>(width_)
             };
 
             hsize_t maxdims[3] = {
                 H5S_UNLIMITED,
-                static_cast<hsize_t>(ny_),
-                static_cast<hsize_t>(nx_)
+                static_cast<hsize_t>(height_),
+                static_cast<hsize_t>(width_)
             };
 
             H5::DataSpace space(3, dims, maxdims);
-            H5::DSetCreatPropList prop;
+            H5::DSetCreatPropList props;
 
-            hsize_t chunks[3] = {
-                1,
-                chunkY,
-                chunkX
-            };
+            hsize_t chunks[3] = {1, chunkY, chunkX};
+            props.setChunk(3, chunks);
 
-            prop.setChunk(3, chunks);
-
-            field_ = file_.createDataSet(
+            fieldDataset_ = file_.createDataSet(
                 "/field",
                 H5::PredType::NATIVE_DOUBLE,
                 space,
-                prop
+                props
             );
         }
 
-        // /step dataset: [frame]
         {
             hsize_t dims[1] = {0};
             hsize_t maxdims[1] = {H5S_UNLIMITED};
 
             H5::DataSpace space(1, dims, maxdims);
-            H5::DSetCreatPropList prop;
+            H5::DSetCreatPropList props;
 
-            hsize_t chunks[1] = {
-                static_cast<hsize_t>(batch_)
-            };
+            hsize_t chunks[1] = {static_cast<hsize_t>(batch_)};
+            props.setChunk(1, chunks);
 
-            prop.setChunk(1, chunks);
-
-            step_ = file_.createDataSet(
+            stepDataset_ = file_.createDataSet(
                 "/step",
                 H5::PredType::NATIVE_INT,
                 space,
-                prop
+                props
             );
         }
 
         extend(capacity_);
     }
 
-    ~H5Writer() {
+    ~TimeSeriesWriter() {
         try {
             close();
         } catch (...) {
-            // Never throw from destructor.
         }
     }
 
-    H5Writer(const H5Writer&) = delete;
-    H5Writer& operator=(const H5Writer&) = delete;
+    TimeSeriesWriter(const TimeSeriesWriter&) = delete;
+    TimeSeriesWriter& operator=(const TimeSeriesWriter&) = delete;
 
-    void write(int stepNumber, const std::vector<double>& field) {
+    void writeFrame(int stepNumber, const std::vector<double>& field) {
         if (closed_) {
-            throw std::runtime_error("H5Writer: write() called after close()");
+            throw std::runtime_error("TimeSeriesWriter: write after close");
         }
 
-        if (field.size() != safeGridSize(nx_, ny_)) {
-            throw std::runtime_error("H5Writer: field size mismatch");
+        if (field.size() != checkedGridSize(width_, height_)) {
+            throw std::runtime_error("TimeSeriesWriter: field size mismatch");
         }
 
-        if (frame_ >= capacity_) {
+        if (frameCount_ >= capacity_) {
             capacity_ += batch_;
             extend(capacity_);
         }
 
-        // Write /field[frame,:,:]
         {
-            H5::DataSpace filespace = field_.getSpace();
+            H5::DataSpace filespace = fieldDataset_.getSpace();
 
             hsize_t start[3] = {
-                static_cast<hsize_t>(frame_),
+                static_cast<hsize_t>(frameCount_),
                 0,
                 0
             };
 
             hsize_t count[3] = {
                 1,
-                static_cast<hsize_t>(ny_),
-                static_cast<hsize_t>(nx_)
+                static_cast<hsize_t>(height_),
+                static_cast<hsize_t>(width_)
             };
 
             filespace.selectHyperslab(H5S_SELECT_SET, count, start);
 
             H5::DataSpace memspace(3, count);
 
-            field_.write(
+            fieldDataset_.write(
                 field.data(),
                 H5::PredType::NATIVE_DOUBLE,
                 memspace,
@@ -509,17 +532,14 @@ public:
             );
         }
 
-        // Write /step[frame]
         {
-            H5::DataSpace filespace = step_.getSpace();
+            H5::DataSpace filespace = stepDataset_.getSpace();
 
             hsize_t start[1] = {
-                static_cast<hsize_t>(frame_)
+                static_cast<hsize_t>(frameCount_)
             };
 
-            hsize_t count[1] = {
-                1
-            };
+            hsize_t count[1] = {1};
 
             filespace.selectHyperslab(H5S_SELECT_SET, count, start);
 
@@ -527,7 +547,7 @@ public:
 
             int value = stepNumber;
 
-            step_.write(
+            stepDataset_.write(
                 &value,
                 H5::PredType::NATIVE_INT,
                 memspace,
@@ -535,7 +555,7 @@ public:
             );
         }
 
-        ++frame_;
+        ++frameCount_;
     }
 
     void close() {
@@ -543,352 +563,335 @@ public:
             return;
         }
 
-        if (frame_ != capacity_) {
-            extend(frame_);
+        if (frameCount_ != capacity_) {
+            extend(frameCount_);
         }
 
         file_.flush(H5F_SCOPE_GLOBAL);
-
-        field_.close();
-        step_.close();
+        fieldDataset_.close();
+        stepDataset_.close();
         file_.close();
 
         closed_ = true;
     }
 
 private:
-    void extend(std::size_t n) {
-        {
-            hsize_t dims[3] = {
-                static_cast<hsize_t>(n),
-                static_cast<hsize_t>(ny_),
-                static_cast<hsize_t>(nx_)
-            };
+    void extend(std::size_t newSize) {
+        hsize_t fieldDims[3] = {
+            static_cast<hsize_t>(newSize),
+            static_cast<hsize_t>(height_),
+            static_cast<hsize_t>(width_)
+        };
 
-            field_.extend(dims);
-        }
+        fieldDataset_.extend(fieldDims);
 
-        {
-            hsize_t dims[1] = {
-                static_cast<hsize_t>(n)
-            };
+        hsize_t stepDims[1] = {
+            static_cast<hsize_t>(newSize)
+        };
 
-            step_.extend(dims);
-        }
+        stepDataset_.extend(stepDims);
     }
 
-private:
     H5::H5File file_;
-    H5::DataSet field_;
-    H5::DataSet step_;
+    H5::DataSet fieldDataset_;
+    H5::DataSet stepDataset_;
 
-    std::size_t nx_{};
-    std::size_t ny_{};
+    std::size_t width_{};
+    std::size_t height_{};
     std::size_t batch_{};
-    std::size_t frame_{};
+    std::size_t frameCount_{};
     std::size_t capacity_{};
 
     bool closed_{false};
 };
 
+#else
 
-// ============================================================
-// OPENMP COMPUTE ROUTINES
-// ============================================================
-
-void computeWeight(
-    std::vector<int>& weight,
-    const Config& cfg,
-    const DomainMap& map
-) {
-    const std::size_t N = safeGridSize(cfg.nx, cfg.ny);
-
-    if (weight.size() != N) {
-        throw std::runtime_error("computeWeight: weight size mismatch");
+class TimeSeriesWriter {
+public:
+    TimeSeriesWriter(
+        const std::string&,
+        std::size_t,
+        std::size_t,
+        std::size_t = 32,
+        std::size_t = 256,
+        std::size_t = 256
+    )
+    {
+        throw std::runtime_error(
+            "This executable was built without HDF5 support. "
+            "Recompile with -DUSE_HDF5 to enable HDF5 output."
+        );
     }
 
-    const index_t nx = static_cast<index_t>(cfg.nx);
-    const index_t ny = static_cast<index_t>(cfg.ny);
+    void writeFrame(int, const std::vector<double>&) {}
+    void close() {}
+};
 
-    // Mandelbrot work is irregular, so dynamic scheduling improves load balance.
+#endif
+
+void computeFractalWeights(
+    std::vector<int>& weightField,
+    const SimulationConfig& cfg,
+    const GridMapping& mapping
+) {
+    const std::size_t totalCells = checkedGridSize(cfg.gridWidth, cfg.gridHeight);
+
+    if (weightField.size() != totalCells) {
+        throw std::runtime_error("computeFractalWeights: size mismatch");
+    }
+
+    const index_t width = static_cast<index_t>(cfg.gridWidth);
+    const index_t height = static_cast<index_t>(cfg.gridHeight);
+
+#ifdef _OPENMP
 #pragma omp parallel for collapse(2) schedule(dynamic, 64)
-    for (index_t j = 0; j < ny; ++j) {
-        for (index_t i = 0; i < nx; ++i) {
-            const std::size_t is = static_cast<std::size_t>(i);
-            const std::size_t js = static_cast<std::size_t>(j);
+#endif
+    for (index_t j = 0; j < height; ++j) {
+        for (index_t i = 0; i < width; ++i) {
+            const std::size_t ii = static_cast<std::size_t>(i);
+            const std::size_t jj = static_cast<std::size_t>(j);
+            const std::size_t idx = linearIndex(ii, jj, cfg.gridWidth);
 
-            const std::size_t p = idx2D(is, js, cfg.nx);
+            const double cReal = mapping.x0 + mapping.dx * static_cast<double>(i);
+            const double cImag = mapping.y0 + mapping.dy * static_cast<double>(j);
 
-            const double ca = map.x0 + map.dx * static_cast<double>(i);
-            const double cb = map.y0 + map.dy * static_cast<double>(j);
+            double zReal = 0.0;
+            double zImag = 0.0;
+            int iter = 0;
 
-            double za = 0.0;
-            double zb = 0.0;
-
-            int it = 0;
-
-            for (; it < cfg.maxIters; ++it) {
-                if (za * za + zb * zb > 4.0) {
+            for (; iter < cfg.maxFractalIterations; ++iter) {
+                if (zReal * zReal + zImag * zImag > 4.0) {
                     break;
                 }
 
-                const double tmp = za * za - zb * zb + ca;
-                zb = 2.0 * za * zb + cb;
-                za = tmp;
+                const double tmp = zReal * zReal - zImag * zImag + cReal;
+                zImag = 2.0 * zReal * zImag + cImag;
+                zReal = tmp;
             }
 
-            weight[p] = it;
+            weightField[idx] = iter;
         }
     }
 }
 
-void initializeField(
-    std::vector<double>& u,
-    const std::vector<int>& weight,
-    const Config& cfg,
-    const DomainMap& map,
-    double discrepancy
-) {
-    const std::size_t N = safeGridSize(cfg.nx, cfg.ny);
-
-    if (u.size() != N || weight.size() != N) {
-        throw std::runtime_error("initializeField: size mismatch");
+std::pair<int, int> computeWeightRange(const std::vector<int>& weightField) {
+    if (weightField.empty()) {
+        throw std::runtime_error("computeWeightRange: empty field");
     }
 
-    const auto [wminIt, wmaxIt] =
-        std::minmax_element(weight.begin(), weight.end());
+    int minWeight = std::numeric_limits<int>::max();
+    int maxWeight = std::numeric_limits<int>::min();
 
-    const int wmin = *wminIt;
-    const int wmax = *wmaxIt;
+    const index_t n = static_cast<index_t>(weightField.size());
 
-    const double denom =
-        (wmax > wmin) ? static_cast<double>(wmax - wmin) : 1.0;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) reduction(min:minWeight) reduction(max:maxWeight)
+#endif
+    for (index_t i = 0; i < n; ++i) {
+        const int value = weightField[static_cast<std::size_t>(i)];
+        minWeight = std::min(minWeight, value);
+        maxWeight = std::max(maxWeight, value);
+    }
 
-    const index_t nx = static_cast<index_t>(cfg.nx);
-    const index_t ny = static_cast<index_t>(cfg.ny);
+    return {minWeight, maxWeight};
+}
 
+void initializeTemperatureField(
+    std::vector<double>& temperature,
+    const std::vector<int>& weightField,
+    const SimulationConfig& cfg,
+    const GridMapping& mapping,
+    double meanDiscrepancy,
+    int minWeight,
+    int maxWeight
+) {
+    const std::size_t totalCells = checkedGridSize(cfg.gridWidth, cfg.gridHeight);
+
+    if (temperature.size() != totalCells || weightField.size() != totalCells) {
+        throw std::runtime_error("initializeTemperatureField: size mismatch");
+    }
+
+    const double denom = (maxWeight > minWeight)
+        ? static_cast<double>(maxWeight - minWeight)
+        : 1.0;
+
+    const index_t width = static_cast<index_t>(cfg.gridWidth);
+    const index_t height = static_cast<index_t>(cfg.gridHeight);
+
+#ifdef _OPENMP
 #pragma omp parallel for collapse(2) schedule(static)
-    for (index_t j = 0; j < ny; ++j) {
-        for (index_t i = 0; i < nx; ++i) {
-            const std::size_t is = static_cast<std::size_t>(i);
-            const std::size_t js = static_cast<std::size_t>(j);
+#endif
+    for (index_t j = 0; j < height; ++j) {
+        for (index_t i = 0; i < width; ++i) {
+            const std::size_t ii = static_cast<std::size_t>(i);
+            const std::size_t jj = static_cast<std::size_t>(j);
+            const std::size_t idx = linearIndex(ii, jj, cfg.gridWidth);
 
-            const std::size_t p = idx2D(is, js, cfg.nx);
+            const double x = mapping.x0 + mapping.dx * static_cast<double>(i);
+            const double y = mapping.y0 + mapping.dy * static_cast<double>(j);
 
-            const double x = map.x0 + map.dx * static_cast<double>(i);
-            const double y = map.y0 + map.dy * static_cast<double>(j);
+            const double normalizedWeight =
+                static_cast<double>(weightField[idx] - minWeight) / denom;
 
-            const double F = analyticalField(x, y);
-            const double wnorm =
-                static_cast<double>(weight[p] - wmin) / denom;
-
-            u[p] = 293.16 + 80.0 * (discrepancy + F) * wnorm;
+            temperature[idx] =
+                293.16 +
+                80.0 *
+                (meanDiscrepancy + analyticalReferenceField(x, y)) *
+                normalizedWeight;
         }
     }
 }
 
 void updateInterior(
-    const double* RESTRICT u1,
-    double* RESTRICT u2,
-    std::size_t nxSize,
-    std::size_t nySize,
-    const CoolingCoeffs& c
+    const double* RESTRICT current,
+    double* RESTRICT next,
+    std::size_t width,
+    std::size_t height,
+    const UpdateCoefficients& coeffs
 ) {
-    const index_t nx = static_cast<index_t>(nxSize);
-    const index_t ny = static_cast<index_t>(nySize);
+    const index_t w = static_cast<index_t>(width);
+    const index_t h = static_cast<index_t>(height);
 
-#pragma omp parallel for collapse(2) schedule(static)
-    for (index_t j = 1; j < ny - 1; ++j) {
-        for (index_t i = 1; i < nx - 1; ++i) {
-            const std::size_t is = static_cast<std::size_t>(i);
-            const std::size_t js = static_cast<std::size_t>(j);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (index_t j = 1; j < h - 1; ++j) {
+#ifdef _OPENMP
+#pragma omp simd
+#endif
+        for (index_t i = 1; i < w - 1; ++i) {
+            const std::size_t ii = static_cast<std::size_t>(i);
+            const std::size_t jj = static_cast<std::size_t>(j);
+            const std::size_t idx = linearIndex(ii, jj, width);
 
-            const std::size_t p = idx2D(is, js, nxSize);
-
-            u2[p] =
-                c.CX * (
-                    u1[idx2D(is - 1, js, nxSize)]
-                    + u1[idx2D(is + 1, js, nxSize)]
-                    + (c.dgx + 0.5 / c.CX) * u1[p]
+            next[idx] =
+                coeffs.coeffX *
+                (
+                    current[linearIndex(ii - 1, jj, width)] +
+                    current[linearIndex(ii + 1, jj, width)] +
+                    (coeffs.laplaceX + 0.5 / coeffs.coeffX) * current[idx]
                 )
-                + c.CY * (
-                    u1[idx2D(is, js - 1, nxSize)]
-                    + u1[idx2D(is, js + 1, nxSize)]
-                    + (c.dgy + 0.5 / c.CY) * u1[p]
+                +
+                coeffs.coeffY *
+                (
+                    current[linearIndex(ii, jj - 1, width)] +
+                    current[linearIndex(ii, jj + 1, width)] +
+                    (coeffs.laplaceY + 0.5 / coeffs.coeffY) * current[idx]
                 );
         }
     }
 }
 
-void applyBoundary(double* u, std::size_t nxSize, std::size_t nySize) {
-    const index_t nx = static_cast<index_t>(nxSize);
-    const index_t ny = static_cast<index_t>(nySize);
+void applyBoundaryConditions(double* field, std::size_t width, std::size_t height) {
+    const index_t w = static_cast<index_t>(width);
+    const index_t h = static_cast<index_t>(height);
 
-    // 1. Left/right boundaries first, excluding corners.
+#ifdef _OPENMP
 #pragma omp parallel for schedule(static)
-    for (index_t j = 1; j < ny - 1; ++j) {
-        const std::size_t js = static_cast<std::size_t>(j);
+#endif
+    for (index_t j = 1; j < h - 1; ++j) {
+        const std::size_t jj = static_cast<std::size_t>(j);
 
-        u[idx2D(0, js, nxSize)] =
-            u[idx2D(1, js, nxSize)];
+        field[linearIndex(0, jj, width)] =
+            field[linearIndex(1, jj, width)];
 
-        u[idx2D(nxSize - 1, js, nxSize)] =
-            u[idx2D(nxSize - 2, js, nxSize)];
+        field[linearIndex(width - 1, jj, width)] =
+            field[linearIndex(width - 2, jj, width)];
     }
 
-    // 2. Top/bottom boundaries including corners.
-    //
-    // This intentionally runs after the left/right update to preserve
-    // the same corner behavior as the CUDA-style two-kernel version.
+#ifdef _OPENMP
 #pragma omp parallel for schedule(static)
-    for (index_t i = 0; i < nx; ++i) {
-        const std::size_t is = static_cast<std::size_t>(i);
+#endif
+    for (index_t i = 0; i < w; ++i) {
+        const std::size_t ii = static_cast<std::size_t>(i);
 
-        u[idx2D(is, 0, nxSize)] =
-            u[idx2D(is, 1, nxSize)];
+        field[linearIndex(ii, 0, width)] =
+            field[linearIndex(ii, 1, width)];
 
-        u[idx2D(is, nySize - 1, nxSize)] =
-            u[idx2D(is, nySize - 2, nxSize)];
+        field[linearIndex(ii, height - 1, width)] =
+            field[linearIndex(ii, height - 2, width)];
     }
 }
 
-void updateField(
-    const double* RESTRICT u1,
-    double* RESTRICT u2,
-    std::size_t nx,
-    std::size_t ny,
-    const CoolingCoeffs& c
+void advanceTemperatureField(
+    const double* current,
+    double* next,
+    std::size_t width,
+    std::size_t height,
+    const UpdateCoefficients& coeffs
 ) {
-    updateInterior(u1, u2, nx, ny, c);
-    applyBoundary(u2, nx, ny);
+    updateInterior(current, next, width, height, coeffs);
+    applyBoundaryConditions(next, width, height);
 }
 
-
-// ============================================================
-// STATISTICS
-// ============================================================
-
-Stats computeStatsAccurate(const std::vector<double>& u) {
-    if (u.empty()) {
-        throw std::runtime_error("computeStatsAccurate: empty field");
+FieldStatistics computeFieldStatistics(const std::vector<double>& field) {
+    if (field.empty()) {
+        throw std::runtime_error("computeFieldStatistics: empty field");
     }
 
-    const auto [mnIt, mxIt] =
-        std::minmax_element(u.begin(), u.end());
+    const index_t n = static_cast<index_t>(field.size());
 
-    long double sum = 0.0L;
-
-    for (double v : u) {
-        sum += static_cast<long double>(v);
-    }
-
-    const long double mean =
-        sum / static_cast<long double>(u.size());
-
-    long double ssd = 0.0L;
-
-    for (double v : u) {
-        const long double d = static_cast<long double>(v) - mean;
-        ssd += d * d;
-    }
-
-    Stats s{};
-
-    s.minv = *mnIt;
-    s.maxv = *mxIt;
-    s.mean = static_cast<double>(mean);
-    s.stddev = static_cast<double>(
-        std::sqrt(ssd / static_cast<long double>(u.size()))
-    );
-
-    return s;
-}
-
-Stats computeStatsFastOpenMP(const std::vector<double>& u) {
-    if (u.empty()) {
-        throw std::runtime_error("computeStatsFastOpenMP: empty field");
-    }
-
-    double minv = std::numeric_limits<double>::infinity();
-    double maxv = -std::numeric_limits<double>::infinity();
+    double minValue = std::numeric_limits<double>::infinity();
+    double maxValue = -std::numeric_limits<double>::infinity();
     double sum = 0.0;
-    double sum2 = 0.0;
+    double sumSquares = 0.0;
+    double checksum = 0.0;
 
-    const index_t n = static_cast<index_t>(u.size());
-
-#pragma omp parallel for schedule(static) reduction(min:minv) reduction(max:maxv) reduction(+:sum,sum2)
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) reduction(min:minValue) reduction(max:maxValue) reduction(+:sum,sumSquares,checksum)
+#endif
     for (index_t i = 0; i < n; ++i) {
-        const double v = u[static_cast<std::size_t>(i)];
+        const std::size_t idx = static_cast<std::size_t>(i);
+        const double value = field[idx];
 
-        minv = std::min(minv, v);
-        maxv = std::max(maxv, v);
-        sum += v;
-        sum2 += v * v;
+        minValue = std::min(minValue, value);
+        maxValue = std::max(maxValue, value);
+        sum += value;
+        sumSquares += value * value;
+        checksum += value * static_cast<double>((idx % 1009U) + 1U);
     }
 
-    const double count = static_cast<double>(u.size());
-    const double mean = sum / count;
-    const double var = std::max(0.0, sum2 / count - mean * mean);
+    const double mean = sum / static_cast<double>(field.size());
 
-    Stats s{};
+    double sumSquaredDiff = 0.0;
 
-    s.minv = minv;
-    s.maxv = maxv;
-    s.mean = mean;
-    s.stddev = std::sqrt(var);
-
-    return s;
-}
-
-Stats computeStats(const std::vector<double>& u, const std::string& mode) {
-    if (mode == "accurate") {
-        return computeStatsAccurate(u);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) reduction(+:sumSquaredDiff)
+#endif
+    for (index_t i = 0; i < n; ++i) {
+        const double diff = field[static_cast<std::size_t>(i)] - mean;
+        sumSquaredDiff += diff * diff;
     }
 
-    if (mode == "fast") {
-        return computeStatsFastOpenMP(u);
-    }
+    FieldStatistics stats{};
+    stats.minValue = minValue;
+    stats.meanValue = mean;
+    stats.maxValue = maxValue;
+    stats.stdDev = std::sqrt(sumSquaredDiff / static_cast<double>(field.size()));
+    stats.l2Norm = std::sqrt(sumSquares);
+    stats.checksum = checksum;
 
-    throw std::runtime_error("Unknown stats mode: " + mode);
+    return stats;
 }
 
-void writeStatsHeader(std::ostream& os) {
-    os << "Step;Min;Mean;Max;Std_dev\n";
+void writeStatisticsHeader(std::ostream& out) {
+    out << "Step;Min;Mean;Max;Std_dev;L2_norm;Checksum\n";
 }
 
-void writeStatsLine(std::ostream& os, int step, const Stats& s) {
-    os << step << ';'
-       << std::setprecision(15) << s.minv << ';'
-       << std::setprecision(15) << s.mean << ';'
-       << std::setprecision(15) << s.maxv << ';'
-       << std::setprecision(15) << s.stddev << '\n';
+void writeStatisticsRow(std::ostream& out, int step, const FieldStatistics& stats) {
+    out
+        << step << ';'
+        << std::setprecision(15) << stats.minValue << ';'
+        << std::setprecision(15) << stats.meanValue << ';'
+        << std::setprecision(15) << stats.maxValue << ';'
+        << std::setprecision(15) << stats.stdDev << ';'
+        << std::setprecision(15) << stats.l2Norm << ';'
+        << std::setprecision(15) << stats.checksum << '\n';
 }
 
-
-// ============================================================
-// SIMPLE CLI PARSER
-// ============================================================
-
-struct CliOptions {
-    std::string inputFile{"input/Cooling.in"};
-    std::string h5File{"output/Cooling.h5"};
-    std::string csvFile{"output/Statistics.csv"};
-
-    // Optional positional override:
-    //   program input h5 csv outputEvery
-    bool hasOutputEvery{false};
-    int outputEvery{0};
-
-    std::string statsMode{"accurate"};
-
-    int threads{0}; // 0 means use environment/default.
-
-    std::size_t h5TileY{256};
-    std::size_t h5TileX{256};
-};
-
-CliOptions parseCommandLine(int argc, char** argv) {
-    CliOptions opt{};
+CommandLineOptions parseCommandLineArguments(int argc, char** argv) {
+    CommandLineOptions options{};
     std::vector<std::string> positional;
 
     for (int i = 1; i < argc; ++i) {
@@ -899,312 +902,364 @@ CliOptions parseCommandLine(int argc, char** argv) {
                 throw std::runtime_error("--threads requires a value");
             }
 
-            opt.threads = parseStrictInt(argv[++i], "threads");
+            options.threads = parseStrictInt(argv[++i], "threads");
 
-            if (opt.threads <= 0) {
-                throw std::runtime_error("--threads must be > 0");
-            }
-        } else if (arg == "--stats") {
-            if (i + 1 >= argc) {
-                throw std::runtime_error("--stats requires a value");
+            if (options.threads <= 0) {
+                throw std::runtime_error("--threads must be positive");
             }
 
-            opt.statsMode = argv[++i];
-
-            if (opt.statsMode != "accurate" && opt.statsMode != "fast") {
-                throw std::runtime_error("--stats must be either 'accurate' or 'fast'");
-            }
-        } else if (arg == "--h5-tile-y") {
-            if (i + 1 >= argc) {
-                throw std::runtime_error("--h5-tile-y requires a value");
-            }
-
-            opt.h5TileY = parseStrictPositiveSize(argv[++i], "h5-tile-y");
-        } else if (arg == "--h5-tile-x") {
-            if (i + 1 >= argc) {
-                throw std::runtime_error("--h5-tile-x requires a value");
-            }
-
-            opt.h5TileX = parseStrictPositiveSize(argv[++i], "h5-tile-x");
-        } else if (startsWithDashDash(arg)) {
-            throw std::runtime_error("Unknown option: " + arg);
-        } else {
-            positional.push_back(arg);
+            continue;
         }
+
+        if (arg == "--no-hdf5") {
+            options.writeHdf5 = false;
+            options.h5File = "none";
+            continue;
+        }
+
+        if (arg == "--help" || arg == "-h") {
+            std::cout
+                << "Usage:\n"
+                << "  " << argv[0]
+                << " [--threads N] [inputFile] [h5File|none|--no-hdf5] [csvFile] [outputEvery]\n\n"
+                << "Examples:\n"
+                << "  " << argv[0] << " --threads 16 input_final.in none Statistics_omp.csv 0\n"
+                << "  " << argv[0] << " --threads 16 input_medium.in output.h5 Statistics_omp.csv 50\n\n"
+                << "Default official grading mode disables HDF5.\n";
+
+            std::exit(0);
+        }
+
+        if (beginsWithDoubleDash(arg)) {
+            throw std::runtime_error("Unknown option: " + arg);
+        }
+
+        positional.push_back(arg);
     }
 
     if (positional.size() > 4) {
-        throw std::runtime_error(
-            "Too many positional arguments. Expected: input h5 csv outputEvery"
-        );
+        throw std::runtime_error("Too many positional arguments");
     }
 
     if (positional.size() >= 1) {
-        opt.inputFile = positional[0];
+        options.inputFile = positional[0];
     }
 
     if (positional.size() >= 2) {
-        opt.h5File = positional[1];
+        options.h5File = positional[1];
+        options.writeHdf5 = !isNoHdf5Token(options.h5File);
     }
 
     if (positional.size() >= 3) {
-        opt.csvFile = positional[2];
+        options.csvFile = positional[2];
     }
 
     if (positional.size() >= 4) {
-        opt.outputEvery = parseStrictInt(positional[3], "outputEvery");
-        opt.hasOutputEvery = true;
+        options.outputEvery = parseStrictInt(positional[3], "outputEvery");
+        options.overrideOutputEvery = true;
 
-        if (opt.outputEvery <= 0) {
-            throw std::runtime_error("outputEvery must be > 0");
+        if (options.outputEvery < 0) {
+            throw std::runtime_error("outputEvery must be non-negative");
         }
     }
 
-    return opt;
+    return options;
 }
 
+bool shouldWriteStep(int step, int finalStep, int outputEvery) {
+    if (step == finalStep) {
+        return true;
+    }
 
-// ============================================================
-// MAIN
-// ============================================================
+    if (outputEvery <= 0) {
+        return false;
+    }
 
-int main(int argc, char** argv) {
-    H5::Exception::dontPrint();
+    if (step == 0) {
+        return true;
+    }
 
-    try {
-        const CliOptions opt = parseCommandLine(argc, argv);
+    return (step % outputEvery) == 0;
+}
+
+void printRunHeader(
+    const CommandLineOptions& cli,
+    const SimulationConfig& cfg,
+    bool hdf5Compiled
+) {
+    std::cout << "Input file:                    " << cli.inputFile << '\n';
+    std::cout << "CSV output:                    " << cli.csvFile << '\n';
+    std::cout << "HDF5 compiled:                 " << (hdf5Compiled ? "yes" : "no") << '\n';
+    std::cout << "HDF5 output:                   " << (cli.writeHdf5 ? cli.h5File : "disabled") << '\n';
+    std::cout << "Official grading mode:         " << (!cli.writeHdf5 ? "yes" : "no") << '\n';
+    std::cout << "Grid:                          " << cfg.gridWidth << " x " << cfg.gridHeight << '\n';
+    std::cout << "Measured points:               " << cfg.measuredPoints.size() << '\n';
+    std::cout << "Max fractal iterations:        " << cfg.maxFractalIterations << '\n';
+    std::cout << "Time steps:                    " << cfg.timeSteps << '\n';
+
+    if (cfg.outputEvery == 0) {
+        std::cout << "Snapshot/statistics policy:     final step only\n";
+    } else {
+        std::cout << "Snapshot/statistics policy:     step 0, every "
+                  << cfg.outputEvery << " step(s), and final step\n";
+    }
 
 #ifdef _OPENMP
-        if (opt.threads > 0) {
-            omp_set_num_threads(opt.threads);
+    std::cout << "OpenMP enabled:                 yes\n";
+    std::cout << "OpenMP max threads:             " << omp_get_max_threads() << '\n';
+    
+#pragma omp parallel
+#pragma omp single
+    {
+        std::cout << "OpenMP active threads:          "
+                  << omp_get_num_threads() << '\n';
+    }
+#else
+    std::cout << "OpenMP enabled:                 no\n";
+#endif
+    
+    std::cout << '\n';
+}
+
+int main(int argc, char** argv) {
+#ifdef USE_HDF5
+    H5::Exception::dontPrint();
+#endif
+
+    try {
+        const CommandLineOptions cli = parseCommandLineArguments(argc, argv);
+         
+#ifdef _OPENMP
+        omp_set_dynamic(0);
+        
+        if (cli.threads > 0) {
+            omp_set_num_threads(cli.threads);
         }
 #else
-        if (opt.threads > 0) {
+        if (cli.threads > 0) {
             std::cerr << "WARNING: --threads ignored because OpenMP is not enabled.\n";
         }
 #endif
+        
+        SimulationConfig cfg = readConfigurationFile(cli.inputFile);
 
-        Config cfg = readInput(opt.inputFile);
-
-        // Command-line outputEvery overrides input-file outputEvery.
-        // If neither specifies it, the program writes only the final state.
-        if (opt.hasOutputEvery) {
-            cfg.outputEvery = opt.outputEvery;
-            cfg.hasOutputEvery = true;
+        if (cli.overrideOutputEvery) {
+            cfg.outputEvery = cli.outputEvery;
         }
 
-        if (cfg.hasOutputEvery && cfg.outputEvery <= 0) {
-            throw std::invalid_argument("outputEvery must be > 0");
+#ifndef USE_HDF5
+        if (cli.writeHdf5) {
+            throw std::runtime_error(
+                "HDF5 output requested, but executable was built without HDF5 support. "
+                "Use 'none' for the HDF5 argument or rebuild with -DUSE_HDF5."
+            );
         }
-
-        const std::size_t N = safeGridSize(cfg.nx, cfg.ny);
-
-        const DomainMap map = buildDomainMap(cfg);
-        const CoolingCoeffs cooling = buildCoolingCoeffs(map.dx, map.dy, 100.0);
-        const double discrepancy = computeDiscrepancy(cfg);
-
-        std::vector<int> weight(N);
-        std::vector<double> uCurr(N);
-        std::vector<double> uNext(N);
-
-        std::ofstream csv(opt.csvFile);
-
-        if (!csv) {
-            throw std::runtime_error("Cannot open CSV output file: " + opt.csvFile);
-        }
-
-        writeStatsHeader(csv);
-
-        std::cout << "Input file:                   " << opt.inputFile << '\n';
-        std::cout << "HDF5 output:                  " << opt.h5File << '\n';
-        std::cout << "CSV output:                   " << opt.csvFile << '\n';
-        std::cout << "Grid:                         " << cfg.nx << " x " << cfg.ny << '\n';
-        std::cout << "Measured points:              " << cfg.measured.size() << '\n';
-        std::cout << "Max iterations:               " << cfg.maxIters << '\n';
-        std::cout << "Time steps:                   " << cfg.steps << '\n';
-
-        if (cfg.hasOutputEvery) {
-            std::cout << "Snapshot every:               "
-                      << cfg.outputEvery << " step(s)\n";
-        } else {
-            std::cout << "Snapshot every:               final step only\n";
-        }
-
-        std::cout << "Stats mode:                   " << opt.statsMode << '\n';
-        std::cout << "HDF5 chunk tile:              "
-                  << std::min<std::size_t>(cfg.ny, opt.h5TileY)
-                  << " x "
-                  << std::min<std::size_t>(cfg.nx, opt.h5TileX)
-                  << '\n';
-
-#ifdef _OPENMP
-        std::cout << "OpenMP enabled:               yes\n";
-        std::cout << "OpenMP max threads:           " << omp_get_max_threads() << '\n';
-#else
-        std::cout << "OpenMP enabled:               no\n";
 #endif
 
-        std::cout << '\n';
+        ensureParentDirectoryExists(cli.csvFile);
 
-        const auto totalT0 = std::chrono::steady_clock::now();
+        if (cli.writeHdf5) {
+            ensureParentDirectoryExists(cli.h5File);
+        }
 
-        // ----------------------------------------------------
-        // Weight field
-        // ----------------------------------------------------
-        const auto weightT0 = std::chrono::steady_clock::now();
+        const std::size_t totalCells = checkedGridSize(cfg.gridWidth, cfg.gridHeight);
+        const GridMapping mapping = buildGridMapping(cfg);
+        const UpdateCoefficients coeffs = buildUpdateCoefficients(mapping.dx, mapping.dy, 100.0);
+        const double meanDiscrepancy = computeMeanDiscrepancy(cfg);
 
-        computeWeight(weight, cfg, map);
+#ifdef USE_HDF5
+        constexpr bool hdf5Compiled = true;
+#else
+        constexpr bool hdf5Compiled = false;
+#endif
 
-        const auto weightT1 = std::chrono::steady_clock::now();
+        printRunHeader(cli, cfg, hdf5Compiled);
 
-        // ----------------------------------------------------
-        // Initialization
-        // ----------------------------------------------------
-        const auto initT0 = std::chrono::steady_clock::now();
+        std::vector<int> weightField(totalCells);
+        std::vector<double> currentField(totalCells);
+        std::vector<double> nextField(totalCells);
 
-        initializeField(uCurr, weight, cfg, map, discrepancy);
+        std::ofstream csv(cli.csvFile);
 
-        const auto initT1 = std::chrono::steady_clock::now();
+        if (!csv) {
+            throw std::runtime_error("Cannot open CSV output file: " + cli.csvFile);
+        }
 
-        // ----------------------------------------------------
-        // Dynamics + output
-        // ----------------------------------------------------
-        double pureDynamicsTime = 0.0;
-        double outputStatsIoTime = 0.0;
-        int outputFrames = 0;
+        writeStatisticsHeader(csv);
 
-        const auto loopT0 = std::chrono::steady_clock::now();
+        ScopedTimer totalTimer;
 
-        H5Writer writer(
-            opt.h5File,
-            cfg.nx,
-            cfg.ny,
-            32,
-            opt.h5TileY,
-            opt.h5TileX
+        ScopedTimer weightTimer;
+        computeFractalWeights(weightField, cfg, mapping);
+        const double weightTime = weightTimer.elapsedSeconds();
+
+        ScopedTimer rangeTimer;
+        const auto [minWeight, maxWeight] = computeWeightRange(weightField);
+        const double weightRangeTime = rangeTimer.elapsedSeconds();
+
+        ScopedTimer initTimer;
+        initializeTemperatureField(
+            currentField,
+            weightField,
+            cfg,
+            mapping,
+            meanDiscrepancy,
+            minWeight,
+            maxWeight
         );
+        const double initTime = initTimer.elapsedSeconds();
 
+        std::unique_ptr<TimeSeriesWriter> writer;
+
+        if (cli.writeHdf5) {
+            writer = std::make_unique<TimeSeriesWriter>(
+                cli.h5File,
+                cfg.gridWidth,
+                cfg.gridHeight,
+                32,
+                256,
+                256
+            );
+        }
+
+        double pureDynamicsTime = 0.0;
+        double statisticsTime = 0.0;
+        double csvTime = 0.0;
+        double hdf5Time = 0.0;
+
+        int outputFrames = 0;
         bool hasLastWrittenStep = false;
         int lastWrittenStep = -1;
+
+        FieldStatistics finalStats{};
 
         auto writeOutputFrame = [&](int step) {
             if (hasLastWrittenStep && step == lastWrittenStep) {
                 return;
             }
 
-            const auto outT0 = std::chrono::steady_clock::now();
+            ScopedTimer statsTimer;
+            const FieldStatistics stats = computeFieldStatistics(currentField);
+            statisticsTime += statsTimer.elapsedSeconds();
 
-            writer.write(step, uCurr);
-            writeStatsLine(csv, step, computeStats(uCurr, opt.statsMode));
+            finalStats = stats;
+
+            ScopedTimer csvTimer;
+            writeStatisticsRow(csv, step, stats);
+            csvTime += csvTimer.elapsedSeconds();
+
+            if (writer) {
+                ScopedTimer hdf5Timer;
+                writer->writeFrame(step, currentField);
+                hdf5Time += hdf5Timer.elapsedSeconds();
+            }
+
             ++outputFrames;
-
-            const auto outT1 = std::chrono::steady_clock::now();
-
-            outputStatsIoTime +=
-                std::chrono::duration<double>(outT1 - outT0).count();
-
             hasLastWrittenStep = true;
             lastWrittenStep = step;
         };
 
-        // If outputEvery was explicitly specified, keep the traditional
-        // behavior and write the initial condition.
-        //
-        // If outputEvery was not specified, do not write step 0 here.
-        // In that mode, only the final state is written after the loop.
-        if (cfg.hasOutputEvery) {
+        ScopedTimer loopTimer;
+
+        if (shouldWriteStep(0, cfg.timeSteps, cfg.outputEvery)) {
             writeOutputFrame(0);
         }
 
-        for (int step = 1; step <= cfg.steps; ++step) {
-            const auto dynT0 = std::chrono::steady_clock::now();
+        for (int step = 1; step <= cfg.timeSteps; ++step) {
+            ScopedTimer stepTimer;
 
-            updateField(
-                uCurr.data(),
-                uNext.data(),
-                cfg.nx,
-                cfg.ny,
-                cooling
+            advanceTemperatureField(
+                currentField.data(),
+                nextField.data(),
+                cfg.gridWidth,
+                cfg.gridHeight,
+                coeffs
             );
 
-            std::swap(uCurr, uNext);
+            pureDynamicsTime += stepTimer.elapsedSeconds();
 
-            const auto dynT1 = std::chrono::steady_clock::now();
+            std::swap(currentField, nextField);
 
-            pureDynamicsTime +=
-                std::chrono::duration<double>(dynT1 - dynT0).count();
-
-            // Periodic loop output only exists when outputEvery was specified.
-            if (cfg.hasOutputEvery && (step % cfg.outputEvery) == 0) {
+            if (shouldWriteStep(step, cfg.timeSteps, cfg.outputEvery)) {
                 writeOutputFrame(step);
             }
         }
 
-        // Always write the final state.
-        //
-        // If periodic output already wrote this same final step,
-        // writeOutputFrame() avoids duplication.
-        writeOutputFrame(cfg.steps);
+        if (writer) {
+            writer->close();
+        }
 
-        writer.close();
+        csv.flush();
 
-        const auto loopT1 = std::chrono::steady_clock::now();
-        const auto totalT1 = std::chrono::steady_clock::now();
-
-        const double weightTime =
-            std::chrono::duration<double>(weightT1 - weightT0).count();
-
-        const double initTime =
-            std::chrono::duration<double>(initT1 - initT0).count();
-
-        const double loopWallTime =
-            std::chrono::duration<double>(loopT1 - loopT0).count();
-
-        const double totalWallTime =
-            std::chrono::duration<double>(totalT1 - totalT0).count();
+        const double loopWallTime = loopTimer.elapsedSeconds();
+        const double totalWallTime = totalTimer.elapsedSeconds();
 
         const double updates =
-            static_cast<double>(cfg.nx - 2)
-            * static_cast<double>(cfg.ny - 2)
-            * static_cast<double>(cfg.steps);
+            static_cast<double>(cfg.gridWidth - 2) *
+            static_cast<double>(cfg.gridHeight - 2) *
+            static_cast<double>(cfg.timeSteps);
 
-        std::cout << "Weight field time:            " << weightTime << " s\n";
-        std::cout << "Init field time:              " << initTime << " s\n";
-        std::cout << "Pure dynamics compute time:   " << pureDynamicsTime << " s\n";
-        std::cout << "Stats + CSV + HDF5 time:      " << outputStatsIoTime << " s\n";
-        std::cout << "Dynamics loop wall time:      " << loopWallTime << " s\n";
-        std::cout << "Total measured wall time:     " << totalWallTime << " s\n";
-        std::cout << "Output frames:                " << outputFrames << '\n';
+        std::cout << "Weight field time:             " << weightTime << " s\n";
+        std::cout << "Weight range reduction time:   " << weightRangeTime << " s\n";
+        std::cout << "Initialization time:           " << initTime << " s\n";
+        std::cout << "Pure dynamics compute time:    " << pureDynamicsTime << " s\n";
+        std::cout << "Statistics time:               " << statisticsTime << " s\n";
+        std::cout << "CSV write time:                " << csvTime << " s\n";
+        std::cout << "HDF5 write time:               " << hdf5Time << " s\n";
+        std::cout << "Dynamics loop wall time:       " << loopWallTime << " s\n";
+        std::cout << "Total measured wall time:      " << totalWallTime << " s\n";
+        std::cout << "Output frames:                 " << outputFrames << '\n';
 
-        if (cfg.steps > 0 && pureDynamicsTime > 0.0) {
-            std::cout << "Pure OpenMP dynamics perf:    "
-                      << updates / pureDynamicsTime / 1e9
+        if (cfg.timeSteps > 0 && pureDynamicsTime > 0.0) {
+            std::cout << "Pure dynamics performance:     "
+                      << updates / pureDynamicsTime / 1.0e9
                       << " GLUP/s\n";
         }
 
-        if (cfg.steps > 0 && loopWallTime > 0.0) {
-            std::cout << "End-to-end loop performance:  "
-                      << updates / loopWallTime / 1e9
+        if (cfg.timeSteps > 0 && loopWallTime > 0.0) {
+            std::cout << "Loop end-to-end performance:   "
+                      << updates / loopWallTime / 1.0e9
                       << " GLUP/s\n";
         }
 
-        std::cout << "Mean discrepancy:             "
-                  << std::setprecision(15) << discrepancy << '\n';
+        std::cout << "Mean discrepancy:              "
+                  << std::setprecision(15) << meanDiscrepancy << '\n';
+
+        std::cout << "Final min:                     "
+                  << std::setprecision(15) << finalStats.minValue << '\n';
+
+        std::cout << "Final mean:                    "
+                  << std::setprecision(15) << finalStats.meanValue << '\n';
+
+        std::cout << "Final max:                     "
+                  << std::setprecision(15) << finalStats.maxValue << '\n';
+
+        std::cout << "Final std.dev.:                "
+                  << std::setprecision(15) << finalStats.stdDev << '\n';
+
+        std::cout << "Final L2 norm:                 "
+                  << std::setprecision(15) << finalStats.l2Norm << '\n';
+
+        std::cout << "Final checksum:                "
+                  << std::setprecision(15) << finalStats.checksum << '\n';
+
+        std::cout << "Weight range:                  "
+                  << minWeight << " ... " << maxWeight << '\n';
 
         std::cout << "\nSimulation completed successfully.\n";
 
         return 0;
-    }
-    catch (const H5::Exception& e) {
+
+#ifdef USE_HDF5
+    } catch (const H5::Exception& e) {
         std::cerr << "HDF5 ERROR: " << e.getDetailMsg() << '\n';
         return 1;
-    }
-    catch (const std::exception& e) {
+#endif
+    } catch (const std::exception& e) {
         std::cerr << "CRITICAL ERROR: " << e.what() << '\n';
         return 1;
-    }
-    catch (...) {
-        std::cerr << "CRITICAL ERROR: Unknown failure\n";
+    } catch (...) {
+        std::cerr << "CRITICAL ERROR: unknown failure\n";
         return 1;
     }
 }

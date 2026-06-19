@@ -19,7 +19,8 @@
 #   files such as virtualenv activation scripts.
 # - source executes shell code, so the path should be derived from
 #   this repository, not from the user's ambient environment.
-#
+# ------------------------------------------------------------
+
 _SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${_SCRIPT_DIR}/.." && pwd)"
 export PROJECT_ROOT
@@ -61,84 +62,90 @@ if [[ "${BREW_PREFIX}" != "/opt/homebrew" ]]; then
 fi
 
 # ------------------------------------------------------------
-# Dependency checks
+# Required dependency checks
 # ------------------------------------------------------------
 #
 # Required:
-# - cmake: needed by scripts/build.sh
-# - hdf5: required by CMakeLists.txt via find_package(HDF5 REQUIRED ...)
+# - cmake
 #
-# Optional but recommended:
-# - libomp: needed if OpenMP support is desired with AppleClang.
-#   The macOS preset uses COOLING_BUILD_OPENMP=AUTO, so the build can
-#   still proceed without OpenMP, but the OpenMP target may be skipped.
-#
+# Optional:
+# - hdf5: used if COOLING_BUILD_HDF5=AUTO and CMake finds it
+# - libomp: used if COOLING_BUILD_OPENMP=AUTO and CMake finds it
+# - llvm: used only if USE_HOMEBREW_LLVM=1
+# ------------------------------------------------------------
 
-missing_required=0
-
-for pkg in cmake hdf5; do
-    if ! brew list "${pkg}" >/dev/null 2>&1; then
-        echo "[ERROR] Missing required Homebrew package: ${pkg}" >&2
-        missing_required=1
-    fi
-done
-
-if [[ "${missing_required}" == "1" ]]; then
+if ! brew list cmake >/dev/null 2>&1; then
+    echo "[ERROR] Missing required Homebrew package: cmake" >&2
     echo >&2
-    echo "[INFO] Install required dependencies with:" >&2
-    echo "       brew install cmake hdf5" >&2
+    echo "[INFO] Install required dependency with:" >&2
+    echo "       brew install cmake" >&2
     echo >&2
     return 1 2>/dev/null || exit 1
 fi
 
-if ! brew list libomp >/dev/null 2>&1; then
-    echo "[WARN] Missing optional Homebrew package: libomp"
-    echo "[WARN] OpenMP detection may fail, and the OpenMP target may not be built."
-    echo "[INFO] To enable OpenMP support, install it with:"
-    echo "       brew install libomp"
+# ------------------------------------------------------------
+# Optional HDF5 and OpenMP discovery
+# ------------------------------------------------------------
+
+CMAKE_PREFIX_PATH_ITEMS=()
+
+if brew list hdf5 >/dev/null 2>&1; then
+    HDF5_ROOT="$(brew --prefix hdf5)"
+    export HDF5_ROOT
+    CMAKE_PREFIX_PATH_ITEMS+=("${HDF5_ROOT}")
+    echo "[INFO] HDF5 found: ${HDF5_ROOT}"
+else
+    echo "[WARN] Homebrew package hdf5 not found."
+    echo "[WARN] The macos-arm64 preset uses COOLING_BUILD_HDF5=AUTO,"
+    echo "[WARN] so the build will continue without HDF5 support."
+    echo "[INFO] To enable HDF5 support, run:"
+    echo "       brew install hdf5"
 fi
-
-# ------------------------------------------------------------
-# Dependency roots
-# ------------------------------------------------------------
-
-HDF5_ROOT="$(brew --prefix hdf5)"
-export HDF5_ROOT
-
-echo "[INFO] HDF5_ROOT=${HDF5_ROOT}"
 
 if brew list libomp >/dev/null 2>&1; then
     OPENMP_ROOT="$(brew --prefix libomp)"
     export OPENMP_ROOT
-    echo "[INFO] OPENMP_ROOT=${OPENMP_ROOT}"
+    CMAKE_PREFIX_PATH_ITEMS+=("${OPENMP_ROOT}")
+    echo "[INFO] OpenMP runtime found: ${OPENMP_ROOT}"
+else
+    echo "[WARN] Homebrew package libomp not found."
+    echo "[WARN] OpenMP detection may fail, and the OpenMP target may not be built."
+    echo "[INFO] To enable OpenMP support, run:"
+    echo "       brew install libomp"
 fi
 
-# Help CMake discover Homebrew packages.
+# ------------------------------------------------------------
+# Help CMake discover Homebrew packages
+# ------------------------------------------------------------
 #
 # CMAKE_PREFIX_PATH is a standard CMake search path variable.
-# Keep any existing value, but prepend the project-relevant prefixes.
-#
-if [[ -n "${OPENMP_ROOT:-}" ]]; then
-    export CMAKE_PREFIX_PATH="${HDF5_ROOT}:${OPENMP_ROOT}:${CMAKE_PREFIX_PATH:-}"
-else
-    export CMAKE_PREFIX_PATH="${HDF5_ROOT}:${CMAKE_PREFIX_PATH:-}"
-fi
+# Keep any existing value, but prepend project-relevant prefixes.
+# ------------------------------------------------------------
 
-echo "[INFO] CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}"
+if [[ "${#CMAKE_PREFIX_PATH_ITEMS[@]}" -gt 0 ]]; then
+    _NEW_CMAKE_PREFIX_PATH="$(IFS=:; echo "${CMAKE_PREFIX_PATH_ITEMS[*]}")"
+
+    if [[ -n "${CMAKE_PREFIX_PATH:-}" ]]; then
+        export CMAKE_PREFIX_PATH="${_NEW_CMAKE_PREFIX_PATH}:${CMAKE_PREFIX_PATH}"
+    else
+        export CMAKE_PREFIX_PATH="${_NEW_CMAKE_PREFIX_PATH}"
+    fi
+
+    echo "[INFO] CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}"
+else
+    echo "[INFO] No optional Homebrew package prefixes added to CMAKE_PREFIX_PATH."
+fi
 
 # ------------------------------------------------------------
 # Select macOS build preset
 # ------------------------------------------------------------
 #
 # The CMake preset remains the source of truth for build options:
+# - COOLING_BUILD_HDF5=AUTO
 # - COOLING_BUILD_OPENMP=AUTO
 # - COOLING_BUILD_CUDA=OFF
 # - CMAKE_OSX_ARCHITECTURES=arm64
-#
-# This makes the usual workflow correct:
-#   source scripts/env.macos.sh
-#   ./scripts/build.sh
-#
+# ------------------------------------------------------------
 
 export PRESET="${PRESET:-macos-arm64}"
 
@@ -157,7 +164,7 @@ export PRESET="${PRESET:-macos-arm64}"
 #
 # - Do not use CXX_COMPILER here; CMake does not automatically consume
 #   that environment variable.
-#
+# ------------------------------------------------------------
 
 USE_HOMEBREW_LLVM="${USE_HOMEBREW_LLVM:-0}"
 
@@ -199,21 +206,32 @@ if [[ "${USE_HOMEBREW_LLVM}" == "1" ]]; then
     echo "[INFO] Using Homebrew LLVM C++ compiler: ${CXX}"
 else
     echo "[INFO] Using default C/C++ compiler unless CC/CXX are already set."
+
     if [[ -n "${CC:-}" ]]; then
         echo "[INFO] Existing CC=${CC}"
     fi
+
     if [[ -n "${CXX:-}" ]]; then
         echo "[INFO] Existing CXX=${CXX}"
     fi
 fi
 
 # ------------------------------------------------------------
+# Basic tool checks
+# ------------------------------------------------------------
+
+if ! command -v cmake >/dev/null 2>&1; then
+    echo "[ERROR] cmake not found, even though Homebrew cmake was expected." >&2
+    return 1 2>/dev/null || exit 1
+fi
+
+# ------------------------------------------------------------
 # Optional Python virtual environment
 # ------------------------------------------------------------
 #
-# Only source the virtualenv from the repository root we computed
-# above. Do not use an externally supplied PROJECT_ROOT.
-#
+# Only source the virtualenv from the repository root computed above.
+# Do not use an externally supplied PROJECT_ROOT.
+# ------------------------------------------------------------
 
 if [[ -d "${PROJECT_ROOT}/cooling_venv" ]]; then
     # shellcheck source=/dev/null
@@ -221,5 +239,10 @@ if [[ -d "${PROJECT_ROOT}/cooling_venv" ]]; then
     echo "[INFO] Activated Python virtualenv: ${PROJECT_ROOT}/cooling_venv"
 fi
 
+# ------------------------------------------------------------
+# Final summary
+# ------------------------------------------------------------
+
 echo "[INFO] PROJECT_ROOT=${PROJECT_ROOT}"
 echo "[INFO] PRESET=${PRESET}"
+echo "[INFO] macOS environment ready."

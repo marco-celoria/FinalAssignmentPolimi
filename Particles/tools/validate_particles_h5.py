@@ -1,15 +1,45 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
 import argparse
 import sys
-from typing import Optional, Tuple, Sequence
+from typing import Optional, Sequence, Tuple
 
 import h5py
 import numpy as np
 
 
-DEFAULT_DATASETS = ("/step", "/pos", "/vel", "/screen")
+# Official strict-validation defaults for the assignment.
+# /screen is intentionally excluded by default because it is intended mainly for
+# visualization/debugging and can be brittle across race-free parallel strategies.
+DEFAULT_DATASETS = ("/step", "/weight", "/pos", "/vel")
 
+# Metadata keys that are useful to compare when --check-metadata is requested.
+# These are written by the reference implementations but are not required for
+# default numerical validation.
+DEFAULT_METADATA_KEYS = (
+    "particles",
+    "max_steps",
+    "output_every",
+    "dt",
+    "kForce",
+    "eps",
+    "eps2",
+    "generating_grid_nx",
+    "generating_grid_ny",
+    "screen_grid_nx",
+    "screen_grid_ny",
+    "screen_grid_xs",
+    "screen_grid_xe",
+    "screen_grid_ys",
+    "screen_grid_ye",
+)
+
+
+# -----------------------------------------------------------------------------
+# Formatting and dataset helpers
+# -----------------------------------------------------------------------------
 
 def format_index(idx_tuple: Sequence[int]) -> str:
     return "(" + ", ".join(str(int(x)) for x in idx_tuple) + ")"
@@ -38,6 +68,43 @@ def first_mismatch_index_close(
         return None
     return tuple(int(x) for x in np.argwhere(diff)[0])
 
+
+def parse_dataset_list(value: str) -> Tuple[str, ...]:
+    names = []
+
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+
+        if not item.startswith("/"):
+            item = "/" + item
+
+        names.append(item)
+
+    if not names:
+        raise argparse.ArgumentTypeError("dataset list cannot be empty")
+
+    return tuple(names)
+
+
+def parse_metadata_key_list(value: str) -> Tuple[str, ...]:
+    names = []
+
+    for item in value.split(","):
+        item = item.strip()
+        if item:
+            names.append(item)
+
+    if not names:
+        raise argparse.ArgumentTypeError("metadata key list cannot be empty")
+
+    return tuple(names)
+
+
+# -----------------------------------------------------------------------------
+# Difference metrics
+# -----------------------------------------------------------------------------
 
 def max_abs_rel_diff(
     a: np.ndarray,
@@ -77,6 +144,10 @@ def max_abs_rel_diff(
     return max_abs, max_rel, max_abs_idx, max_rel_idx
 
 
+# -----------------------------------------------------------------------------
+# Finite checks
+# -----------------------------------------------------------------------------
+
 def check_finite_dataset(
     ds: h5py.Dataset,
     name: str,
@@ -112,8 +183,13 @@ def check_finite_dataset(
             print(f"       value: {data[local_idx]}")
             return False
 
+    print(f"[ OK ] {label}:{name}: all floating-point values are finite")
     return True
 
+
+# -----------------------------------------------------------------------------
+# Dataset comparison
+# -----------------------------------------------------------------------------
 
 def compare_dataset(
     ds_a: h5py.Dataset,
@@ -234,6 +310,10 @@ def compare_dataset(
     return True
 
 
+# -----------------------------------------------------------------------------
+# /step validation
+# -----------------------------------------------------------------------------
+
 def read_step_dataset(file_handle: h5py.File, label: str) -> Optional[np.ndarray]:
     if not dataset_exists(file_handle, "/step"):
         print(f"[FAIL] {label}: missing /step dataset")
@@ -248,10 +328,33 @@ def read_step_dataset(file_handle: h5py.File, label: str) -> Optional[np.ndarray
     return step
 
 
+def expected_steps(max_steps: int, output_every: int) -> np.ndarray:
+    """
+    Expected saved physical steps.
+
+    output_every == 0 means final-frame-only HDF5 output, i.e. [max_steps].
+    output_every > 0 means step 0, every output_every steps before max_steps,
+    and the final step max_steps.
+    """
+    if output_every < 0:
+        raise ValueError("output_every must be >= 0")
+
+    if output_every == 0:
+        return np.asarray([max_steps], dtype=np.int64)
+
+    steps = list(range(0, max_steps, output_every))
+
+    if not steps or steps[-1] != max_steps:
+        steps.append(max_steps)
+
+    return np.asarray(steps, dtype=np.int64)
+
+
 def validate_steps(
     step_a: np.ndarray,
     step_b: np.ndarray,
     max_steps: Optional[int],
+    require_initial_zero: bool,
 ) -> bool:
     ok = True
 
@@ -273,8 +376,15 @@ def validate_steps(
         print("[FAIL] /step: no frames written")
         return False
 
-    if int(step_a[0]) != 0:
+    # Multi-frame output should start at step 0. A single non-zero frame is
+    # allowed because output_every == 0 means final-frame-only HDF5 output.
+    if require_initial_zero and step_a.size > 1 and int(step_a[0]) != 0:
         print(f"[FAIL] /step: first saved step is {step_a[0]}, expected 0")
+        ok = False
+
+    if np.any(step_a < 0):
+        bad = int(np.argwhere(step_a < 0)[0, 0])
+        print(f"[FAIL] /step: negative step at frame {bad}: {step_a[bad]}")
         ok = False
 
     diffs = np.diff(step_a)
@@ -298,18 +408,14 @@ def validate_steps(
             print(f"[ OK ] /step: final saved step is max_steps={max_steps}")
 
     if ok:
-        print("[ OK ] /step: identical, strictly increasing, no duplicates")
+        if require_initial_zero and step_a.size > 1:
+            print("[ OK ] /step: identical, starts at zero, strictly increasing, no duplicates")
+        elif step_a.size == 1:
+            print("[ OK ] /step: identical single-frame sequence, no duplicates")
+        else:
+            print("[ OK ] /step: identical, strictly increasing, no duplicates")
 
     return ok
-
-
-def expected_steps(max_steps: int, output_every: int) -> np.ndarray:
-    steps = list(range(0, max_steps, output_every))
-
-    if not steps or steps[-1] != max_steps:
-        steps.append(max_steps)
-
-    return np.asarray(steps, dtype=np.int64)
 
 
 def validate_expected_steps(
@@ -333,36 +439,73 @@ def validate_expected_steps(
         elif exp.size != step.size:
             print("       common prefix matches, but lengths differ")
 
-        print(f"       expected first/last: {exp[0]} / {exp[-1]}")
-        print(f"       actual first/last:   {step[0]} / {step[-1]}")
+        if exp.size > 0:
+            print(f"       expected first/last: {exp[0]} / {exp[-1]}")
+        if step.size > 0:
+            print(f"       actual first/last:   {step[0]} / {step[-1]}")
         return False
 
     print("[ OK ] /step: matches expected cadence")
     return True
 
 
-def parse_dataset_list(value: str) -> Tuple[str, ...]:
-    names = []
+# -----------------------------------------------------------------------------
+# Metadata comparison
+# -----------------------------------------------------------------------------
 
-    for item in value.split(","):
-        item = item.strip()
-        if not item:
+def metadata_values_equal(a, b, rtol: float, atol: float) -> bool:
+    arr_a = np.asarray(a)
+    arr_b = np.asarray(b)
+
+    if arr_a.shape != arr_b.shape:
+        return False
+
+    if np.issubdtype(arr_a.dtype, np.number) or np.issubdtype(arr_b.dtype, np.number):
+        return bool(np.allclose(arr_a, arr_b, rtol=rtol, atol=atol, equal_nan=True))
+
+    return bool(np.array_equal(arr_a, arr_b))
+
+
+def compare_metadata(
+    fa: h5py.File,
+    fb: h5py.File,
+    keys: Sequence[str],
+    rtol: float,
+    atol: float,
+) -> bool:
+    ok = True
+    print("[INFO] metadata: checking root attributes")
+
+    for key in keys:
+        in_a = key in fa.attrs
+        in_b = key in fb.attrs
+
+        if not in_a or not in_b:
+            print(f"[FAIL] metadata:{key}: missing in {'reference' if not in_a else 'candidate'} file")
+            ok = False
             continue
 
-        if not item.startswith("/"):
-            item = "/" + item
+        va = fa.attrs[key]
+        vb = fb.attrs[key]
 
-        names.append(item)
+        if metadata_values_equal(va, vb, rtol=rtol, atol=atol):
+            print(f"[ OK ] metadata:{key}")
+        else:
+            print(f"[FAIL] metadata:{key}: mismatch")
+            print(f"       reference: {va}")
+            print(f"       candidate: {vb}")
+            ok = False
 
-    if not names:
-        raise argparse.ArgumentTypeError("dataset list cannot be empty")
+    return ok
 
-    return tuple(names)
 
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Compare two particles.h5 files dataset-by-dataset."
+        description="Compare two particles HDF5 files dataset-by-dataset."
     )
 
     parser.add_argument("file_a", help="Reference file")
@@ -372,7 +515,8 @@ def main() -> int:
         "--datasets",
         type=parse_dataset_list,
         default=DEFAULT_DATASETS,
-        help="Comma-separated datasets to compare. Default: /step,/pos,/vel,/screen",
+        help="Comma-separated datasets to compare. Default: /step,/weight,/pos,/vel. "
+             "Use --datasets step,weight,pos,vel,screen to include /screen.",
     )
 
     parser.add_argument(
@@ -413,7 +557,7 @@ def main() -> int:
         "--chunksize",
         type=int,
         default=8,
-        help="Number of frames to compare at once. Default: 8",
+        help="Number of frames/leading-axis entries to compare at once. Default: 8",
     )
 
     parser.add_argument(
@@ -431,7 +575,7 @@ def main() -> int:
     parser.add_argument(
         "--check-finite",
         action="store_true",
-        help="Fail if floating-point datasets contain NaN or Inf.",
+        help="Fail if floating-point datasets such as /weight, /pos, or /vel contain NaN or Inf.",
     )
 
     parser.add_argument(
@@ -445,7 +589,20 @@ def main() -> int:
         "--output-every",
         type=int,
         default=None,
-        help="Expected output cadence. Requires --max-steps. Validates exact /step sequence.",
+        help="Expected output cadence. Requires --max-steps. Use 0 for final-frame-only HDF5 output.",
+    )
+
+    parser.add_argument(
+        "--check-metadata",
+        action="store_true",
+        help="Also compare selected root HDF5 attributes. Off by default.",
+    )
+
+    parser.add_argument(
+        "--metadata-keys",
+        type=parse_metadata_key_list,
+        default=DEFAULT_METADATA_KEYS,
+        help="Comma-separated root attribute keys used with --check-metadata.",
     )
 
     args = parser.parse_args()
@@ -463,8 +620,8 @@ def main() -> int:
         return 2
 
     if args.output_every is not None:
-        if args.output_every <= 0:
-            print("ERROR: --output-every must be > 0", file=sys.stderr)
+        if args.output_every < 0:
+            print("ERROR: --output-every must be >= 0", file=sys.stderr)
             return 2
 
         if args.max_steps is None:
@@ -492,6 +649,16 @@ def main() -> int:
                 print("\nFAILURE: missing datasets.")
                 return 1
 
+            if args.check_metadata:
+                ok = compare_metadata(
+                    fa=fa,
+                    fb=fb,
+                    keys=args.metadata_keys,
+                    rtol=args.rtol,
+                    atol=args.atol,
+                )
+                overall_ok = overall_ok and ok
+
             if "/step" in args.datasets:
                 step_a = read_step_dataset(fa, "reference")
                 step_b = read_step_dataset(fb, "candidate")
@@ -499,10 +666,19 @@ def main() -> int:
                 if step_a is None or step_b is None:
                     overall_ok = False
                 else:
+                    # output_every == 0 means final-only output, so /step is expected
+                    # to contain [max_steps] and should not be forced to start at 0.
+                    require_initial_zero = not (
+                        args.max_steps is not None
+                        and args.output_every is not None
+                        and args.output_every == 0
+                    )
+
                     ok = validate_steps(
                         step_a=step_a,
                         step_b=step_b,
                         max_steps=args.max_steps,
+                        require_initial_zero=require_initial_zero,
                     )
                     overall_ok = overall_ok and ok
 
@@ -516,7 +692,7 @@ def main() -> int:
 
             if args.check_finite:
                 for name in args.datasets:
-                    if name in ("/pos", "/vel"):
+                    if name in ("/weight", "/pos", "/vel"):
                         ok_a = check_finite_dataset(
                             fa[name],
                             name,
@@ -610,3 +786,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

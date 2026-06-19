@@ -78,7 +78,7 @@
 4000
 
 # Number of time steps
-500
+200
 
 # Output every N time steps
-50
+20

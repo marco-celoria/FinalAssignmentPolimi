@@ -28,7 +28,7 @@ STEP_DATASET = "/step"
 # Visualization defaults
 # ---------------------------------------------------------------------
 
-TITLE = "Mandelbrot-seeded N-body simulation"
+DEFAULT_TITLE = "Mandelbrot-seeded N-body simulation"
 
 FIGSIZE = (9.0, 7.0)
 ASPECT = "equal"
@@ -191,9 +191,15 @@ def validate_cli_args(args: argparse.Namespace) -> None:
     if args.stride <= 0:
         raise ValueError("--stride must be greater than zero")
 
+    if args.particle_stride <= 0:
+        raise ValueError("--particle-stride must be greater than zero")
+
+    if args.max_particles is not None and args.max_particles <= 0:
+        raise ValueError("--max-particles must be greater than zero")
+
 
 # ---------------------------------------------------------------------
-# Frame and data helpers
+# Frame, particle, and metadata helpers
 # ---------------------------------------------------------------------
 
 def make_frame_indices(nframes: int, stride: int) -> list[int]:
@@ -203,6 +209,29 @@ def make_frame_indices(nframes: int, stride: int) -> list[int]:
         raise ValueError("no frames selected; check --stride")
 
     return frames
+
+
+def make_particle_indices(
+    nparticles: int,
+    particle_stride: int,
+    max_particles: Optional[int],
+) -> np.ndarray:
+    """
+    Select a deterministic particle subset for plotting.
+
+    The simulation data are unchanged; this only reduces scatter-plot load for
+    large files.
+    """
+    indices = np.arange(0, nparticles, particle_stride, dtype=np.int64)
+
+    if indices.size == 0:
+        raise ValueError("no particles selected; check --particle-stride")
+
+    if max_particles is not None and indices.size > max_particles:
+        positions = np.linspace(0, indices.size - 1, max_particles)
+        indices = indices[np.round(positions).astype(np.int64)]
+
+    return indices
 
 
 def choose_sampled_frames(
@@ -222,50 +251,117 @@ def choose_sampled_frames(
     return [frame_indices[int(round(pos))] for pos in positions]
 
 
-def load_positions(pos: h5py.Dataset, frame: int) -> np.ndarray:
-    return pos[frame, :, :2]
+def load_positions(
+    pos: h5py.Dataset,
+    frame: int,
+    particle_indices: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    if particle_indices is None:
+        return pos[frame, :, :2]
+    return pos[frame, particle_indices, :2]
 
 
 def load_screen(screen: h5py.Dataset, frame: int) -> np.ndarray:
     return screen[frame]
 
 
+def title_from_metadata(h5: h5py.File) -> str:
+    """
+    Build a readable title from HDF5 metadata, if available.
+    """
+    application = h5.attrs.get("application")
+
+    if application is None:
+        return DEFAULT_TITLE
+
+    if isinstance(application, bytes):
+        application = application.decode("utf-8", errors="replace")
+
+    application = str(application).strip()
+    return application if application else DEFAULT_TITLE
+
+
 def build_title(
+    title_base: str,
     frame: int,
     nframes: int,
     steps: Optional[h5py.Dataset],
 ) -> str:
     if steps is None:
-        return f"{TITLE} — frame {frame}/{nframes - 1}"
+        return f"{title_base} — frame {frame}/{nframes - 1}"
 
-    return f"{TITLE} — frame {frame}/{nframes - 1} — step {int(steps[frame])}"
+    return f"{title_base} — frame {frame}/{nframes - 1} — step {int(steps[frame])}"
+
+
+def print_optional_root_metadata(h5: h5py.File) -> None:
+    keys = (
+        "application",
+        "format_version",
+        "input_file",
+        "particles",
+        "max_steps",
+        "output_every",
+        "dt",
+        "kForce",
+        "eps",
+    )
+
+    available = [(key, h5.attrs[key]) for key in keys if key in h5.attrs]
+
+    if not available:
+        return
+
+    print("Metadata:")
+    for key, value in available:
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="replace")
+        print(f"  {key}: {value}")
 
 
 # ---------------------------------------------------------------------
 # Extent and color scaling
 # ---------------------------------------------------------------------
 
-def read_screen_extent(screen: h5py.Dataset) -> Optional[tuple[float, float, float, float]]:
-    """
-    Read physical extent from /screen attributes if available.
-
-    Expected attributes:
-        xs, xe, ys, ye
-    """
-    required_attrs = ("xs", "xe", "ys", "ye")
-
-    if not all(name in screen.attrs for name in required_attrs):
-        return None
-
-    xs = float(screen.attrs["xs"])
-    xe = float(screen.attrs["xe"])
-    ys = float(screen.attrs["ys"])
-    ye = float(screen.attrs["ye"])
-
+def _validate_extent(xs: float, xe: float, ys: float, ye: float, source: str) -> tuple[float, float, float, float]:
     if xe <= xs or ye <= ys:
-        raise ValueError("invalid /screen extent attributes: require xe > xs and ye > ys")
-
+        raise ValueError(f"invalid {source} extent attributes: require xe > xs and ye > ys")
     return xs, xe, ys, ye
+
+
+def read_screen_extent(
+    h5: h5py.File,
+    screen: h5py.Dataset,
+) -> Optional[tuple[float, float, float, float]]:
+    """
+    Read physical extent from HDF5 metadata if available.
+
+    Priority:
+      1. /screen attributes: xs, xe, ys, ye
+      2. root attributes used by the assignment writers:
+         screen_grid_xs, screen_grid_xe, screen_grid_ys, screen_grid_ye
+    """
+    if all(name in screen.attrs for name in ("xs", "xe", "ys", "ye")):
+        xs = float(screen.attrs["xs"])
+        xe = float(screen.attrs["xe"])
+        ys = float(screen.attrs["ys"])
+        ye = float(screen.attrs["ye"])
+        return _validate_extent(xs, xe, ys, ye, "/screen")
+
+    root_names = (
+        "screen_grid_xs",
+        "screen_grid_xe",
+        "screen_grid_ys",
+        "screen_grid_ye",
+    )
+
+    if all(name in h5.attrs for name in root_names):
+        xs = float(h5.attrs["screen_grid_xs"])
+        xe = float(h5.attrs["screen_grid_xe"])
+        ys = float(h5.attrs["screen_grid_ys"])
+        ye = float(h5.attrs["screen_grid_ye"])
+        return _validate_extent(xs, xe, ys, ye, "root screen_grid_*")
+
+    return None
 
 
 def infer_extent_from_positions(
@@ -321,6 +417,7 @@ def infer_extent_from_positions(
 
 
 def determine_extent(
+    h5: h5py.File,
     pos: h5py.Dataset,
     screen: h5py.Dataset,
     frame_indices: Sequence[int],
@@ -329,10 +426,11 @@ def determine_extent(
     Determine plotting extent.
 
     Priority:
-      1. /screen attributes xs, xe, ys, ye
-      2. inferred particle-position extent
+      1. /screen attrs xs, xe, ys, ye
+      2. root attrs screen_grid_xs, screen_grid_xe, screen_grid_ys, screen_grid_ye
+      3. inferred particle-position extent
     """
-    extent = read_screen_extent(screen)
+    extent = read_screen_extent(h5, screen)
 
     if extent is not None:
         return extent
@@ -410,9 +508,11 @@ def create_animation(
     screen: h5py.Dataset,
     steps: Optional[h5py.Dataset],
     frame_indices: Sequence[int],
+    particle_indices: np.ndarray,
     extent: tuple[float, float, float, float],
     screen_bounds: tuple[float, float],
     *,
+    title_base: str,
     fps: int,
     log_scale: bool,
 ) -> animation.FuncAnimation:
@@ -420,7 +520,7 @@ def create_animation(
     nframes = int(pos.shape[0])
 
     screen0 = load_screen(screen, first_frame)
-    pos0 = load_positions(pos, first_frame)
+    pos0 = load_positions(pos, first_frame, particle_indices)
 
     vmin, vmax = screen_bounds
 
@@ -460,14 +560,14 @@ def create_animation(
     ax.set_ylabel("y")
     ax.set_aspect(ASPECT, adjustable="box")
 
-    title = ax.set_title(build_title(first_frame, nframes, steps))
+    title = ax.set_title(build_title(title_base, first_frame, nframes, steps))
 
     def update(frame_number: int):
         frame = frame_indices[frame_number]
 
         image.set_data(load_screen(screen, frame))
-        scatter.set_offsets(load_positions(pos, frame))
-        title.set_text(build_title(frame, nframes, steps))
+        scatter.set_offsets(load_positions(pos, frame, particle_indices))
+        title.set_text(build_title(title_base, frame, nframes, steps))
 
         return image, scatter, title
 
@@ -553,6 +653,20 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--particle-stride",
+        type=int,
+        default=1,
+        help="plot every Nth particle, default: 1",
+    )
+
+    parser.add_argument(
+        "--max-particles",
+        type=int,
+        default=None,
+        help="maximum number of particles to draw after applying --particle-stride",
+    )
+
+    parser.add_argument(
         "--log-screen",
         action="store_true",
         help="use logarithmic color scaling for /screen",
@@ -586,11 +700,19 @@ def run(args: argparse.Namespace) -> None:
         validate_optional_steps(steps, nframes)
 
         frame_indices = make_frame_indices(nframes, args.stride)
-        extent = determine_extent(pos, screen, frame_indices)
+        particle_indices = make_particle_indices(
+            nparticles,
+            args.particle_stride,
+            args.max_particles,
+        )
+        extent = determine_extent(h5, pos, screen, frame_indices)
+        title_base = title_from_metadata(h5)
 
         print(f"Loaded file:        {input_path}")
+        print_optional_root_metadata(h5)
         print(f"Frames displayed:   {len(frame_indices)} / {nframes}")
         print(f"Particles:          {nparticles}")
+        print(f"Particles drawn:    {particle_indices.size} / {nparticles}")
         print(f"Screen grid:        {screen_nx} x {screen_ny}")
         print(f"Position dataset:   shape={pos.shape}, dtype={pos.dtype}")
         print(f"Screen dataset:     shape={screen.shape}, dtype={screen.dtype}")
@@ -632,8 +754,10 @@ def run(args: argparse.Namespace) -> None:
             screen,
             steps,
             frame_indices,
+            particle_indices,
             extent,
             screen_bounds,
+            title_base=title_base,
             fps=args.fps,
             log_scale=args.log_screen,
         )
@@ -669,3 +793,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
