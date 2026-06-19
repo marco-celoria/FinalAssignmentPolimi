@@ -301,7 +301,7 @@ def blocks_1d(n: int, threads: int) -> int:
 # ============================================================
 
 
-@njit(cache=True, parallel=True, fastmath=False)
+@njit(parallel=True, fastmath=False)
 def compute_generating_field_numba(values, nx, ny, xs, xe, ys, ye, max_iter):
     dx = (xe - xs) / (nx - 1)
     dy = (ye - ys) / (ny - 1)

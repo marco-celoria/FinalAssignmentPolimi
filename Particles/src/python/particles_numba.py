@@ -280,7 +280,7 @@ def should_write_step(step: int, final_step: int, output_every: int) -> bool:
 # ============================================================
 
 
-@njit(cache=True, parallel=True, fastmath=False)
+@njit(parallel=True, fastmath=False)
 def compute_generating_field_numba(values, nx, ny, xs, xe, ys, ye, max_iter):
     dx = (xe - xs) / (nx - 1)
     dy = (ye - ys) / (ny - 1)
@@ -308,7 +308,7 @@ def compute_generating_field_numba(values, nx, ny, xs, xe, ys, ye, max_iter):
             values[base + i] = np.uint64(it)
 
 
-@njit(cache=True, parallel=True, fastmath=False)
+@njit(parallel=True, fastmath=False)
 def compute_forces_numba(x, y, w, fx, fy):
     n_particles = x.shape[0]
 
@@ -338,7 +338,7 @@ def compute_forces_numba(x, y, w, fx, fy):
         fy[i] = fyi
 
 
-@njit(cache=True, parallel=True, fastmath=False)
+@njit(parallel=True, fastmath=False)
 def half_kick_drift_numba(x, y, vx, vy, w, fx, fy, dt):
     n_particles = x.shape[0]
 
@@ -350,7 +350,7 @@ def half_kick_drift_numba(x, y, vx, vy, w, fx, fy, dt):
         y[i] += vy[i] * dt
 
 
-@njit(cache=True, parallel=True, fastmath=False)
+@njit(parallel=True, fastmath=False)
 def half_kick_numba(vx, vy, w, fx_new, fy_new, dt):
     n_particles = vx.shape[0]
 
@@ -360,7 +360,7 @@ def half_kick_numba(vx, vy, w, fx_new, fy_new, dt):
         vy[i] += 0.5 * fy_new[i] * invm * dt
 
 
-@njit(cache=True, fastmath=False)
+@njit(fastmath=False)
 def build_screen_numba(values, nx, ny, xs, xe, ys, ye, x, y, w, wmin, wr):
     # Kept serial intentionally: several particles may update the same screen
     # cell. A naive prange would introduce races.
@@ -405,7 +405,7 @@ def build_screen_numba(values, nx, ny, xs, xe, ys, ye, x, y, w, wmin, wr):
                 values[row + jx] += wp_u64
 
 
-@njit(cache=True, parallel=True, fastmath=False)
+@njit(parallel=True, fastmath=False)
 def validation_basic_numba(w, x, y, vx, vy):
     n_particles = x.shape[0]
     sum_x = 0.0
@@ -448,7 +448,7 @@ def validation_basic_numba(w, x, y, vx, vy):
     )
 
 
-@njit(cache=True, parallel=True, fastmath=False)
+@njit(parallel=True, fastmath=False)
 def validation_potential_numba(w, x, y):
     n_particles = x.shape[0]
     potential_like = 0.0
