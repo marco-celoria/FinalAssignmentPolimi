@@ -18,6 +18,7 @@ module load hdf5/1.14.3--gcc--12.2.0-spack0.22
 module load python/3.11.7
 python3 -m venv cooling_venv --system-site-packages
 source cooling_venv/bin/activate
-pip install -r requirements.txt
+python3 -m pip install --upgrade pip setuptools wheel
+python3 -m pip install --no-cache-dir -r requirements.txt
 deactivate
 
