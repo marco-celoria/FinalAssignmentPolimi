@@ -2,21 +2,29 @@
 """
 Cooling / field-evolution solver - Numba CUDA reference implementation.
 
+This version is aligned with the Python/NumPy teaching baseline and the C++
+serial baseline.
+
 GPU-accelerated parts:
 
-  1) fractal weight field
-  2) temperature initialization
-  3) stencil update + boundary kernels
+  1) temperature initialization
+  2) stencil update + boundary kernels
 
 Host-side by design:
 
+  - fractal weight field initialization, using the same scalar algorithm as the
+    strict Python/NumPy baseline and the C++ serial baseline
+  - weight min/max reduction
   - HDF5 output
   - CSV output
   - snapshot statistics and checksum
-  - weight min/max reduction, intentionally simple for this teaching version
 
 Important design choices:
 
+  - The fractal/Mandelbrot-style weight initialization is intentionally computed
+    on the host. This avoids CPU/GPU boundary-classification differences and
+    makes this Numba CUDA implementation produce the same initial field as the
+    NumPy baseline.
   - HDF5 output is optional and disabled by default.
   - Statistics are computed on the host after copying requested snapshots.
   - outputEvery = 0 means final frame/statistics only.
@@ -56,8 +64,7 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 import numba
 import numpy as np
-from numba import cuda
-
+from numba import cuda, njit, prange
 
 # ============================================================
 # DATA STRUCTURES
@@ -121,8 +128,8 @@ class FieldStatistics:
 @dataclass
 class RunTimings:
     warmup_time: float = 0.0
-    weight_kernel_time: float = 0.0
-    weight_copy_time: float = 0.0
+    weight_host_time: float = 0.0
+    weight_h2d_time: float = 0.0
     weight_range_time: float = 0.0
     init_kernel_time: float = 0.0
     pure_dynamics_gpu_time: float = 0.0
@@ -420,59 +427,134 @@ def build_update_coefficients(
 
 
 # ============================================================
+# HOST-SIDE STRICT FRACTAL INITIALIZATION
+# ============================================================
+
+@njit(parallel=True, fastmath=False)
+def compute_fractal_weights_host_kernel(
+    grid_width: int,
+    grid_height: int,
+    x0: float,
+    y0: float,
+    dx: float,
+    dy: float,
+    max_iterations: int,
+) -> np.ndarray:
+    """
+    Numba-compiled host-side fractal weight computation.
+
+    Uses only primitive arguments so that Numba can compile in nopython mode.
+    The loop order and escape-before-update logic match the C++ baseline.
+    """
+    weight = np.empty(grid_width * grid_height, dtype=np.int32)
+
+    for j in prange(grid_height):
+        c_imag = y0 + dy * float(j)
+        row = j * grid_width
+
+        for i in range(grid_width):
+            c_real = x0 + dx * float(i)
+
+            z_real = 0.0
+            z_imag = 0.0
+            iteration = 0
+
+            while iteration < max_iterations:
+                if z_real * z_real + z_imag * z_imag > 4.0:
+                    break
+
+                tmp = z_real * z_real - z_imag * z_imag + c_real
+                z_imag = 2.0 * z_real * z_imag + c_imag
+                z_real = tmp
+                iteration += 1
+
+            weight[row + i] = iteration
+
+    return weight
+
+
+def compute_fractal_weights_host(
+    grid_width: int,
+    grid_height: int,
+    mapping: GridMapping,
+    max_iterations: int,
+) -> np.ndarray:
+    """
+    Python wrapper around the Numba host kernel.
+
+    Validation stays outside @njit because checked_grid_size() and GridMapping
+    are normal Python objects.
+    """
+    checked_grid_size(grid_width, grid_height)
+
+    if max_iterations <= 0:
+        raise ValueError("max_iterations must be > 0")
+
+    return compute_fractal_weights_host_kernel(
+        grid_width,
+        grid_height,
+        mapping.x0,
+        mapping.y0,
+        mapping.dx,
+        mapping.dy,
+        max_iterations,
+    )
+
+
+
+# ============================================================
 # NUMBA CUDA KERNELS
 # ============================================================
 
 @cuda.jit
-def compute_fractal_weights_kernel(
-        weight_field, grid_width, grid_height, x0, y0, dx, dy, max_fractal_iterations,
-    ):
-    i, j = cuda.grid(2)
-    if i >= grid_width or j >= grid_height:
-        return
-    
-    p = i + j * grid_width
-    x = x0 + dx * i
-    y = y0 + dy * j
-    z_real = 0.0
-    z_imag = 0.0
-    iteration = 0
-    while iteration < max_fractal_iterations:
-        if z_real * z_real + z_imag * z_imag > 4.0:
-            break
-        tmp = z_real * z_real - z_imag * z_imag + x
-        z_imag = 2.0 * z_real * z_imag + y
-        z_real = tmp
-        iteration += 1
-    weight_field[p] = iteration
-
-@cuda.jit
 def initialize_temperature_field_kernel(
-        temperature, weight_field, grid_width, grid_height, x0, y0, dx, dy, mean_discrepancy, min_weight, max_weight,
-    ):
+    temperature,
+    weight_field,
+    grid_width,
+    grid_height,
+    x0,
+    y0,
+    dx,
+    dy,
+    mean_discrepancy,
+    min_weight,
+    max_weight,
+):
     i, j = cuda.grid(2)
     if i >= grid_width or j >= grid_height:
         return
+
     p = i + j * grid_width
     x = x0 + dx * i
     y = y0 + dy * j
+
     denom = 1.0
     if max_weight > min_weight:
         denom = float(max_weight - min_weight)
+
     field_value = (x * x * x + y * y * y) / 6.0
     normalized_weight = float(weight_field[p] - min_weight) / denom
-    temperature[p] = (293.16 + 80.0 * (mean_discrepancy + field_value) * normalized_weight)
+    temperature[p] = 293.16 + 80.0 * (mean_discrepancy + field_value) * normalized_weight
+
 
 @cuda.jit
 def update_interior_kernel(
-        current_field, next_field, grid_width, grid_height, center_x, center_y, coeff_x, coeff_y,
-    ):
+    current_field,
+    next_field,
+    grid_width,
+    grid_height,
+    center_x,
+    center_y,
+    coeff_x,
+    coeff_y,
+):
     i, j = cuda.grid(2)
     if i < 1 or i >= grid_width - 1 or j < 1 or j >= grid_height - 1:
         return
+
     p = i + j * grid_width
     next_field[p] = (
-          coeff_x * (current_field[p - 1] + current_field[p + 1] + center_x * current_field[p])
+        coeff_x * (current_field[p - 1] + current_field[p + 1] + center_x * current_field[p])
         + coeff_y * (current_field[p - grid_width] + current_field[p + grid_width] + center_y * current_field[p])
     )
 
@@ -482,6 +564,7 @@ def apply_boundary_left_right_kernel(field, grid_width, grid_height):
     j = cuda.grid(1)
     if j < 1 or j >= grid_height - 1:
         return
+
     row = j * grid_width
     field[row] = field[row + 1]
     field[row + grid_width - 1] = field[row + grid_width - 2]
@@ -492,6 +575,7 @@ def apply_boundary_top_bottom_kernel(field, grid_width, grid_height):
     i = cuda.grid(1)
     if i >= grid_width:
         return
+
     field[i] = field[grid_width + i]
     field[(grid_height - 1) * grid_width + i] = field[(grid_height - 2) * grid_width + i]
 
@@ -512,35 +596,12 @@ def grid2d_for(
     )
 
 
-def launch_compute_fractal_weights(
-    d_weight_field: Any,
-    grid_width: int,
-    grid_height: int,
-    mapping: Any,
-    max_fractal_iterations: int,
-    block2d: Tuple[int, int],
-    stream: Any,
-) -> None:
-    grid = grid2d_for(grid_width, grid_height, block2d)
-
-    compute_fractal_weights_kernel[grid, block2d, stream](
-        d_weight_field,
-        grid_width,
-        grid_height,
-        mapping.x0,
-        mapping.y0,
-        mapping.dx,
-        mapping.dy,
-        max_fractal_iterations,
-    )
-
-
 def launch_initialize_temperature_field(
     d_temperature: Any,
     d_weight_field: Any,
     grid_width: int,
     grid_height: int,
-    mapping: Any,
+    mapping: GridMapping,
     mean_discrepancy: float,
     min_weight: int,
     max_weight: int,
@@ -569,7 +630,7 @@ def launch_advance_temperature_field(
     d_next_field: Any,
     grid_width: int,
     grid_height: int,
-    coeffs: Any,
+    coeffs: UpdateCoefficients,
     block2d: Tuple[int, int],
     block1d: int,
     stream: Any,
@@ -613,7 +674,7 @@ def advance_temperature_field_steps(
     number_of_steps: int,
     grid_width: int,
     grid_height: int,
-    coeffs: Any,
+    coeffs: UpdateCoefficients,
     block2d: Tuple[int, int],
     block1d: int,
     stream: Any,
@@ -836,21 +897,15 @@ def warmup_cuda(
     mapping = GridMapping(0.0, 0.0, 0.1, 0.1)
     coeffs = build_update_coefficients(mapping.dx, mapping.dy, 100.0)
 
-    d_weight_field = cuda.device_array(total_cells, dtype=np.int32)
+    host_weight = compute_fractal_weights_host(grid_width, grid_height, mapping, 2)
+
+    d_weight_field = cuda.to_device(host_weight)
     d_current_field = cuda.device_array(total_cells, dtype=np.float64)
     d_next_field = cuda.device_array(total_cells, dtype=np.float64)
 
     stream = cuda.stream()
-
-    launch_compute_fractal_weights(
-        d_weight_field,
-        grid_width,
-        grid_height,
-        mapping,
-        2,
-        block2d,
-        stream,
-    )
+    min_weight = int(np.min(host_weight))
+    max_weight = int(np.max(host_weight))
 
     launch_initialize_temperature_field(
         d_current_field,
@@ -859,8 +914,8 @@ def warmup_cuda(
         grid_height,
         mapping,
         0.0,
-        0,
-        1,
+        min_weight,
+        max_weight,
         block2d,
         stream,
     )
@@ -881,7 +936,7 @@ def warmup_cuda(
     elapsed = time.perf_counter() - start
 
     if verbose:
-        print("CUDA warmup completed; reported timings exclude compilation.")
+        print("CUDA warmup completed; reported GPU timings exclude compilation.")
 
     return elapsed
 
@@ -931,13 +986,6 @@ def run_simulation(
 
     stream = cuda.stream()
 
-    d_weight_field = cuda.device_array(total_cells, dtype=np.int32)
-    d_current_field = cuda.device_array(total_cells, dtype=np.float64)
-    d_next_field = cuda.device_array(total_cells, dtype=np.float64)
-
-    host_field = cuda.pinned_array(total_cells, dtype=np.float64)
-    host_weight_field = cuda.pinned_array(total_cells, dtype=np.int32)
-
     timings = RunTimings()
 
     if not skip_warmup:
@@ -947,28 +995,31 @@ def run_simulation(
 
     total_wall_start = time.perf_counter()
 
-    timings.weight_kernel_time = time_cuda_segment(
-        lambda: launch_compute_fractal_weights(
-            d_weight_field,
-            cfg.grid_width,
-            cfg.grid_height,
-            mapping,
-            cfg.max_fractal_iterations,
-            block2d,
-            stream,
-        ),
-        stream,
+    # --------------------------------------------------------
+    # Host-side strict fractal initialization.
+    # --------------------------------------------------------
+    weight_start = time.perf_counter()
+    host_weight_field = compute_fractal_weights_host(
+        cfg.grid_width,
+        cfg.grid_height,
+        mapping,
+        cfg.max_fractal_iterations,
     )
-
-    copy_start = time.perf_counter()
-    d_weight_field.copy_to_host(host_weight_field, stream=stream)
-    stream.synchronize()
-    timings.weight_copy_time = time.perf_counter() - copy_start
+    timings.weight_host_time = time.perf_counter() - weight_start
 
     range_start = time.perf_counter()
     min_weight = int(np.min(host_weight_field))
     max_weight = int(np.max(host_weight_field))
     timings.weight_range_time = time.perf_counter() - range_start
+
+    h2d_start = time.perf_counter()
+    d_weight_field = cuda.to_device(host_weight_field, stream=stream)
+    stream.synchronize()
+    timings.weight_h2d_time = time.perf_counter() - h2d_start
+
+    d_current_field = cuda.device_array(total_cells, dtype=np.float64, stream=stream)
+    d_next_field = cuda.device_array(total_cells, dtype=np.float64, stream=stream)
+    host_field = cuda.pinned_array(total_cells, dtype=np.float64)
 
     timings.init_kernel_time = time_cuda_segment(
         lambda: launch_initialize_temperature_field(
@@ -1003,7 +1054,7 @@ def run_simulation(
         if write_hdf5
         else None
     )
-    
+
     loop_start = time.perf_counter()
 
     try:
@@ -1113,9 +1164,10 @@ def run_simulation(
     print(f"CUDA block2d:                 {block2d}")
     print(f"CUDA block1d:                 {block1d}")
     print("CUDA backend:                 Numba CUDA")
+    print("Weight initialization:        host scalar baseline-compatible")
     print(f"CUDA warmup time:             {timings.warmup_time:.6f} s")
-    print(f"Weight field GPU time:        {timings.weight_kernel_time:.6f} s")
-    print(f"Weight D2H copy time:         {timings.weight_copy_time:.6f} s")
+    print(f"Weight field host time:       {timings.weight_host_time:.6f} s")
+    print(f"Weight H2D copy time:         {timings.weight_h2d_time:.6f} s")
     print(f"Weight range reduction time:  {timings.weight_range_time:.6f} s")
     print(f"Init kernel GPU time:         {timings.init_kernel_time:.6f} s")
     print(f"Pure dynamics GPU time:       {timings.pure_dynamics_gpu_time:.6f} s")
@@ -1305,5 +1357,4 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"CRITICAL ERROR: {exc}", file=sys.stderr)
         raise SystemExit(1)
-
 
