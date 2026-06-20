@@ -4,15 +4,15 @@
 #SBATCH --nodes=1
 #SBATCH --partition=boost_usr_prod
 #SBATCH --time=0:30:00
-#SBATCH --mem=50GB
+#SBATCH --mem=0
 #SBATCH --job-name=run_omp_cooling
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 #SBATCH --gres=gpu:1
 #SBATCH --qos=boost_qos_dbg
-##SBATCH --exclusive
+#SBATCH --exclusive
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 source scripts/env.leonardo.sh
-srun ./install/bin/cooling_omp ./input/Cooling.in ./output/Cooling_omp.h5 ./output/Cooling_omp.csv
+./install/bin/cooling_omp ./input/Cooling.in ./output/Cooling_omp.h5 ./output/Cooling_omp.csv
 
