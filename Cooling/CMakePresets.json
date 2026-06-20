@@ -57,10 +57,9 @@
       "displayName": "Leonardo A100, OpenMP + CUDA + HDF5",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "COOLING_BUILD_HDF5": "ON",
-        "COOLING_BUILD_OPENMP": "ON",
-        "COOLING_BUILD_CUDA": "ON",
-        "COOLING_STRICT_CUDA": "ON",
+        "COOLING_BUILD_HDF5": "AUTO",
+        "COOLING_BUILD_OPENMP": "AUTO",
+        "COOLING_BUILD_CUDA": "AUTO",
         "COOLING_CUDA_ARCHITECTURES": "80"
       }
     }
