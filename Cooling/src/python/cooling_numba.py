@@ -404,7 +404,7 @@ def build_update_coefficients(
 # NUMBA CPU KERNELS
 # ============================================================
 
-@njit(parallel=True, fastmath=False, cache=True)
+@njit(parallel=True, fastmath=False)
 def compute_fractal_weights_kernel(
     weight_field: np.ndarray,
     grid_width: int,
@@ -440,7 +440,7 @@ def compute_fractal_weights_kernel(
             weight_field[p] = iteration
 
 
-@njit(parallel=True, fastmath=False, cache=True)
+@njit(parallel=True, fastmath=False)
 def initialize_temperature_field_kernel(
     temperature: np.ndarray,
     weight_field: np.ndarray,
@@ -473,7 +473,7 @@ def initialize_temperature_field_kernel(
             )
 
 
-@njit(parallel=True, fastmath=False, cache=True)
+@njit(parallel=True, fastmath=False)
 def update_interior_kernel(
     current_field: np.ndarray,
     next_field: np.ndarray,
@@ -508,7 +508,7 @@ def update_interior_kernel(
             )
 
 
-@njit(parallel=True, fastmath=False, cache=True)
+@njit(parallel=True, fastmath=False)
 def apply_boundary_left_right_kernel(
     field: np.ndarray,
     grid_width: int,
@@ -521,7 +521,7 @@ def apply_boundary_left_right_kernel(
         field[row + grid_width - 1] = field[row + grid_width - 2]
 
 
-@njit(parallel=True, fastmath=False, cache=True)
+@njit(parallel=True, fastmath=False)
 def apply_boundary_top_bottom_kernel(
     field: np.ndarray,
     grid_width: int,
