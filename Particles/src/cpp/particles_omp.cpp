@@ -17,31 +17,20 @@ Primary OpenMP targets
 
 Reference benchmark/no-output mode
 ----------------------------------
-  ./particles_openmp_reference input_final.in none 0
+  ./particles_omp input/Particles.in none 0
 
 Reference HDF5 correctness mode
 -------------------------------
-  ./particles_openmp_reference_hdf5 input_final.in reference_openmp.h5 1000
+  ./particles_omp input/Particles.in output/Particles_omp.h5 1000
 
 Build without HDF5:
   g++ -O3 -std=c++17 -Wall -Wextra -pedantic -fopenmp \
-      particles_openmp_reference.cpp -o particles_openmp_reference
+      particles_omp.cpp -o particles_omp
 
 Build with HDF5:
   h5c++ -O3 -std=c++17 -Wall -Wextra -pedantic -fopenmp -DUSE_HDF5 \
-      particles_openmp_reference.cpp -o particles_openmp_reference_hdf5
+      particles_omp.cpp -o particles_omp
 
-Notes for instructors
----------------------
-  * This is a conservative OpenMP reference: it parallelizes the outer particle
-    loop and keeps one force accumulation per particle, thereby avoiding atomics
-    and race-prone symmetric updates.
-  * Pair-symmetry optimizations are deliberately not used here. They are valid
-    advanced student strategies, but require careful race-free accumulation.
-  * Timings are wall-clock elapsed times, not process CPU times.
-  * Bitwise identity with the serial version is not guaranteed because OpenMP
-    SIMD reductions may change the order of additions inside each particle sum.
-    Validation should use floating-point tolerances.
 ================================================================================
 */
 
@@ -122,8 +111,8 @@ void printUsage(const char* prog) {
     std::cerr
         << "Usage: " << prog << " [inputFile] [h5File|none|--no-hdf5] [outputEvery]\n"
         << "Examples:\n"
-        << "  " << prog << " input_final.in none 0\n"
-        << "  " << prog << " input_final.in reference_openmp.h5 1000\n";
+        << "  " << prog << " input/Particles.in none 0\n"
+        << "  " << prog << " input/Particles.in output/Particles_omp.h5 1000\n";
 }
 
 bool shouldWriteStep(std::size_t step, std::size_t finalStep, std::size_t outputEvery) {

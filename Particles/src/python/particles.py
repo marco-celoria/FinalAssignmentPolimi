@@ -16,16 +16,16 @@ baseline used in the course.
 
 Official benchmark/no-output mode:
 
-  python3 particles_python_numpy_baseline.py input_final.in none 0
+  python3 ./path/to/particles.py input/Particles.in none 0
 
 Optional HDF5 correctness/debug run:
 
-  python3 particles_python_numpy_baseline.py input_medium.in particles_python.h5 10
-  python3 particles_python_numpy_baseline.py input_final.in reference_python.h5 1000
+  python3 ./path/to/particles.py input/Particles.in output/Particles_python.h5
+  python3 ./path/to/particles.py input/Particles.in output/Particles_python.h5 1000
 
 Command line:
 
-  python3 particles_python_numpy_baseline.py [inputFile] [h5File|none|--no-hdf5] [outputEvery]
+  python3 ./path/to/particles.py [inputFile] [h5File|none|--no-hdf5] [outputEvery]
 
 Input file format, after removing empty lines and comment-only lines beginning
 with '#':
@@ -51,12 +51,6 @@ outputEvery:
   0  means final HDF5 frame only, if HDF5 output is enabled.
   >0 means step 0, every outputEvery steps, and the final step.
 
-Notes for students:
-  * The main target remains compute_forces(...), an O(N^2) all-pairs interaction.
-  * This NumPy implementation computes the force in i-blocks to avoid building
-    full NxN temporary matrices for large particle counts.
-  * A Numba/Numba-CUDA solution will usually replace compute_forces(...),
-    integrate_vv(...), and possibly compute_generating_field(...).
 ================================================================================
 """
 
@@ -683,7 +677,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Vectorized Python/NumPy baseline for the Particle System Solver assignment"
     )
-    parser.add_argument("input_file", nargs="?", default="Particles.inp")
+    parser.add_argument("input_file", nargs="?", default="input/Particles.in")
     parser.add_argument("h5_file", nargs="?", default="none")
     parser.add_argument("output_every", nargs="?", type=int, default=None)
     parser.add_argument(

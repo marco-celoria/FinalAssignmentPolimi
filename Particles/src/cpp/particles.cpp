@@ -9,54 +9,45 @@ OpenACC, or hybrid approaches.
 
 Primary objective
 -----------------
-Students should optimize and parallelize the particle dynamics phase, especially
-computeForces(...), which is an O(N^2) all-pairs interaction kernel.
+Students should optimize and parallelize the particle dynamics phase.
 
-Official benchmark/no-output mode
+Benchmark/no-output mode
 ---------------------------------
-HDF5 output disabled. No screen generation. Final validation quantities are
-still printed.
+HDF5 output disabled. No screen generation. 
+Final validation quantities are still printed.
 
 Recommended benchmark run:
 
-  ./particles_baseline input_final.in none 0
+  ./path/to/particles_serial input/Particles.in none 0
 
-Recommended HDF5 correctness run:
-
-  ./particles_baseline_hdf5 input_final.in reference.h5 1000
-  ./student_solution_hdf5 input_final.in candidate.h5 1000
-
-This writes step 0 and the final step for maxSteps=1000. Use the external
-validator on /step,/weight,/pos,/vel. The /screen dataset is intended mainly for
-visualization/debugging and is usually too brittle for strict grading.
+Use the external validator on /step,/weight,/pos,/vel. 
+The /screen dataset is intended mainly for visualization/debugging.
 
 HDF5 support is optional at compile time.
 
 Without HDF5:
 
-  g++ -O3 -std=c++17 -Wall -Wextra -pedantic particles_baseline.cpp \
-      -o particles_baseline
+  g++ -O3 -std=c++17 -Wall -Wextra -pedantic particles.cpp -o particles_serial
 
 With HDF5:
 
   g++ -O3 -std=c++17 -Wall -Wextra -pedantic -DUSE_HDF5 \
-      particles_baseline.cpp -o particles_baseline_hdf5 \
-      -lhdf5_cpp -lhdf5
+      particles.cpp -o particles_serial -lhdf5_cpp -lhdf5
 
 or, depending on the system:
 
   h5c++ -O3 -std=c++17 -Wall -Wextra -pedantic -DUSE_HDF5 \
-      particles_baseline.cpp -o particles_baseline_hdf5
+      particles.cpp -o particles_serial
 
 Command line:
 
-  ./particles_baseline [inputFile] [h5File|none|--no-hdf5] [outputEvery]
+  ./particles_serial [inputFile] [h5File|none|--no-hdf5] [outputEvery]
 
 Examples:
 
-  ./particles_baseline input_final.in none 0
-  ./particles_baseline_hdf5 input_medium.in particles.h5 10
-  ./particles_baseline_hdf5 input_final.in reference.h5 1000
+  ./particles_serial input/Particles.in none 0
+  ./particles_serial input/Particles.in output/Particles_cpp.h5
+  ./particles_serial input/Particles.in output/Particles_cpp.h5 1000
 
 Input file format, after removing empty lines and comment-only lines beginning
 with '#':
@@ -81,20 +72,6 @@ with '#':
 outputEvery:
   0  means final HDF5 frame only, if HDF5 output is enabled.
   >0 means step 0, every outputEvery steps, and the final step.
-
-Rules for student submissions:
-
-  1. The numerical model must not be changed.
-  2. The time step count, particle generation procedure, force law, and
-     integration method must not be reduced or skipped for official runs.
-  3. Students may reorganize data structures, use OpenMP/MPI/CUDA/OpenACC,
-     introduce blocking, tiling, device buffers, reductions, pair-symmetry
-     optimizations, or hybrid methods.
-  4. Students may not remove force interactions, skip time steps, hard-code
-     results, use precomputed answers, or reduce the official input size.
-  5. Results are validated against the serial baseline using external tools and
-     floating-point tolerances. Bitwise equality is not required for parallel
-     implementations unless explicitly stated.
 
 ================================================================================
 */
@@ -178,8 +155,8 @@ void printUsage(const char* prog) {
     std::cerr
         << "Usage: " << prog << " [inputFile] [h5File|none|--no-hdf5] [outputEvery]\n"
         << "Examples:\n"
-        << "  " << prog << " input_final.in none 0\n"
-        << "  " << prog << " input_final.in reference.h5 1000\n";
+        << "  " << prog << " input/Particles.in none 0\n"
+        << "  " << prog << " input/Particles.in output/Particles_cpp.h5 1000\n";
 }
 
 bool shouldWriteStep(std::size_t step, std::size_t finalStep, std::size_t outputEvery) {

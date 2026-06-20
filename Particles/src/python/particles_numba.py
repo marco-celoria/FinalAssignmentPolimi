@@ -18,16 +18,16 @@ Primary Numba targets
 
 Official benchmark/no-output mode
 ---------------------------------
-  python3 particles_numba_reference.py input_final.in none 0
+  python3 ./path/to/particles_numba.py input/Particles.in none 0
 
 Optional HDF5 correctness/debug run
 -----------------------------------
-  python3 particles_numba_reference.py input_medium.in particles_numba.h5 10
-  python3 particles_numba_reference.py input_final.in reference_numba.h5 1000
+  python3 ./path/to/particles_numba.py input/Particles.in output/Particles_numba.h5
+  python3 ./path/to/particles_numba.py input/Particles.in output/Particles_python.h5 1000
 
 Command line
 ------------
-  python3 particles_numba_reference.py [inputFile] [h5File|none|--no-hdf5] [outputEvery]
+  python3 ./path/to/particles_numba.py [inputFile] [h5File|none|--no-hdf5] [outputEvery]
                                       [--threads N]
                                       [--screen-tile-y NY]
                                       [--screen-tile-x NX]
@@ -58,15 +58,6 @@ outputEvery:
   0  means final HDF5 frame only, if HDF5 output is enabled.
   >0 means step 0, every outputEvery steps, and the final step.
 
-Notes for instructors
----------------------
-  * This is a conservative, race-free Numba CPU reference.
-  * The force kernel parallelizes over target particle i. Each thread computes
-    and writes fx[i], fy[i] exactly once.
-  * Pair-symmetry is deliberately not used here. It is a valid advanced strategy
-    but needs careful race-free accumulation.
-  * JIT warm-up is enabled by default so reported timings exclude compilation.
-  * HDF5 output is optional and excluded from benchmark/no-output mode.
 ================================================================================
 """
 
@@ -774,7 +765,7 @@ def parse_args(argv: Optional[list[str]] = None):
         description="Numba multicore reference solution for the Particle System Solver assignment"
     )
 
-    parser.add_argument("input", nargs="?", default="Particles.inp", help="Input file")
+    parser.add_argument("input", nargs="?", default="input/Particles.in", help="Input file")
     parser.add_argument("output", nargs="?", default="none", help="HDF5 file, or none/-/--no-hdf5")
     parser.add_argument("output_every", nargs="?", type=int, default=None, help="Override outputEvery from input file")
 

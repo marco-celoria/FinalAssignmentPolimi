@@ -26,11 +26,11 @@ Official performance grading mode:
 
 Recommended official run style:
 
-  ./cooling_serial input_final.in none output_final.csv 0
+  ./path/to/cooling_serial input/Cooling.in none output/Cooling_cpp.csv 0
 
 or simply:
 
-  ./cooling_serial input_final.in
+  ./path/to/cooling_serial input/Cooling.in
 
 if the default output names are acceptable.
 
@@ -39,14 +39,11 @@ HDF5 support:
 
   Without HDF5:
 
-    g++ -O3 -std=c++17 -Wall -Wextra -pedantic cooling.cpp \
-        -o cooling_serial
+  g++ -O3 -std=c++17 -Wall -Wextra -pedantic cooling.cpp -o cooling_serial
 
   With HDF5:
 
-    g++ -O3 -std=c++17 -Wall -Wextra -pedantic -DUSE_HDF5 \
-        cooling.cpp -o cooling_serial \
-        -lhdf5_cpp -lhdf5
+  g++ -O3 -std=c++17 -Wall -Wextra -pedantic -DUSE_HDF5 cooling.cpp -o cooling_serial -lhdf5_cpp -lhdf5
 
   Depending on the cluster configuration, students may need an HDF5 compiler
   wrapper, modules, or explicit include/library paths.
@@ -67,26 +64,13 @@ Input file format, after removing comments beginning with '#':
 
 Command line:
 
-  ./cooling_serial [inputFile] [h5File|none|--no-hdf5] [csvFile] [outputEvery]
+  ./path/to/cooling_serial [inputFile] [h5File|none|--no-hdf5] [csvFile] [outputEvery]
 
 Examples:
 
-  ./cooling_serial input_small.in
-  ./cooling_serial input_final.in none output_final.csv 0
-  ./cooling_serial input_medium.in output.h5 output.csv 50
-
-Rules for student submissions:
-
-  1. The numerical model must not be changed.
-  2. The grid size, number of time steps, max iteration count, and input data
-     must not be reduced for official measurements.
-  3. Students may reorganize data structures, introduce device memory,
-     implement MPI domain decomposition, add OpenMP/OpenACC directives,
-     write CUDA kernels, change reduction implementations, or change I/O
-     implementation.
-  4. Students may not remove required computations, skip time steps, omit
-     required statistics, hard-code answers, or use precomputed results.
-  5. Parallel results are validated against the serial baseline.
+  ./path/to/cooling_serial input/Cooling.in
+  ./path/to/cooling_serial input/Cooling.in none                  output/Cooling_cpp.csv  0
+  ./path/to/cooling_serial input/Cooling.in output/Cooling_cpp.h5 output/Cooling_cpp.csv 50
 
 ================================================================================
 */
@@ -169,9 +153,9 @@ struct FieldStatistics {
 };
 
 struct CommandLineOptions {
-    std::string inputFile{"input_final.in"};
+    std::string inputFile{"input/Cooling.in"};
     std::string h5File{"none"};
-    std::string csvFile{"Statistics.csv"};
+    std::string csvFile{"output/Cooling_cpp.csv"};
     bool writeHdf5{false};
     bool overrideOutputEvery{false};
     int outputEvery{0};
@@ -854,8 +838,8 @@ CommandLineOptions parseCommandLineArguments(int argc, char** argv) {
                 << "Usage:\n"
                 << "  " << argv[0] << " [inputFile] [h5File|none|--no-hdf5] [csvFile] [outputEvery]\n\n"
                 << "Examples:\n"
-                << "  " << argv[0] << " input_final.in none Statistics.csv 0\n"
-                << "  " << argv[0] << " input_medium.in output.h5 Statistics.csv 50\n\n"
+                << "  " << argv[0] << " input/Cooling.in none                  output/Cooling_cpp.csv  0\n"
+                << "  " << argv[0] << " input/Cooling.in output/Cooling_cpp.h5 output/Cooling_cpp.csv 50\n\n"
                 << "Default official grading mode disables HDF5.\n";
             std::exit(0);
         }

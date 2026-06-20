@@ -24,42 +24,29 @@ Host-side initialization
 
 Reference benchmark/no-output mode
 ----------------------------------
-  ./particles_cuda_reference input_final.in none 0
+  ./particles_cuda input/Particles.in none 0
 
 Reference HDF5 correctness mode
 -------------------------------
-  ./particles_cuda_reference_hdf5 input_final.in reference_cuda.h5 1000
+  ./particles_cuda input/Particles.in output/Particles_cuda.h5 1000
 
 Build without HDF5:
   nvcc -O3 -std=c++17 -Xcompiler "-Wall -Wextra -pedantic" \
-       particles_cuda_reference.cu -o particles_cuda_reference
+       particles.cu -o particles_cuda
 
 Build with HDF5:
   nvcc -O3 -std=c++17 -DUSE_HDF5 -Xcompiler "-Wall -Wextra -pedantic" \
-       particles_cuda_reference.cu -o particles_cuda_reference_hdf5 \
-       -lhdf5_cpp -lhdf5
+       particles.cu -o particles_cuda -lhdf5_cpp -lhdf5
 
 Depending on the site installation, HDF5 include/library paths may need to be
 provided explicitly, for example with -I and -L options.
 
 Command line:
-  ./particles_cuda_reference [inputFile] [h5File|none|--no-hdf5] [outputEvery]
+  ./particles_cuda [inputFile] [h5File|none|--no-hdf5] [outputEvery]
 
 Input format:
   Same as the serial baseline.
 
-Notes for instructors
----------------------
-  * This is a robust CUDA reference, not necessarily the fastest possible CUDA
-    implementation.
-  * The force kernel deliberately avoids pair-symmetry updates. Each CUDA thread
-    owns exactly one target particle and writes fx[i], fy[i] once, avoiding
-    atomics in the main force calculation.
-  * The particle arrays remain resident on the GPU throughout the time loop.
-  * HDF5 output is optional and intentionally excluded from official benchmark
-    mode.
-  * Final validation quantities are computed on the host after copying the final
-    particle state back from the GPU.
 ================================================================================
 */
 
@@ -254,8 +241,8 @@ void printUsage(const char* prog) {
     std::cerr
         << "Usage: " << prog << " [inputFile] [h5File|none|--no-hdf5] [outputEvery]\n"
         << "Examples:\n"
-        << "  " << prog << " input_final.in none 0\n"
-        << "  " << prog << " input_final.in reference_cuda.h5 1000\n";
+        << "  " << prog << " input/Particles.in none 0\n"
+        << "  " << prog << " input/Particles.in output/Particles_cuda.h5 1000\n";
 }
 
 bool shouldWriteStep(std::size_t step, std::size_t finalStep, std::size_t outputEvery) {

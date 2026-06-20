@@ -31,21 +31,21 @@ Important design choices:
 
 Official performance mode:
 
-  ./cooling_numba_cpu.py input_final.in none Statistics_numba.csv 0
+  python ./path/to/cooling_numba.py input/Cooling.in none output/Cooling_numba.csv 0
 
 or with explicit thread count:
 
-  ./cooling_numba_cpu.py --threads 16 input_final.in none Statistics_numba.csv 0
+  python ./path/to/cooling_numba.py --threads 16 input/Cooling.in none output/Cooling_numba.csv 0
 
 Command line:
 
-  ./cooling_numba_cpu.py [options] [inputFile] [h5File|none] [csvFile] [outputEvery]
+  python ./path/to/cooling_numba.py [options] [inputFile] [h5File|none] [csvFile] [outputEvery]
 
 Examples:
 
-  ./cooling_numba_cpu.py --threads 8 input_final.in none Statistics_numba.csv 0
-  ./cooling_numba_cpu.py --threads 8 input_medium.in output.h5 Statistics_numba.csv 50
-  ./cooling_numba_cpu.py --threads 8 --no-hdf5 input_final.in none Statistics_numba.csv 0
+  python ./path/to/cooling_numba.py --threads 8           input/Cooling.in none                    output/Cooling_numba.csv  0
+  python ./path/to/cooling_numba.py --threads 8           input/Cooling.in output/Cooling_numba.h5 output/Cooling_numba.csv 50
+  python ./path/to/cooling_numba.py --threads 8 --no-hdf5 input/Cooling.in none                    output/Cooling_numba.csv  0
 """
 
 from __future__ import annotations
@@ -1046,7 +1046,7 @@ def parse_command_line(argv: Optional[Sequence[str]] = None) -> argparse.Namespa
     parser.add_argument(
         "input",
         nargs="?",
-        default="input_final.in",
+        default="input/Cooling.in",
         help="Input file",
     )
 
@@ -1060,7 +1060,7 @@ def parse_command_line(argv: Optional[Sequence[str]] = None) -> argparse.Namespa
     parser.add_argument(
         "csv",
         nargs="?",
-        default="Statistics.csv",
+        default="output/Cooling_numba.csv",
         help="Output CSV file",
     )
 

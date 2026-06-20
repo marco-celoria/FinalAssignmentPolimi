@@ -18,21 +18,20 @@ which is executed on the GPU.
 
 Official performance mode:
 
-  ./cooling_cuda input_final.in none output_final_cuda.csv 0
+  ./path/to/cooling_cuda input/Cooling.in none output/Cooling_cuda.csv 0
 
 or with explicit CUDA device selection:
 
-  ./cooling_cuda --device 0 input_final.in none output_final_cuda.csv 0
+  ./path/to/cooling_cuda --device 0 input/Cooling.in none output/Cooling_cuda.csv 0
 
 Compile without HDF5:
 
-  nvcc -O3 -std=c++17 -Xcompiler "-Wall -Wextra -pedantic" \
-      cooling_cuda.cu -o cooling_cuda
+  nvcc -O3 -std=c++17 -Xcompiler "-Wall -Wextra -pedantic" cooling.cu -o cooling_cuda
 
 Compile with HDF5:
 
   nvcc -O3 -std=c++17 -DUSE_HDF5 -Xcompiler "-Wall -Wextra -pedantic" \
-      cooling_cuda.cu -o cooling_cuda \
+      cooling.cu -o cooling_cuda \
       -lhdf5_cpp -lhdf5
 
 Depending on the cluster configuration, students may need an HDF5 compiler
@@ -54,7 +53,7 @@ Input file format, after removing comments beginning with '#':
 
 Command line:
 
-  ./cooling_cuda [options] [inputFile] [h5File|none|--no-hdf5] [csvFile] [outputEvery]
+  ./path/to/cooling_cuda [options] [inputFile] [h5File|none|--no-hdf5] [csvFile] [outputEvery]
 
 Options:
 
@@ -67,8 +66,8 @@ Options:
 
 Examples:
 
-  ./cooling_cuda --device 0 input_final.in none Statistics_cuda.csv 0
-  ./cooling_cuda --device 0 input_medium.in output.h5 Statistics_cuda.csv 50
+  ./path/to/cooling_cuda --device 0 input/Cooling.in none                   output/Cooling_cuda.csv  0
+  ./path/to/cooling_cuda --device 0 input/Cooling.in output/Cooling_cuda.h5 output/Cooling_cuda.csv 50
 
 ================================================================================
 */
@@ -169,9 +168,9 @@ struct FieldStatistics {
 };
 
 struct CommandLineOptions {
-    std::string inputFile{"input_final.in"};
+    std::string inputFile{"input/Cooling.in"};
     std::string h5File{"none"};
-    std::string csvFile{"Statistics.csv"};
+    std::string csvFile{"output/Cooling_cuda.csv"};
 
     bool writeHdf5{false};
     bool overrideOutputEvery{false};
@@ -1186,8 +1185,8 @@ CommandLineOptions parseCommandLineArguments(int argc, char** argv) {
                 << "  --no-hdf5        Disable HDF5 output\n"
                 << "  --help, -h       Print this help message\n\n"
                 << "Examples:\n"
-                << "  " << argv[0] << " --device 0 input_final.in none Statistics_cuda.csv 0\n"
-                << "  " << argv[0] << " --device 0 input_medium.in output.h5 Statistics_cuda.csv 50\n\n"
+                << "  " << argv[0] << " --device 0 input/Cooling.in none                   output/Cooling_cuda.csv  0\n"
+                << "  " << argv[0] << " --device 0 input/Cooling.in output/Cooling_cuda.h5 output/Cooling_cuda.csv 50\n\n"
                 << "Default official grading mode disables HDF5.\n";
 
             std::exit(0);

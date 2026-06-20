@@ -13,16 +13,15 @@ global reductions using OpenMP. HDF5 output remains serial and optional.
 
 Official performance mode:
 
-  ./cooling_omp input_final.in none output_final_omp.csv 0
+  ./path/to/cooling_omp input/Cooling.in none output/Cooling_omp.csv 0
 
 or with an explicit thread count:
 
-  ./cooling_omp --threads 16 input_final.in none output_final_omp.csv 0
+  ./path/to/cooling_omp --threads 16 input/Cooling.in none output/Cooling_omp.csv 0
 
 Compile without HDF5:
 
-  g++ -O3 -std=c++17 -Wall -Wextra -pedantic -fopenmp \
-      cooling_omp.cpp -o cooling_omp
+  g++ -O3 -std=c++17 -Wall -Wextra -pedantic -fopenmp cooling_omp.cpp -o cooling_omp
 
 Compile with HDF5:
 
@@ -49,12 +48,12 @@ Input file format, after removing comments beginning with '#':
 
 Command line:
 
-  ./cooling_omp [--threads N] [inputFile] [h5File|none|--no-hdf5] [csvFile] [outputEvery]
+  ./path/to/cooling_omp [--threads N] [inputFile] [h5File|none|--no-hdf5] [csvFile] [outputEvery]
 
 Examples:
 
-  ./cooling_omp --threads 16 input_final.in none Statistics_omp.csv 0
-  ./cooling_omp --threads 16 input_medium.in output.h5 Statistics_omp.csv 50
+  ./path/to/cooling_omp --threads 16 input/Cooling.in none                  output/Cooling_omp.csv  0
+  ./path/to/cooling_omp --threads 16 input/Cooling.in output/Cooling_omp.h5 output/Cooling_omp.csv 50
 
 ================================================================================
 */
@@ -141,9 +140,9 @@ struct FieldStatistics {
 };
 
 struct CommandLineOptions {
-    std::string inputFile{"input_final.in"};
+    std::string inputFile{"input/Cooling.in"};
     std::string h5File{"none"};
-    std::string csvFile{"Statistics.csv"};
+    std::string csvFile{"output/Cooling_omp.csv"};
 
     bool writeHdf5{false};
     bool overrideOutputEvery{false};
@@ -923,8 +922,8 @@ CommandLineOptions parseCommandLineArguments(int argc, char** argv) {
                 << "  " << argv[0]
                 << " [--threads N] [inputFile] [h5File|none|--no-hdf5] [csvFile] [outputEvery]\n\n"
                 << "Examples:\n"
-                << "  " << argv[0] << " --threads 16 input_final.in none Statistics_omp.csv 0\n"
-                << "  " << argv[0] << " --threads 16 input_medium.in output.h5 Statistics_omp.csv 50\n\n"
+                << "  " << argv[0] << " --threads 16 input/Cooling.in none                   output/Cooling_omp.csv  0\n"
+                << "  " << argv[0] << " --threads 16 input/Cooling.in output/Cooling_omp.csv output/Cooling_omp.csv 50\n\n"
                 << "Default official grading mode disables HDF5.\n";
 
             std::exit(0);

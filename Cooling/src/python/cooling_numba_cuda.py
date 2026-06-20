@@ -33,21 +33,21 @@ Important design choices:
 
 Official performance mode:
 
-  ./cooling_numba_cuda.py input_final.in none Statistics_numba_cuda.csv 0
+  python ./path/to/cooling_numba_cuda.py input/Cooling.in none output/Cooling_numba_cuda.csv 0
 
 or with explicit CUDA device selection:
 
-  ./cooling_numba_cuda.py --device 0 input_final.in none Statistics_numba_cuda.csv 0
+  python ./path/to/cooling_numba_cuda.py --device 0 input/Cooling.in none output/Cooling_numba_cuda.csv 0
 
 Command line:
 
-  ./cooling_numba_cuda.py [options] [inputFile] [h5File|none] [csvFile] [outputEvery]
+  python ./path/to/cooling_numba_cuda.py [options] [inputFile] [h5File|none] [csvFile] [outputEvery]
 
 Examples:
 
-  ./cooling_numba_cuda.py --device 0 input_final.in none Statistics_numba_cuda.csv 0
-  ./cooling_numba_cuda.py --device 0 input_medium.in output.h5 Statistics_numba_cuda.csv 50
-  ./cooling_numba_cuda.py --device 0 --no-hdf5 input_final.in none Statistics_numba_cuda.csv 0
+  python ./path/to/cooling_numba_cuda.py --device 0           input/Cooling.in none                         output/Cooling_numba_cuda.csv  0
+  python ./path/to/cooling_numba_cuda.py --device 0           input/Cooling.in output/Cooling_numba_cuda.h5 output/Cooling_numba_cuda.csv 50
+  python ./path/to/cooling_numba_cuda.py --device 0 --no-hdf5 input/Cooling.in none                         output/Cooling_numba_cuda.csv  0
 """
 
 from __future__ import annotations
@@ -1213,7 +1213,7 @@ def parse_command_line(argv: Optional[Sequence[str]] = None) -> argparse.Namespa
     parser.add_argument(
         "input",
         nargs="?",
-        default="input_final.in",
+        default="input/Cooling.in",
         help="Input file",
     )
 
@@ -1227,7 +1227,7 @@ def parse_command_line(argv: Optional[Sequence[str]] = None) -> argparse.Namespa
     parser.add_argument(
         "csv",
         nargs="?",
-        default="Statistics.csv",
+        default="output/Cooling_numba_cuda.csv",
         help="Output CSV file",
     )
 

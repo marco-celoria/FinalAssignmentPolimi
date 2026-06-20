@@ -25,16 +25,16 @@ Host-side initialization
 
 Official benchmark/no-output mode
 ---------------------------------
-  python3 particles_numba_cuda_reference.py input_final.in none 0
+  python3 ./path/to/particles_numba_cuda.py input/Particles.in none 0
 
 Optional HDF5 correctness/debug run
 -----------------------------------
-  python3 particles_numba_cuda_reference.py input_medium.in particles_numba_cuda.h5 10
-  python3 particles_numba_cuda_reference.py input_final.in reference_numba_cuda.h5 1000
+  python3 ./path/to/particles_numba_cuda.py input/Particles.in output/Particles_numba_cuda.h5
+  python3 ./path/to/particles_numba_cuda.py input/Particles.in output/Particles_numba_cuda.h5 1000
 
 Command line
 ------------
-  python3 particles_numba_cuda_reference.py [inputFile] [h5File|none|--no-hdf5] [outputEvery]
+  python3 ./path/to/particles_numba_cuda.py [inputFile] [h5File|none|--no-hdf5] [outputEvery]
                                            [--device ID]
                                            [--threads-per-block N]
                                            [--chunk-frames N]
@@ -50,17 +50,6 @@ outputEvery:
   0  means final HDF5 frame only, if HDF5 output is enabled.
   >0 means step 0, every outputEvery steps, and the final step.
 
-Notes for instructors
----------------------
-  * This is a conservative, race-free GPU reference implementation.
-  * The force kernel deliberately does not exploit pair symmetry. Each GPU
-    thread owns one target particle and writes fx[i], fy[i] exactly once.
-  * Particle arrays remain resident on the GPU during the simulation loop.
-  * HDF5 output is optional and excluded from benchmark/no-output mode.
-  * Final validation quantities are computed on the host after copying the final
-    particle state back from the GPU.
-  * Bitwise identity with the serial C++ baseline is not expected for the GPU
-    dynamics. Validation should use numerical tolerances.
 ================================================================================
 """
 
@@ -811,7 +800,7 @@ def parse_args(argv: Optional[list[str]] = None):
         description="Numba CUDA reference solution for the Particle System Solver assignment"
     )
 
-    parser.add_argument("input", nargs="?", default="Particles.inp", help="Input file")
+    parser.add_argument("input", nargs="?", default="input/Particles.in", help="Input file")
     parser.add_argument("output", nargs="?", default="none", help="HDF5 file, or none/-/--no-hdf5")
     parser.add_argument("output_every", nargs="?", type=int, default=None, help="Override outputEvery from input file")
 

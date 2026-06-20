@@ -9,8 +9,7 @@ It is intentionally a CPU NumPy implementation. Students can use it as a
 starting point for:
 
   1) Numba CPU multicore parallelization
-  2) Numba CUDA GPU offloading
-  3) CuPy GPU offloading
+  2) Numba CUDA/CuPy GPU offloading
 
 Important design choices:
 
@@ -23,30 +22,18 @@ Important design choices:
 
 Official performance mode:
 
-  ./cooling_numpy_baseline.py input_final.in none Statistics_numpy.csv 0
+  python ./path/to/cooling.py input/Cooling.in none output/Cooling_python.csv 0
 
 Command line:
 
-  ./cooling_numpy_baseline.py [options] [inputFile] [h5File|none] [csvFile] [outputEvery]
+  python ./path/to/cooling.py [options] [inputFile] [h5File|none] [csvFile] [outputEvery]
 
 Examples:
 
-  ./cooling_numpy_baseline.py input_final.in none Statistics_numpy.csv 0
-  ./cooling_numpy_baseline.py input_medium.in output.h5 Statistics_numpy.csv 50
-  ./cooling_numpy_baseline.py --no-hdf5 input_final.in none Statistics_numpy.csv 0
+  python ./path/to/cooling.py           input/Cooling.in none                     output/Cooling_python.csv  0
+  python ./path/to/cooling.py           input/Cooling.in output/Cooling_python.h5 output/Cooling_python.csv 50
+  python ./path/to/cooling.py --no-hdf5 input/Cooling.in none                     output/Cooling_python.csv  0
 
-Notes for students:
-
-  - The NumPy fractal initialization is memory hungry because it uses several
-    full-size arrays. This is deliberate: it is clear, simple, and suitable as
-    a baseline, but large C++/CUDA benchmark sizes may be too large for this
-    pure NumPy version.
-  - For Numba CPU, replace the NumPy vectorized kernels with explicit loops and
-    @numba.njit(parallel=True).
-  - For Numba CUDA, implement explicit CUDA kernels for the weight field,
-    initialization, update, and optionally reductions/statistics.
-  - For CuPy, port arrays and kernels to the GPU while preserving the numerical
-    model and validation outputs.
 """
 
 from __future__ import annotations
@@ -900,7 +887,7 @@ def parse_command_line(argv: Optional[Sequence[str]] = None) -> argparse.Namespa
     parser.add_argument(
         "input",
         nargs="?",
-        default="input_final.in",
+        default="input/Cooling.in",
         help="Input file",
     )
 
@@ -914,7 +901,7 @@ def parse_command_line(argv: Optional[Sequence[str]] = None) -> argparse.Namespa
     parser.add_argument(
         "csv",
         nargs="?",
-        default="Statistics.csv",
+        default="output/Cooling_python.csv",
         help="Output CSV file",
     )
 
