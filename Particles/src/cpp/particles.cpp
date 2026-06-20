@@ -4,8 +4,8 @@
 Particle System Solver - Serial C++17 Baseline
 ================================================================================
 
-Course final project baseline for parallel programming with OpenMP, MPI, CUDA,
-OpenACC, or hybrid approaches.
+Course final project baseline for parallel programming with:
+OpenMP, MPI, CUDA, OpenACC, or hybrid approaches.
 
 Primary objective
 -----------------
@@ -31,13 +31,11 @@ Without HDF5:
 
 With HDF5:
 
-  g++ -O3 -std=c++17 -Wall -Wextra -pedantic -DUSE_HDF5 \
-      particles.cpp -o particles_serial -lhdf5_cpp -lhdf5
+  g++ -O3 -std=c++17 -Wall -Wextra -pedantic -DUSE_HDF5 particles.cpp -o particles_serial -lhdf5_cpp -lhdf5
 
 or, depending on the system:
 
-  h5c++ -O3 -std=c++17 -Wall -Wextra -pedantic -DUSE_HDF5 \
-      particles.cpp -o particles_serial
+  h5c++ -O3 -std=c++17 -Wall -Wextra -pedantic -DUSE_HDF5 particles.cpp -o particles_serial
 
 Command line:
 
@@ -196,8 +194,8 @@ struct Grid {
 struct Particles {
     std::size_t n{};
 
-    // Structure-of-arrays layout. This is deliberate: it is friendly to SIMD,
-    // cache blocking, CUDA/OpenACC offload, and MPI packing.
+    // Structure-of-arrays layout. 
+    // Friendly to SIMD, cache blocking, CUDA/OpenACC offload, and MPI packing.
     std::vector<double> w;
     std::vector<double> x;
     std::vector<double> y;
@@ -366,7 +364,6 @@ Config readInput(const std::string& file, Grid& g, Grid& pg) {
 
 // ============================================================
 // MANDELBROT FIELD GENERATION
-// Secondary parallelization target: embarrassingly parallel over grid points.
 // ============================================================
 
 void computeGeneratingField(Grid& g, std::size_t maxIter) {
@@ -436,11 +433,7 @@ Particles generateParticles(const Grid& g, const Grid& pg) {
     }
 
     const std::size_t count = static_cast<std::size_t>(
-        std::count_if(
-            g.values.begin(),
-            g.values.end(),
-            [&](unsigned long long v) { return v >= vmin; }
-        )
+        std::count_if(g.values.begin(), g.values.end(), [&](unsigned long long v) { return v >= vmin; })
     );
 
     if (count == 0) {
@@ -460,15 +453,8 @@ Particles generateParticles(const Grid& g, const Grid& pg) {
             }
 
             P.w[n] = std::max(1.0, 10.0 * static_cast<double>(v));
-
-            P.x[n] = pg.xs
-                + (pg.xe - pg.xs) * static_cast<double>(i)
-                / static_cast<double>(g.nx - 1);
-
-            P.y[n] = pg.ys
-                + (pg.ye - pg.ys) * static_cast<double>(j)
-                / static_cast<double>(g.ny - 1);
-
+            P.x[n] = pg.xs + (pg.xe - pg.xs) * static_cast<double>(i) / static_cast<double>(g.nx - 1);
+            P.y[n] = pg.ys + (pg.ye - pg.ys) * static_cast<double>(j) / static_cast<double>(g.ny - 1);
             P.vx[n] = 0.0;
             P.vy[n] = 0.0;
 
@@ -488,10 +474,9 @@ Particles generateParticles(const Grid& g, const Grid& pg) {
 // PRIMARY HPC KERNEL: FORCE COMPUTATION
 // ============================================================
 // This O(N^2) all-pairs interaction loop is the main target for optimization
-// and parallelization. Students may change the implementation strategy, data
-// layout, blocking, MPI decomposition, GPU offload, or exploit pair symmetry,
-// but the force law and the inclusion of all pair interactions must be
-// preserved.
+// and parallelization. It is possible to change the implementation strategy,
+// data layout, blocking, MPI decomposition, GPU offload, exploit pair symmetry,
+// but force law and the inclusion of all pair interactions must be preserved.
 // ============================================================
 
 void computeForces(const Particles& P, double* fx, double* fy) {
@@ -517,12 +502,10 @@ void computeForces(const Particles& P, double* fx, double* fy) {
             if (i != j) {
                 const double dx = x[j] - xi;
                 const double dy = y[j] - yi;
-
                 const double r2 = dx * dx + dy * dy + eps2;
                 const double invr  = 1.0 / std::sqrt(r2);
-                const double invr2 = invr * invr;
+                const double invr2 = invr  * invr;
                 const double invr3 = invr2 * invr;
-
                 const double coeff = kForce * wi * w[j] * invr3;
 
                 fxi += coeff * dx;
@@ -561,9 +544,8 @@ void integrateVV(
 
         P.vx[i] += 0.5 * fx[i] * invm * dt;
         P.vy[i] += 0.5 * fy[i] * invm * dt;
-
-        P.x[i] += P.vx[i] * dt;
-        P.y[i] += P.vy[i] * dt;
+        P.x[i]  += P.vx[i] * dt;
+        P.y[i]  += P.vy[i] * dt;
     }
 
     computeForces(P, fx_new.data(), fy_new.data());
@@ -640,9 +622,7 @@ void buildScreen(Grid& screen, const Particles& P, double wmin, double wr) {
                     continue;
                 }
 
-                const std::size_t p =
-                    static_cast<std::size_t>(jx)
-                    + static_cast<std::size_t>(jy) * screen.nx;
+                const std::size_t p = static_cast<std::size_t>(jx) + static_cast<std::size_t>(jy) * screen.nx;
 
                 screen.values[p] += wp;
             }
@@ -666,8 +646,8 @@ ValidationQuantities computeValidationQuantities(const Particles& P) {
         const double vxi = P.vx[i];
         const double vyi = P.vy[i];
 
-        q.sum_x += xi;
-        q.sum_y += yi;
+        q.sum_x  += xi;
+        q.sum_y  += yi;
         q.sum_vx += vxi;
         q.sum_vy += vyi;
 
@@ -698,19 +678,18 @@ ValidationQuantities computeValidationQuantities(const Particles& P) {
 
 void printValidationQuantities(const ValidationQuantities& q) {
     std::cout << std::setprecision(17);
-
     std::cout << "Final validation quantities:\n";
-    std::cout << "  sum_x:            " << q.sum_x << "\n";
-    std::cout << "  sum_y:            " << q.sum_y << "\n";
-    std::cout << "  sum_vx:           " << q.sum_vx << "\n";
-    std::cout << "  sum_vy:           " << q.sum_vy << "\n";
+    std::cout << "  sum_x:            " << q.sum_x          << "\n";
+    std::cout << "  sum_y:            " << q.sum_y          << "\n";
+    std::cout << "  sum_vx:           " << q.sum_vx         << "\n";
+    std::cout << "  sum_vy:           " << q.sum_vy         << "\n";
     std::cout << "  weighted_sum_x:   " << q.weighted_sum_x << "\n";
     std::cout << "  weighted_sum_y:   " << q.weighted_sum_y << "\n";
-    std::cout << "  momentum_x:       " << q.momentum_x << "\n";
-    std::cout << "  momentum_y:       " << q.momentum_y << "\n";
+    std::cout << "  momentum_x:       " << q.momentum_x     << "\n";
+    std::cout << "  momentum_y:       " << q.momentum_y     << "\n";
     std::cout << "  kinetic_energy:   " << q.kinetic_energy << "\n";
     std::cout << "  potential_like:   " << q.potential_like << "\n";
-    std::cout << "  energy_like:      " << q.energy_like << "\n";
+    std::cout << "  energy_like:      " << q.energy_like    << "\n";
 }
 
 
@@ -903,10 +882,8 @@ private:
     }
 
     void createScreenDataset(std::size_t screenTileY, std::size_t screenTileX) {
-        const hsize_t screenChunkY =
-            static_cast<hsize_t>(std::min<std::size_t>(ny_, screenTileY));
-        const hsize_t screenChunkX =
-            static_cast<hsize_t>(std::min<std::size_t>(nx_, screenTileX));
+        const hsize_t screenChunkY = static_cast<hsize_t>(std::min<std::size_t>(ny_, screenTileY));
+        const hsize_t screenChunkX = static_cast<hsize_t>(std::min<std::size_t>(nx_, screenTileX));
 
         hsize_t dims[3] = {0, static_cast<hsize_t>(ny_), static_cast<hsize_t>(nx_)};
         hsize_t maxdims[3] = {H5S_UNLIMITED, static_cast<hsize_t>(ny_), static_cast<hsize_t>(nx_)};
@@ -1120,23 +1097,22 @@ int main(int argc, char** argv) {
 #ifdef USE_HDF5
         std::cout << "HDF5 compiled:              yes\n";
 #else
-        std::cout << "HDF5 compiled:              no\n";
+        std::cout << "HDF5 compiled:               no\n";
 #endif
 
         std::cout << "HDF5 output:                " << (writeHdf5 ? outputFile : "disabled") << "\n";
-        std::cout << "Benchmark/no-output mode:   " << (!writeHdf5 ? "yes" : "no") << "\n";
-        std::cout << "Generating grid:            " << gen.nx << " x " << gen.ny << "\n";
-        std::cout << "Screen grid:                " << screen.nx << " x " << screen.ny << "\n";
-        std::cout << "Max iterations:             " << cfg.maxIters << "\n";
-        std::cout << "Steps:                      " << cfg.maxSteps << "\n";
-        std::cout << "dt:                         " << cfg.dt << "\n";
+        std::cout << "Benchmark/no-output mode:   " << (!writeHdf5 ? "yes" : "no")           << "\n";
+        std::cout << "Generating grid:            " << gen.nx << " x " << gen.ny             << "\n";
+        std::cout << "Screen grid:                " << screen.nx << " x " << screen.ny       << "\n";
+        std::cout << "Max iterations:             " << cfg.maxIters                          << "\n";
+        std::cout << "Steps:                      " << cfg.maxSteps                          << "\n";
+        std::cout << "dt:                         " << cfg.dt                                << "\n";
 
         if (cfg.outputEvery == 0) {
             std::cout << "Output policy:              final frame only, if HDF5 is enabled\n";
         } else {
             std::cout << "Output policy:              step 0, every "
-                      << cfg.outputEvery
-                      << " step(s), and final step, if HDF5 is enabled\n";
+                      << cfg.outputEvery << " step(s), and final step, if HDF5 is enabled\n";
         }
 
         // ----------------------------------------------------
@@ -1145,9 +1121,7 @@ int main(int argc, char** argv) {
         const auto mandelStart = std::chrono::steady_clock::now();
         computeGeneratingField(gen, cfg.maxIters);
         const auto mandelStop = std::chrono::steady_clock::now();
-
-        const double mandelSeconds =
-            std::chrono::duration<double>(mandelStop - mandelStart).count();
+        const double mandelSeconds = std::chrono::duration<double>(mandelStop - mandelStart).count();
 
         // ----------------------------------------------------
         // 2. Generate particles
@@ -1155,9 +1129,7 @@ int main(int argc, char** argv) {
         const auto particleStart = std::chrono::steady_clock::now();
         Particles P = generateParticles(gen, screen);
         const auto particleStop = std::chrono::steady_clock::now();
-
-        const double particleGenerationSeconds =
-            std::chrono::duration<double>(particleStop - particleStart).count();
+        const double particleGenerationSeconds = std::chrono::duration<double>(particleStop - particleStart).count();
 
         const std::size_t N = P.n;
         std::cout << "Particles:                  " << N << "\n";
@@ -1176,9 +1148,7 @@ int main(int argc, char** argv) {
         const auto initForceStart = std::chrono::steady_clock::now();
         computeForces(P, fx.data(), fy.data());
         const auto initForceStop = std::chrono::steady_clock::now();
-
-        const double initForceSeconds =
-            std::chrono::duration<double>(initForceStop - initForceStart).count();
+        const double initForceSeconds = std::chrono::duration<double>(initForceStop - initForceStart).count();
 
         // ----------------------------------------------------
         // 5. Weight range for screen output
@@ -1200,11 +1170,11 @@ int main(int argc, char** argv) {
         }
 
         std::size_t outputFrames = 0;
-        bool hasLastWrittenStep = false;
+        bool hasLastWrittenStep  = false;
         std::size_t lastWrittenStep = 0;
 
         double screenBuildSeconds = 0.0;
-        double hdf5WriteSeconds = 0.0;
+        double hdf5WriteSeconds   = 0.0;
 
         auto writeOutputFrame = [&](std::size_t step) {
             if (!h5) {
@@ -1219,18 +1189,16 @@ int main(int argc, char** argv) {
             buildScreen(screen, P, wmin, wr);
             const auto screenStop = std::chrono::steady_clock::now();
 
-            screenBuildSeconds +=
-                std::chrono::duration<double>(screenStop - screenStart).count();
+            screenBuildSeconds += std::chrono::duration<double>(screenStop - screenStart).count();
 
             const auto h5Start = std::chrono::steady_clock::now();
             h5->writeFrame(step, P, screen);
             const auto h5Stop = std::chrono::steady_clock::now();
 
-            hdf5WriteSeconds +=
-                std::chrono::duration<double>(h5Stop - h5Start).count();
+            hdf5WriteSeconds += std::chrono::duration<double>(h5Stop - h5Start).count();
 
             hasLastWrittenStep = true;
-            lastWrittenStep = step;
+            lastWrittenStep    = step;
             ++outputFrames;
         };
 
@@ -1249,8 +1217,7 @@ int main(int argc, char** argv) {
             integrateVV(P, fx, fy, fx_new, fy_new, cfg.dt);
             const auto dynStop = std::chrono::steady_clock::now();
 
-            pureDynamicsSeconds +=
-                std::chrono::duration<double>(dynStop - dynStart).count();
+            pureDynamicsSeconds += std::chrono::duration<double>(dynStop - dynStart).count();
         }
 
         if (h5) {
@@ -1259,8 +1226,7 @@ int main(int argc, char** argv) {
         }
 
         const auto loopStop = std::chrono::steady_clock::now();
-        const double loopWallSeconds =
-            std::chrono::duration<double>(loopStop - loopStart).count();
+        const double loopWallSeconds = std::chrono::duration<double>(loopStop - loopStart).count();
 
         // ----------------------------------------------------
         // 8. Validation
@@ -1268,43 +1234,33 @@ int main(int argc, char** argv) {
         const auto validationStart = std::chrono::steady_clock::now();
         const ValidationQuantities validation = computeValidationQuantities(P);
         const auto validationStop = std::chrono::steady_clock::now();
-
-        const double validationSeconds =
-            std::chrono::duration<double>(validationStop - validationStart).count();
+        const double validationSeconds = std::chrono::duration<double>(validationStop - validationStart).count();
 
         // ----------------------------------------------------
         // 9. Reporting
         // ----------------------------------------------------
         // This performance metric intentionally excludes the initial force
         // computation and reports only the repeated dynamics loop.
-        const double interactions =
-            static_cast<double>(N)
-            * static_cast<double>(N - 1)
-            * static_cast<double>(cfg.maxSteps);
-
+        const double interactions = static_cast<double>(N) * static_cast<double>(N - 1) * static_cast<double>(cfg.maxSteps);
         const double gigaInteractions = interactions / 1.0e9;
 
         std::cout << "Simulation completed successfully.\n";
-        std::cout << "Output frames:                 " << outputFrames << "\n";
-        std::cout << "Mandelbrot wall time:          " << mandelSeconds << " s\n";
+        std::cout << "Output frames:                 " << outputFrames              << "  \n";
+        std::cout << "Mandelbrot wall time:          " << mandelSeconds             << " s\n";
         std::cout << "Particle generation wall time: " << particleGenerationSeconds << " s\n";
-        std::cout << "Initial force wall time:       " << initForceSeconds << " s\n";
-        std::cout << "Pure dynamics time:            " << pureDynamicsSeconds << " s\n";
-        std::cout << "Screen build time:             " << screenBuildSeconds << " s\n";
-        std::cout << "HDF5 write time:               " << hdf5WriteSeconds << " s\n";
-        std::cout << "Validation time:               " << validationSeconds << " s\n";
-        std::cout << "Loop wall time:                " << loopWallSeconds << " s\n";
+        std::cout << "Initial force wall time:       " << initForceSeconds          << " s\n";
+        std::cout << "Pure dynamics time:            " << pureDynamicsSeconds       << " s\n";
+        std::cout << "Screen build time:             " << screenBuildSeconds        << " s\n";
+        std::cout << "HDF5 write time:               " << hdf5WriteSeconds          << " s\n";
+        std::cout << "Validation time:               " << validationSeconds         << " s\n";
+        std::cout << "Loop wall time:                " << loopWallSeconds           << " s\n";
 
         if (cfg.maxSteps > 0 && pureDynamicsSeconds > 0.0) {
-            std::cout << "Pure dynamics performance:  "
-                      << gigaInteractions / pureDynamicsSeconds
-                      << " GInteractions/s\n";
+            std::cout << "Pure dynamics performance:  " << gigaInteractions / pureDynamicsSeconds << " GInteractions/s\n";
         }
 
         if (cfg.maxSteps > 0 && loopWallSeconds > 0.0) {
-            std::cout << "Loop end-to-end performance: "
-                      << gigaInteractions / loopWallSeconds
-                      << " GInteractions/s\n";
+            std::cout << "Loop end-to-end performance: " << gigaInteractions / loopWallSeconds << " GInteractions/s\n";
         }
 
         printValidationQuantities(validation);

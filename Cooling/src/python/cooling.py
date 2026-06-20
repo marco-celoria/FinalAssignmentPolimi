@@ -2,13 +2,10 @@
 """
 Cooling / field-evolution solver - Python/NumPy teaching baseline.
 
-This file is the Python teaching baseline aligned with the polished C++,
-OpenMP, and CUDA versions of the assignment.
+It is intentionally a CPU NumPy implementation. 
+Students can use it as a starting point for:
 
-It is intentionally a CPU NumPy implementation. Students can use it as a
-starting point for:
-
-  1) Numba CPU multicore parallelization
+  1) Numba CPU multicore parallelization and/or
   2) Numba CUDA/CuPy GPU offloading
 
 Important design choices:
@@ -20,7 +17,7 @@ Important design choices:
   - outputEvery > 0 means step 0, every outputEvery steps, and final step.
   - CSV statistics include L2_norm and a deterministic checksum to help validation.
 
-Official performance mode:
+Performance/Benchmarking mode:
 
   python ./path/to/cooling.py input/Cooling.in none output/Cooling_python.csv 0
 
@@ -62,18 +59,15 @@ class SamplePoint:
 
 @dataclass
 class SimulationConfig:
-    grid_width: int
-    grid_height: int
-
+    grid_width:   int
+    grid_height:  int
     domain_start_x: float
     domain_start_y: float
-    domain_width: float
-    domain_height: float
-
+    domain_width:   float
+    domain_height:  float
     max_fractal_iterations: int
-    time_steps: int
+    time_steps:   int
     output_every: int  # 0 means final-only output
-
     measured_points: List[SamplePoint]
 
 
@@ -88,8 +82,8 @@ class GridMapping:
 @dataclass
 class UpdateCoefficients:
     damping: float
-    step_x: float
-    step_y: float
+    step_x:  float
+    step_y:  float
     laplace_x: float
     laplace_y: float
     coeff_x: float
@@ -98,11 +92,11 @@ class UpdateCoefficients:
 
 @dataclass
 class FieldStatistics:
-    min_value: float
+    min_value:  float
     mean_value: float
-    max_value: float
-    std_dev: float
-    l2_norm: float
+    max_value:  float
+    std_dev:  float
+    l2_norm:  float
     checksum: float
 
 
@@ -113,9 +107,9 @@ class RunTimings:
     init_time: float = 0.0
     pure_dynamics_time: float = 0.0
     statistics_time: float = 0.0
-    csv_time: float = 0.0
+    csv_time:  float = 0.0
     hdf5_time: float = 0.0
-    loop_wall_time: float = 0.0
+    loop_wall_time:  float = 0.0
     total_wall_time: float = 0.0
 
 
@@ -128,8 +122,7 @@ _INTEGER_RE = re.compile(r"^[+-]?[0-9]+$")
 
 def parse_strict_int(token: str) -> int:
     """
-    Strict integer parser aligned with the C++ baseline behavior.
-    Rejects strings such as '1.0' or '1_000'.
+    Strict integer parser. Rejects strings such as '1.0' or '1_000'.
     """
     if not _INTEGER_RE.match(token):
         raise RuntimeError(f"Malformed input: invalid integer token '{token}'")
@@ -343,7 +336,7 @@ def build_grid_mapping(cfg: SimulationConfig) -> GridMapping:
     return GridMapping(
         x0=cfg.domain_start_x,
         y0=cfg.domain_start_y,
-        dx=cfg.domain_width / float(cfg.grid_width - 1),
+        dx=cfg.domain_width  / float(cfg.grid_width  - 1),
         dy=cfg.domain_height / float(cfg.grid_height - 1),
     )
 
@@ -411,7 +404,7 @@ def compute_fractal_weights_numpy(
     Returns:
         int32 array of shape (grid_height, grid_width)
     """
-    x = mapping.x0 + mapping.dx * np.arange(grid_width, dtype=np.float64)
+    x = mapping.x0 + mapping.dx * np.arange(grid_width,  dtype=np.float64)
     y = mapping.y0 + mapping.dy * np.arange(grid_height, dtype=np.float64)
 
     c_real = np.broadcast_to(x[None, :], (grid_height, grid_width))
@@ -420,7 +413,7 @@ def compute_fractal_weights_numpy(
     z_real = np.zeros((grid_height, grid_width), dtype=np.float64)
     z_imag = np.zeros((grid_height, grid_width), dtype=np.float64)
     weight = np.zeros((grid_height, grid_width), dtype=np.int32)
-    active = np.ones((grid_height, grid_width), dtype=bool)
+    active =  np.ones((grid_height, grid_width), dtype=bool)
 
     for iteration in range(max_iterations):
         if not bool(np.any(active)):
@@ -450,12 +443,13 @@ def initialize_temperature_field_numpy(
     min_weight: int,
     max_weight: int,
 ) -> np.ndarray:
+
     if weight_field.ndim != 2:
         raise ValueError("weight_field must be a 2-D array")
 
     grid_height, grid_width = weight_field.shape
 
-    x = mapping.x0 + mapping.dx * np.arange(grid_width, dtype=np.float64)
+    x = mapping.x0 + mapping.dx * np.arange(grid_width,  dtype=np.float64)
     y = mapping.y0 + mapping.dy * np.arange(grid_height, dtype=np.float64)
 
     x3 = x[None, :] * x[None, :] * x[None, :]
@@ -493,22 +487,13 @@ def update_temperature_field_numpy(
     ly = coeffs.laplace_y
 
     next_field[1:-1, 1:-1] = (
-        cx * (
-            current[1:-1, :-2]
-            + current[1:-1, 2:]
-            + (lx + 0.5 / cx) * current[1:-1, 1:-1]
-        )
-        + cy * (
-            current[:-2, 1:-1]
-            + current[2:, 1:-1]
-            + (ly + 0.5 / cy) * current[1:-1, 1:-1]
-        )
+          cx * (current[1:-1, :-2] + current[1:-1, 2:] + (lx + 0.5 / cx) * current[1:-1, 1:-1])
+        + cy * (current[:-2, 1:-1] + current[2:, 1:-1] + (ly + 0.5 / cy) * current[1:-1, 1:-1])
     )
 
-    next_field[1:-1, 0] = next_field[1:-1, 1]
+    next_field[1:-1,  0] = next_field[1:-1, 1]
     next_field[1:-1, -1] = next_field[1:-1, -2]
-
-    next_field[0, :] = next_field[1, :]
+    next_field[0,  :] = next_field[ 1, :]
     next_field[-1, :] = next_field[-2, :]
 
 
@@ -518,6 +503,7 @@ def advance_temperature_field_steps_numpy(
     number_of_steps: int,
     coeffs: UpdateCoefficients,
 ) -> Tuple[np.ndarray, np.ndarray]:
+
     if number_of_steps < 0:
         raise ValueError("number_of_steps must be >= 0")
 
@@ -538,10 +524,10 @@ def advance_temperature_field_steps_numpy(
 class TimeSeriesWriter:
     def __init__(
         self,
-        file_name: str,
-        grid_width: int,
+        file_name:   str,
+        grid_width:  int,
         grid_height: int,
-        batch: int = 32,
+        batch: int  = 32,
         tile_y: int = 256,
         tile_x: int = 256,
     ):
@@ -631,6 +617,15 @@ class TimeSeriesWriter:
 # STATISTICS
 # ============================================================
 
+def compute_checksum(flat: np.ndarray) -> float:
+    """
+    Deterministic weighted checksum for validation. This is not a physical quantity. 
+    It is only meant to help detect numerical differences between implementations.
+    """
+    weights = (np.arange(flat.size, dtype=np.uint64) % np.uint64(1009)) + np.uint64(1)
+    return float(np.sum(flat * weights.astype(np.float64), dtype=np.float64))
+
+
 def compute_field_statistics(field: np.ndarray) -> FieldStatistics:
     if field.size == 0:
         raise RuntimeError("compute_field_statistics: empty field")
@@ -645,19 +640,11 @@ def compute_field_statistics(field: np.ndarray) -> FieldStatistics:
 
     sum_squares = float(np.sum(flat * flat, dtype=np.float64))
     l2_norm = float(np.sqrt(sum_squares))
-
-    checksum_weights = (
-        (np.arange(flat.size, dtype=np.uint64) % np.uint64(1009))
-        + np.uint64(1)
-    )
-    checksum = float(
-        np.sum(flat * checksum_weights.astype(np.float64), dtype=np.float64)
-    )
+    
+    checksum = compute_checksum(flat)
 
     diff = flat - mean_value
-    std_dev = float(
-        np.sqrt(np.sum(diff * diff, dtype=np.float64) / float(flat.size))
-    )
+    std_dev = float(np.sqrt(np.sum(diff * diff, dtype=np.float64) / float(flat.size)))
 
     return FieldStatistics(
         min_value=min_value,
@@ -697,6 +684,7 @@ def run_simulation(
     h5_tile_x: int,
     write_hdf5: bool,
 ) -> None:
+
     validate_output_every(cfg.output_every)
     checked_grid_size(cfg.grid_width, cfg.grid_height)
 
@@ -816,14 +804,10 @@ def run_simulation(
         if writer_ctx is not None and not writer_ctx.closed:
             writer_ctx.close()
 
-    timings.loop_wall_time = time.perf_counter() - loop_start
+    timings.loop_wall_time  = time.perf_counter() - loop_start
     timings.total_wall_time = time.perf_counter() - total_wall_start
 
-    updates = (
-        float(cfg.grid_width - 2)
-        * float(cfg.grid_height - 2)
-        * float(cfg.time_steps)
-    )
+    updates = (float(cfg.grid_width - 2) * float(cfg.grid_height - 2) * float(cfg.time_steps))
 
     print(f"Grid:                         {cfg.grid_width} x {cfg.grid_height}")
     print(f"Measured points:              {len(cfg.measured_points)}")
@@ -833,10 +817,7 @@ def run_simulation(
     if cfg.output_every == 0:
         print("Snapshot/statistics policy:    final step only")
     else:
-        print(
-            "Snapshot/statistics policy:    "
-            f"step 0, every {cfg.output_every} step(s), and final step"
-        )
+        print(f"Snapshot/statistics policy:    step 0, every {cfg.output_every} step(s), and final step")
 
     print(f"HDF5 chunk tile:              {min(cfg.grid_height, h5_tile_y)} x {min(cfg.grid_width, h5_tile_x)}")
     print("Explicit parallelism:          no")
@@ -853,16 +834,10 @@ def run_simulation(
     print(f"Output frames:                {output_frames}")
 
     if cfg.time_steps > 0 and timings.pure_dynamics_time > 0.0:
-        print(
-            f"Pure dynamics performance:    "
-            f"{updates / timings.pure_dynamics_time / 1e9:.6f} GLUP/s"
-        )
+        print(f"Pure dynamics performance:    {updates / timings.pure_dynamics_time / 1e9:.6f} GLUP/s")
 
     if cfg.time_steps > 0 and timings.loop_wall_time > 0.0:
-        print(
-            f"End-to-end loop performance:  "
-            f"{updates / timings.loop_wall_time / 1e9:.6f} GLUP/s"
-        )
+        print(f"End-to-end loop performance:  {updates / timings.loop_wall_time / 1e9:.6f} GLUP/s")
 
     print(f"Mean discrepancy:             {mean_discrepancy:.15g}")
     print(f"Final min:                    {final_stats.min_value:.15g}")
@@ -880,9 +855,7 @@ def run_simulation(
 # ============================================================
 
 def parse_command_line(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Python NumPy baseline cooling solver"
-    )
+    parser = argparse.ArgumentParser(description="Python NumPy baseline cooling solver")
 
     parser.add_argument(
         "input",
@@ -910,10 +883,7 @@ def parse_command_line(argv: Optional[Sequence[str]] = None) -> argparse.Namespa
         nargs="?",
         type=int,
         default=None,
-        help=(
-            "Optional snapshot cadence override. "
-            "0 means final-only output; >0 means step 0, periodic snapshots, and final."
-        ),
+        help=("Optional snapshot cadence override. 0 means final-only output; >0 means step 0, periodic snapshots, and final."),
     )
 
     parser.add_argument(
@@ -982,3 +952,4 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"CRITICAL ERROR: {exc}", file=sys.stderr)
         raise SystemExit(1)
+

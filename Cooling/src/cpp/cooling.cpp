@@ -21,21 +21,13 @@ The application contains:
   - global statistical reductions,
   - optional HDF5 output.
 
-Official performance grading mode:
-  HDF5 output must be disabled.
+Performance/Benchmarking mode: HDF5 output disabled.
 
-Recommended official run style:
+Recommended benchmarking run style:
 
   ./path/to/cooling_serial input/Cooling.in none output/Cooling_cpp.csv 0
 
-or simply:
-
-  ./path/to/cooling_serial input/Cooling.in
-
-if the default output names are acceptable.
-
-HDF5 support:
-  HDF5 is optional at compile time.
+HDF5 support: HDF5 is optional at compile time.
 
   Without HDF5:
 
@@ -84,6 +76,7 @@ Examples:
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -363,7 +356,7 @@ GridMapping buildGridMapping(const SimulationConfig& cfg) {
     GridMapping mapping{};
     mapping.x0 = cfg.domainStartX;
     mapping.y0 = cfg.domainStartY;
-    mapping.dx = cfg.domainWidth / static_cast<double>(cfg.gridWidth - 1);
+    mapping.dx = cfg.domainWidth  / static_cast<double>(cfg.gridWidth  - 1);
     mapping.dy = cfg.domainHeight / static_cast<double>(cfg.gridHeight - 1);
     return mapping;
 }
@@ -677,9 +670,7 @@ void initializeTemperatureField(
         throw std::runtime_error("initializeTemperatureField: size mismatch");
     }
 
-    const double denom = (maxWeight > minWeight)
-        ? static_cast<double>(maxWeight - minWeight)
-        : 1.0;
+    const double denom = (maxWeight > minWeight) ? static_cast<double>(maxWeight - minWeight) : 1.0;
 
     const index_t width = static_cast<index_t>(cfg.gridWidth);
     const index_t height = static_cast<index_t>(cfg.gridHeight);
@@ -693,14 +684,9 @@ void initializeTemperatureField(
             const double x = mapping.x0 + mapping.dx * static_cast<double>(i);
             const double y = mapping.y0 + mapping.dy * static_cast<double>(j);
 
-            const double normalizedWeight =
-                static_cast<double>(weightField[idx] - minWeight) / denom;
+            const double normalizedWeight = static_cast<double>(weightField[idx] - minWeight) / denom;
 
-            temperature[idx] =
-                293.16 +
-                80.0 *
-                (meanDiscrepancy + analyticalReferenceField(x, y)) *
-                normalizedWeight;
+            temperature[idx] = 293.16 + 80.0 * (meanDiscrepancy + analyticalReferenceField(x, y)) * normalizedWeight;
         }
     }
 }
@@ -722,15 +708,13 @@ void updateInterior(
             const std::size_t idx = linearIndex(ii, jj, width);
 
             next[idx] =
-                coeffs.coeffX *
-                (
+                coeffs.coeffX * (
                     current[linearIndex(ii - 1, jj, width)] +
                     current[linearIndex(ii + 1, jj, width)] +
                     (coeffs.laplaceX + 0.5 / coeffs.coeffX) * current[idx]
                 )
                 +
-                coeffs.coeffY *
-                (
+                coeffs.coeffY * (
                     current[linearIndex(ii, jj - 1, width)] +
                     current[linearIndex(ii, jj + 1, width)] +
                     (coeffs.laplaceY + 0.5 / coeffs.coeffY) * current[idx]
@@ -768,16 +752,14 @@ FieldStatistics computeFieldStatistics(const std::vector<double>& field) {
     }
 
     const std::size_t n = field.size();
-
-    double minValue = std::numeric_limits<double>::infinity();
+    double minValue =  std::numeric_limits<double>::infinity();
     double maxValue = -std::numeric_limits<double>::infinity();
     double sum = 0.0;
     double sumSquares = 0.0;
-    double checksum = 0.0;
+    double checksum = 0.0; // checksum is not a physical quantity. It is meant to help detect numerical differences between implementations.
 
     for (std::size_t i = 0; i < n; ++i) {
         const double value = field[i];
-
         minValue = std::min(minValue, value);
         maxValue = std::max(maxValue, value);
         sum += value;
@@ -810,14 +792,13 @@ void writeStatisticsHeader(std::ostream& out) {
 }
 
 void writeStatisticsRow(std::ostream& out, int step, const FieldStatistics& stats) {
-    out
-        << step << ';'
-        << std::setprecision(15) << stats.minValue << ';'
+    out << step << ';'
+        << std::setprecision(15) << stats.minValue  << ';'
         << std::setprecision(15) << stats.meanValue << ';'
-        << std::setprecision(15) << stats.maxValue << ';'
-        << std::setprecision(15) << stats.stdDev << ';'
-        << std::setprecision(15) << stats.l2Norm << ';'
-        << std::setprecision(15) << stats.checksum << '\n';
+        << std::setprecision(15) << stats.maxValue  << ';'
+        << std::setprecision(15) << stats.stdDev    << ';'
+        << std::setprecision(15) << stats.l2Norm    << ';'
+        << std::setprecision(15) << stats.checksum  << '\n';
 }
 
 CommandLineOptions parseCommandLineArguments(int argc, char** argv) {
@@ -914,8 +895,7 @@ void printRunHeader(
     if (cfg.outputEvery == 0) {
         std::cout << "Snapshot/statistics policy:     final step only\n";
     } else {
-        std::cout << "Snapshot/statistics policy:     step 0, every "
-                  << cfg.outputEvery << " step(s), and final step\n";
+        std::cout << "Snapshot/statistics policy:     step 0, every " << cfg.outputEvery << " step(s), and final step\n";
     }
 
     std::cout << '\n';
@@ -1010,8 +990,8 @@ int main(int argc, char** argv) {
         }
 
         double pureDynamicsTime = 0.0;
-        double statisticsTime = 0.0;
-        double csvTime = 0.0;
+        double statisticsTime   = 0.0;
+        double csvTime  = 0.0;
         double hdf5Time = 0.0;
 
         int outputFrames = 0;
@@ -1077,59 +1057,38 @@ int main(int argc, char** argv) {
 
         const double loopWallTime = loopTimer.elapsedSeconds();
         const double totalWallTime = totalTimer.elapsedSeconds();
+        const double interiorWidth  = static_cast<double>(cfg.gridWidth  - 2);
+        const double interiorHeight = static_cast<double>(cfg.gridHeight - 2);
+        const double steps          = static_cast<double>(cfg.timeSteps);
+        const double updates = interiorWidth * interiorHeight * steps;
 
-        const double updates =
-            static_cast<double>(cfg.gridWidth - 2) *
-            static_cast<double>(cfg.gridHeight - 2) *
-            static_cast<double>(cfg.timeSteps);
-
-        std::cout << "Weight field time:             " << weightTime << " s\n";
-        std::cout << "Weight range reduction time:   " << weightRangeTime << " s\n";
-        std::cout << "Initialization time:           " << initTime << " s\n";
+        std::cout << "Weight field time:             " << weightTime       << " s\n";
+        std::cout << "Weight range reduction time:   " << weightRangeTime  << " s\n";
+        std::cout << "Initialization time:           " << initTime         << " s\n";
         std::cout << "Pure dynamics compute time:    " << pureDynamicsTime << " s\n";
-        std::cout << "Statistics time:               " << statisticsTime << " s\n";
-        std::cout << "CSV write time:                " << csvTime << " s\n";
-        std::cout << "HDF5 write time:               " << hdf5Time << " s\n";
-        std::cout << "Dynamics loop wall time:       " << loopWallTime << " s\n";
-        std::cout << "Total measured wall time:      " << totalWallTime << " s\n";
-        std::cout << "Output frames:                 " << outputFrames << '\n';
+        std::cout << "Statistics time:               " << statisticsTime   << " s\n";
+        std::cout << "CSV write time:                " << csvTime          << " s\n";
+        std::cout << "HDF5 write time:               " << hdf5Time         << " s\n";
+        std::cout << "Dynamics loop wall time:       " << loopWallTime     << " s\n";
+        std::cout << "Total measured wall time:      " << totalWallTime    << " s\n";
+        std::cout << "Output frames:                 " << outputFrames     << '\n';
 
         if (cfg.timeSteps > 0 && pureDynamicsTime > 0.0) {
-            std::cout << "Pure dynamics performance:     "
-                      << updates / pureDynamicsTime / 1.0e9
-                      << " GLUP/s\n";
+            std::cout << "Pure dynamics performance:     " << updates / pureDynamicsTime / 1.0e9 << " GLUP/s\n";
         }
 
         if (cfg.timeSteps > 0 && loopWallTime > 0.0) {
-            std::cout << "Loop end-to-end performance:   "
-                      << updates / loopWallTime / 1.0e9
-                      << " GLUP/s\n";
+            std::cout << "Loop end-to-end performance:   " << updates / loopWallTime / 1.0e9 << " GLUP/s\n";
         }
 
-        std::cout << "Mean discrepancy:              "
-                  << std::setprecision(15) << meanDiscrepancy << '\n';
-
-        std::cout << "Final min:                     "
-                  << std::setprecision(15) << finalStats.minValue << '\n';
-
-        std::cout << "Final mean:                    "
-                  << std::setprecision(15) << finalStats.meanValue << '\n';
-
-        std::cout << "Final max:                     "
-                  << std::setprecision(15) << finalStats.maxValue << '\n';
-
-        std::cout << "Final std.dev.:                "
-                  << std::setprecision(15) << finalStats.stdDev << '\n';
-
-        std::cout << "Final L2 norm:                 "
-                  << std::setprecision(15) << finalStats.l2Norm << '\n';
-
-        std::cout << "Final checksum:                "
-                  << std::setprecision(15) << finalStats.checksum << '\n';
-
-        std::cout << "Weight range:                  "
-                  << minWeight << " ... " << maxWeight << '\n';
-
+        std::cout << "Mean discrepancy:              " << std::setprecision(15) << meanDiscrepancy      << '\n';
+        std::cout << "Final min:                     " << std::setprecision(15) << finalStats.minValue  << '\n';
+        std::cout << "Final mean:                    " << std::setprecision(15) << finalStats.meanValue << '\n';
+        std::cout << "Final max:                     " << std::setprecision(15) << finalStats.maxValue  << '\n';
+        std::cout << "Final std.dev.:                " << std::setprecision(15) << finalStats.stdDev    << '\n';
+        std::cout << "Final L2 norm:                 " << std::setprecision(15) << finalStats.l2Norm    << '\n';
+        std::cout << "Final checksum:                " << std::setprecision(15) << finalStats.checksum  << '\n';
+        std::cout << "Weight range:                  " << minWeight << " ... "  << maxWeight            << '\n';
         std::cout << "\nSimulation completed successfully.\n";
 
         return 0;
